@@ -403,6 +403,47 @@ impl chassis::Resources for WgpuResources {
         }))
     }
 
+    fn write_buffer(
+        &mut self,
+        buffer: &chassis::Buffer,
+        offset: u64,
+        data: &[u8],
+    ) -> chassis::Result<()> {
+        // Without a queue there is nothing to stage the write through, so refuse
+        // by name rather than dropping the bytes.
+        let Some(queue) = self.queue.as_ref() else {
+            return Err(chassis::Error::Unsupported(
+                "write_buffer needs a queue; build the resources with \
+                 WgpuResources::with_queue"
+                    .to_owned(),
+            ));
+        };
+        let resource = self
+            .buffers
+            .get(*buffer)
+            .ok_or(chassis::Error::InvalidHandle)?;
+        // `queue.write_buffer` requires COPY_DST, and a buffer without it is a
+        // wgpu validation panic rather than a `Result`.
+        if !resource
+            .usage()
+            .contains(chassis::BufferUsage::TRANSFER_DST)
+        {
+            return Err(chassis::Error::InvalidDescriptor(format!(
+                "write_buffer needs a buffer created with TRANSFER_DST ({})",
+                resource.label()
+            )));
+        }
+        if offset + data.len() as u64 > resource.size() {
+            return Err(chassis::Error::InvalidDescriptor(format!(
+                "write_buffer writes {} bytes at {offset} into a {} byte buffer",
+                data.len(),
+                resource.size()
+            )));
+        }
+        queue.write_buffer(resource.inner(), offset, data);
+        Ok(())
+    }
+
     fn create_texture(&mut self, desc: chassis::TextureDesc) -> chassis::Result<chassis::Texture> {
         let Some(format) = wgpu_device::to_wgpu_format(desc.format) else {
             // No substitution. A near-enough format renders the wrong image,

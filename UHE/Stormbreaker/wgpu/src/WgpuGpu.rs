@@ -394,6 +394,19 @@ impl chassis::Gpu for WgpuGpu {
             .map(|surface| surface as &dyn Swapchain)
     }
 
+    fn extent(&self) -> chassis::Extent2d {
+        // The `Swapchain` impl above already answers this -- the surface's
+        // extent, or the stored headless one -- so this only lifts it onto `Gpu`
+        // where a frontend holding `&mut dyn Gpu` can reach it.
+        chassis::Swapchain::extent(self)
+    }
+
+    fn resize(&mut self, extent: chassis::Extent2d) -> RhiResult<()> {
+        // Reconfigures the surface when there is one, and records the extent the
+        // executor sets its viewports from when there is not.
+        WgpuGpu::resize(self, extent).map_err(chassis::Error::from)
+    }
+
     fn graph(&mut self) -> &mut dyn RenderGraphTrait {
         &mut self.graph
     }
@@ -470,7 +483,7 @@ impl chassis::Gpu for WgpuGpu {
     ) -> RhiResult<()> {
         // The swapchain's extent when there is one: it is the clamped, configured
         // size, and the frontend sized this frame's targets from the same one.
-        let extent = self.extent();
+        let extent = chassis::Swapchain::extent(self);
         self.executor.set_extent(extent);
 
         // The frontend's table is the frame's table. Replaced rather than merged:

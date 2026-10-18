@@ -142,7 +142,13 @@ impl CommandList for WgpuCommandList<'_> {
                 ops: wgpu::Operations {
                     load: match color.load {
                         chassis::LoadOp::Clear => {
-                            wgpu::LoadOp::<wgpu::Color>::Clear(wgpu::Color::TRANSPARENT)
+                            let [r, g, b, a] = color.clear;
+                            wgpu::LoadOp::<wgpu::Color>::Clear(wgpu::Color {
+                                r: r as f64,
+                                g: g as f64,
+                                b: b as f64,
+                                a: a as f64,
+                            })
                         }
                         chassis::LoadOp::Load => wgpu::LoadOp::<wgpu::Color>::Load,
                         // `DontCare` maps to `Load`, not to wgpu's `DontCare`.
@@ -183,18 +189,24 @@ impl CommandList for WgpuCommandList<'_> {
         let depth_attachment = desc
             .depth
             .as_ref()
-            .and_then(|d| self.resources.get_texture(d.texture))
-            .map(|texture| wgpu::RenderPassDepthStencilAttachment {
+            .and_then(|d| {
+                self.resources
+                    .get_texture(d.texture)
+                    .map(|texture| (d, texture))
+            })
+            .map(|(d, texture)| wgpu::RenderPassDepthStencilAttachment {
                 view: texture.view(),
-                // Cleared to 1.0 -- the far plane -- rather than to the colour
-                // the graph carries. The RHI's `DepthAttachmentDesc` has no
-                // clear value field, and 1.0 is the only value that makes an
-                // untouched depth buffer behave.
                 // `LoadOp<f32>`, not `LoadOp<Color>`: depth loads a number and
                 // a colour attachment loads a colour, and wgpu's generic is what
                 // makes that a compile error rather than a silent mistake.
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::<f32>::Clear(1.0),
+                    load: match d.load {
+                        chassis::LoadOp::Clear => wgpu::LoadOp::<f32>::Clear(d.clear_depth),
+                        chassis::LoadOp::Load => wgpu::LoadOp::<f32>::Load,
+                        // Same reasoning as the colour arm: wgpu's `DontCare` is
+                        // unsafe to construct, and `Load` is the safe superset.
+                        chassis::LoadOp::DontCare => wgpu::LoadOp::<f32>::Load,
+                    },
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -364,11 +376,11 @@ impl CommandList for WgpuCommandList<'_> {
                 buffer: buffer.inner(),
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    // Tightly packed. wgpu's default is 256-byte row alignment,
-                    // which is what a GPU wants and not what a readback buffer
-                    // wants -- the bytes would come back in a different shape
-                    // than the caller asked for, silently.
-                    bytes_per_row: Some(extent.width * 4),
+                    // The aligned pitch, not a tightly packed row: wgpu refuses a
+                    // `bytes_per_row` that is not a multiple of 256, which is
+                    // every width that is not a multiple of 64 texels. The
+                    // caller that reads the buffer back strips the padding.
+                    bytes_per_row: Some(chassis::copy_row_pitch(extent.width, 4)),
                     rows_per_image: Some(extent.height),
                 },
             },

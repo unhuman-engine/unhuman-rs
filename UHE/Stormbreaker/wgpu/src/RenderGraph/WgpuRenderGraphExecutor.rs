@@ -192,14 +192,16 @@ impl WgpuRenderGraphExecutor {
             let mut recording = Recording::new(self.resources.device().inner(), &pass.name);
             {
                 let mut list = WgpuCommandList::new(&mut recording, &self.resources);
+                let pass_extent =
+                    attachment_extent(pass, &self.slots, &self.resources, self.extent);
                 let scope = PassScope {
                     index: pass.index,
                     name: &pass.name,
-                    extent: self.extent,
+                    extent: pass_extent,
                     slots: &self.slots,
                 };
                 let opened =
-                    open_render_scope(pass, &self.slots, &self.resources, self.extent, &mut list)?;
+                    open_render_scope(pass, &self.slots, &self.resources, pass_extent, &mut list)?;
                 record.record(&scope, &mut list)?;
                 if opened {
                     list.end_rendering();
@@ -251,6 +253,42 @@ impl WgpuRenderGraphExecutor {
 /// Returns whether a scope was opened, so the caller closes exactly what it
 /// opened. A pass with no attachments -- a compute or transfer pass -- gets no
 /// scope.
+/// The size a pass records at: its first attachment's.
+///
+/// Not the frame's. A shadow pass renders into a square map of its own while the
+/// frame is a wide rectangle, so recording it at the frame's extent draws into a
+/// corner of the map. The Vulkan executor asks the same question of its own
+/// textures, so the two record a pass at the same size.
+fn attachment_extent(
+    pass: &chassis::graph::CompiledPass,
+    slots: &SlotTable,
+    resources: &WgpuResources,
+    frame: chassis::Extent2d,
+) -> chassis::Extent2d {
+    let size = |handle: chassis::Texture| {
+        resources
+            .get_texture(handle)
+            .map(|texture| chassis::Extent2d {
+                width: texture.extent().width,
+                height: texture.extent().height,
+            })
+    };
+
+    pass.colors
+        .first()
+        .and_then(|color| slots.texture(color.texture))
+        .and_then(size)
+        .or_else(|| {
+            pass.depth
+                .as_ref()
+                .and_then(|depth| slots.texture(depth.texture))
+                .and_then(size)
+        })
+        // The backbuffer has no `chassis::Texture` here either: the surface owns
+        // it, so a pass writing to it falls back to the frame's own extent.
+        .unwrap_or(frame)
+}
+
 fn open_render_scope(
     pass: &chassis::graph::CompiledPass,
     slots: &SlotTable,
@@ -285,6 +323,7 @@ fn open_render_scope(
             texture: handle,
             format,
             load: load_op(color.load),
+            clear: color.clear,
             store: true,
             resolve: chassis::Texture::null(),
         });
@@ -301,6 +340,7 @@ fn open_render_scope(
             texture: handle,
             format,
             load: load_op(depth.load),
+            clear_depth: depth.clear_depth,
             store: true,
         });
     }
