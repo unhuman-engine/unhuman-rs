@@ -16,7 +16,7 @@ pub const TARGET_LIFETIME: f32 = 6.0;
 pub const SPAWN_INTERVAL: f32 = 1.0;
 
 /// The pick radius, and the size `Sphere.glb` is drawn at.
-pub const TARGET_RADIUS: f32 = 0.5;
+pub const TARGET_RADIUS: f32 = 1.0;
 
 /// Points a hit is worth.
 pub const HIT_POINTS: u32 = 100;
@@ -26,8 +26,19 @@ pub const SPAWN_X: (f32, f32) = (-8.0, 8.0);
 pub const SPAWN_Y: (f32, f32) = (-1.0, 5.0);
 pub const SPAWN_Z: f32 = 10.0;
 
-/// Five units off the wall at `z = 10`, looking down -Z at the targets.
-pub const CAMERA_POSITION: Vec3 = Vec3::new(0.0, 0.0, SPAWN_Z + 5.0);
+/// The orbit radius: the camera sits this far from its focal point, the origin.
+pub const CAMERA_DISTANCE: f32 = 5.0;
+
+/// The camera's yaw, in degrees, so its local -Z turns onto +Z toward the wall.
+pub const CAMERA_YAW_DEGREES: f32 = 180.0;
+
+/// The focal point less `CAMERA_DISTANCE` along the view direction: `-5` on Z.
+///
+/// A camera looking down its own -Z at a focal point placed at the origin sits at
+/// `focal - forward * distance`, so facing the wall at `z = 10` puts it at
+/// `z = -5`. The wall is then `CAMERA_DISTANCE + SPAWN_Z = 15` away, and a target
+/// on it reads `15..18` from the eye instead of the old 5.
+pub const CAMERA_POSITION: Vec3 = Vec3::new(0.0, 0.0, -CAMERA_DISTANCE);
 
 /// Ground, light and camera: everything `build` adds besides the targets.
 pub const STAGE_ENTITIES: usize = 3;

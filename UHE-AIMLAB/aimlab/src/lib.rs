@@ -21,9 +21,9 @@ use meats::{Entity, Scene};
 use pings::MouseButton;
 
 pub use rules::{
-    ray_sphere, spawn_position, Rng, Score, CAMERA_FAR, CAMERA_FOV, CAMERA_NEAR, CAMERA_POSITION,
-    HIT_POINTS, SPAWN_INTERVAL, SPAWN_X, SPAWN_Y, SPAWN_Z, STAGE_ENTITIES, TARGET_COUNT,
-    TARGET_LIFETIME, TARGET_RADIUS,
+    ray_sphere, spawn_position, Rng, Score, CAMERA_DISTANCE, CAMERA_FAR, CAMERA_FOV, CAMERA_NEAR,
+    CAMERA_POSITION, CAMERA_YAW_DEGREES, HIT_POINTS, SPAWN_INTERVAL, SPAWN_X, SPAWN_Y, SPAWN_Z,
+    STAGE_ENTITIES, TARGET_COUNT, TARGET_LIFETIME, TARGET_RADIUS,
 };
 
 /// The target and ground meshes, as virtual paths against the workspace asset root.
@@ -70,7 +70,7 @@ impl AimLabPlugin {
             spawned: 0,
             spawn_timer: SPAWN_INTERVAL,
             rng: Rng::default(),
-            yaw: 0.0,
+            yaw: CAMERA_YAW_DEGREES.to_radians(),
             pitch: 0.0,
             mouse_was_down: false,
             built: false,
@@ -94,7 +94,7 @@ impl AimLabPlugin {
         let name = format!("Target_{}", self.spawned);
         self.spawned += 1;
         let position = spawn_position(&mut self.rng);
-        let entity = scene::spawn(&mut eng.scene, &name, position, Vec3::ONE);
+        let entity = scene::spawn(&mut eng.scene, &name, position, Vec3::splat(TARGET_RADIUS));
         scene::add_mesh(&mut eng.scene, entity, TARGET_MESH);
         self.targets.push(Target { entity, life });
     }
@@ -138,6 +138,8 @@ impl AimLabPlugin {
         if (dx * dx + dy * dy).sqrt() > MAX_MOUSE_DELTA {
             return;
         }
+        // Yaw is about the camera's own Y axis, so `-= dx` turns right from any
+        // starting yaw, including the wall-facing 180 the camera now starts at.
         self.yaw -= dx * MOUSE_SENSITIVITY;
         self.pitch = (self.pitch + dy * MOUSE_SENSITIVITY).clamp(-PITCH_LIMIT, PITCH_LIMIT);
         scene::aim(
@@ -207,6 +209,9 @@ impl Plugin for AimLabPlugin {
 
         let camera = scene::spawn(&mut eng.scene, "Camera", CAMERA_POSITION, Vec3::ONE);
         scene::add_primary_camera(&mut eng.scene, camera, CAMERA_FOV, CAMERA_NEAR, CAMERA_FAR);
+        // `look` only writes the rotation once the mouse moves, so the initial
+        // yaw that turns -Z onto the wall has to be set here.
+        scene::aim(&mut eng.scene, CAMERA_YAW_DEGREES, 0.0);
 
         // There is no gun entity, so the clip hangs on the camera: the ear and the
         // muzzle are the same point for a one-shot the listener takes.

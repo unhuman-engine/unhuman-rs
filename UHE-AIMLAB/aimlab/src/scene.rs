@@ -32,7 +32,7 @@ fn set_scale(scene: &mut Scene, entity: Entity, scale: Vec3) {
     }
 }
 
-/// Mouse look: yaw and pitch, in degrees, onto the primary camera.
+/// Yaw then pitch, in degrees, onto the primary camera's rotation.
 pub(crate) fn aim(scene: &mut Scene, yaw_degrees: f32, pitch_degrees: f32) {
     let Some(camera) = scene.primary_camera() else {
         return;

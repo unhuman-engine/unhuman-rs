@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use adam::{Engine, FrameCtx, Plugin};
 use aimlab::{
-    ray_sphere, AimLabPlugin, Score, HIT_POINTS, SPAWN_X, SPAWN_Y, SPAWN_Z, STAGE_ENTITIES,
-    TARGET_COUNT,
+    ray_sphere, AimLabPlugin, Score, CAMERA_DISTANCE, HIT_POINTS, SPAWN_X, SPAWN_Y, SPAWN_Z,
+    STAGE_ENTITIES, TARGET_COUNT, TARGET_RADIUS,
 };
 use glam::Vec3;
 use meats::{Entity, Transform};
@@ -184,6 +184,70 @@ fn the_camera_carries_the_shot_sound() {
 }
 
 #[test]
+fn a_target_directly_ahead_is_picked() {
+    let (mut engine, mut plugin) = built();
+    // Clear the centre ray of the other four so the hit is unambiguous.
+    for entity in plugin.target_entities() {
+        place(&mut engine, entity, Vec3::new(8.0, 5.0, SPAWN_Z));
+    }
+    let target = plugin.target_entities()[0];
+    place(&mut engine, target, Vec3::new(0.0, 0.0, SPAWN_Z));
+
+    click(&mut engine);
+    plugin.on_update(&mut engine, &mut context());
+
+    assert_eq!(plugin.score().hits, 1);
+}
+
+#[test]
+fn a_target_off_to_the_side_is_not_picked() {
+    let (mut engine, mut plugin) = built();
+    // `sqrt(8^2 + 5^2) ~= 9.4` off the axis is well outside a radius-1 sphere.
+    for entity in plugin.target_entities() {
+        place(&mut engine, entity, Vec3::new(8.0, 5.0, SPAWN_Z));
+    }
+
+    click(&mut engine);
+    plugin.on_update(&mut engine, &mut context());
+
+    assert_eq!(plugin.score().shots, 1);
+    assert_eq!(plugin.score().hits, 0);
+}
+
+#[test]
+fn the_camera_faces_the_wall_from_five_units_behind_the_origin() {
+    let (engine, _) = built();
+    let camera = engine.scene.primary_camera().expect("primary camera");
+    let transform = engine.scene.world_transform(camera);
+    let position = transform.w_axis.truncate();
+    let forward = -transform.z_axis.truncate().normalize_or_zero();
+
+    assert!(
+        (position - Vec3::new(0.0, 0.0, -CAMERA_DISTANCE)).length() < 1e-4,
+        "camera at {position}"
+    );
+    assert!(
+        forward.dot(Vec3::Z) > 0.999,
+        "forward {forward} misses the wall"
+    );
+}
+
+#[test]
+fn targets_sit_at_the_cpp_distance_not_five() {
+    let (engine, plugin) = built();
+    let camera = engine.scene.primary_camera().expect("primary camera");
+    let camera_position = translation(&engine, camera);
+    // The wall centre is exactly the orbit radius plus the wall's own Z.
+    let wall_centre = Vec3::new(0.0, 0.0, SPAWN_Z);
+    assert!(((wall_centre - camera_position).length() - (CAMERA_DISTANCE + SPAWN_Z)).abs() < 1e-4);
+    for entity in plugin.target_entities() {
+        let distance = (translation(&engine, entity) - camera_position).length();
+        assert!((14.0..=18.0).contains(&distance), "{distance}");
+        assert!((distance - 5.0).abs() > 1.0, "the old 5-unit framing");
+    }
+}
+
+#[test]
 fn a_hit_is_worth_its_points_and_a_miss_is_not() {
     let mut score = Score::default();
     score.hit();
@@ -201,15 +265,27 @@ fn a_hit_is_worth_its_points_and_a_miss_is_not() {
 }
 
 #[test]
-fn the_pick_ray_finds_the_sphere_it_points_at() {
-    let forward = Vec3::new(0.0, 0.0, 1.0);
-    let radius = 0.5;
+fn a_ray_at_the_drawn_silhouette_edge_hits() {
+    let forward = Vec3::Z;
+    let center = Vec3::new(0.0, 0.0, 15.0);
 
     assert_eq!(
-        ray_sphere(Vec3::ZERO, forward, Vec3::new(0.0, 0.0, 5.0), radius),
-        Some(4.5)
+        ray_sphere(Vec3::ZERO, forward, center, TARGET_RADIUS),
+        Some(14.0)
     );
-    assert!(ray_sphere(Vec3::ZERO, forward, Vec3::new(0.0, 0.0, -5.0), radius).is_none());
-    assert!(ray_sphere(Vec3::ZERO, forward, Vec3::new(1.0, 0.0, 5.0), radius).is_none());
-    assert!(ray_sphere(Vec3::ZERO, Vec3::ZERO, Vec3::new(0.0, 0.0, 5.0), radius).is_none());
+    // Tangent: a ray at exactly the drawn radius still grazes the sphere.
+    let edge = Vec3::new(TARGET_RADIUS, 0.0, 0.0);
+    assert!(ray_sphere(edge, forward, center, TARGET_RADIUS).is_some());
+    // A hair past the silhouette clears it.
+    let outside = Vec3::new(TARGET_RADIUS + 0.01, 0.0, 0.0);
+    assert!(ray_sphere(outside, forward, center, TARGET_RADIUS).is_none());
+
+    assert!(ray_sphere(
+        Vec3::ZERO,
+        forward,
+        Vec3::new(0.0, 0.0, -5.0),
+        TARGET_RADIUS
+    )
+    .is_none());
+    assert!(ray_sphere(Vec3::ZERO, Vec3::ZERO, center, TARGET_RADIUS).is_none());
 }
