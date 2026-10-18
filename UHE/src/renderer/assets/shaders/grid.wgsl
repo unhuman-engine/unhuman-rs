@@ -8,11 +8,10 @@
 // Two constraints:
 //   * the two matrices are a uniform block, because the RHI cannot declare push
 //     constants;
-//   * the grid pass has no depth attachment (see `PipelineKey::grid`), so the
-//     fragment returns colour alone: a pipeline whose shader writes
-//     `@builtin(frag_depth)` against a pass with no depth is rejected outright.
-//     The grid blends over the scene instead of being depth-occluded, and the
-//     distance fade does the work a fragment depth would.
+//   * the grid pass loads the scene depth (see `PipelineKey::grid`), so the
+//     fragment writes `@builtin(frag_depth)` from the grid plane's own position:
+//     that is what lets geometry occlude the grid. The pipeline has a depth
+//     attachment with the test enabled and the write disabled.
 
 struct Grid {
     view_projection: mat4x4<f32>,
@@ -56,6 +55,7 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
 
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
 };
 
 @fragment
@@ -97,6 +97,10 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
         discard;
     }
 
+    // The grid plane's own depth, so geometry the opaque pass wrote occludes it.
+    // Clamped because the depth output is defined over [0, 1].
+    let clip = grid.view_projection * vec4<f32>(frag_pos, 1.0);
+    out.depth = clamp(clip.z / clip.w, 0.0, 1.0);
     out.color = color;
     return out;
 }

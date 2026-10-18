@@ -350,6 +350,8 @@ impl ShaderVariant {
                 // view, and a gizmo line has no facing at all.
                 | ShaderVariant::Grid
                 | ShaderVariant::Line
+                | ShaderVariant::Ssao
+                | ShaderVariant::Composite
         )
     }
 }
@@ -394,10 +396,14 @@ impl PipelineKey {
 
     /// The depth-only prepass: no colour target, so the vertex stage is the
     /// whole pipeline.
-    pub fn shadow(depth: TextureFormat, samples: SampleCount, layout: &VertexLayout) -> Self {
+    ///
+    /// It draws with `depth.wgsl`, which reads position alone, so the layout
+    /// declares position alone; declaring the attributes the model shader reads
+    /// would fetch them and warn that nothing consumes them.
+    pub fn shadow(depth: TextureFormat, samples: SampleCount) -> Self {
         Self {
             variant: ShaderVariant::Shadow,
-            vertex: VertexLayoutKey::of(layout),
+            vertex: VertexLayoutKey::of(&mesh::depth_vertex_layout()),
             color_targets: Vec::new(),
             depth: Some(depth),
             depth_write: true,
@@ -424,19 +430,30 @@ impl PipelineKey {
         }
     }
 
-    /// The grid: six vertices from `@builtin(vertex_index)`, no depth test because
-    /// the pass it runs in has no depth attachment.
-    pub fn grid(color: TextureFormat, samples: SampleCount) -> Self {
-        Self::fullscreen(ShaderVariant::Grid, color, samples)
+    /// The grid: six vertices from `@builtin(vertex_index)`, depth-tested against
+    /// the scene depth so geometry occludes it. It writes no depth, so it cannot
+    /// hide the gizmos drawn in the same pass.
+    pub fn grid(color: TextureFormat, depth: TextureFormat, samples: SampleCount) -> Self {
+        Self {
+            variant: ShaderVariant::Grid,
+            vertex: VertexLayoutKey::of(&VertexLayout::default()),
+            color_targets: vec![color],
+            depth: Some(depth),
+            depth_write: false,
+            depth_compare: 1,
+            samples,
+            index_format: None,
+        }
     }
 
-    /// A line list, which is what a gizmo is.
-    pub fn lines(color: TextureFormat, samples: SampleCount) -> Self {
+    /// A line list, which is what a gizmo is. Depth-tested but not depth-writing:
+    /// a gizmo behind geometry is hidden without occluding later draws.
+    pub fn lines(color: TextureFormat, depth: TextureFormat, samples: SampleCount) -> Self {
         Self {
             variant: ShaderVariant::Line,
             vertex: VertexLayoutKey::of(&line_vertex_layout()),
             color_targets: vec![color],
-            depth: None,
+            depth: Some(depth),
             depth_write: false,
             depth_compare: 1,
             samples,
@@ -502,8 +519,8 @@ pub fn pipeline_desc(key: &PipelineKey, shaders: &ShaderSet) -> PipelineDesc {
         ShaderVariant::Model
         | ShaderVariant::ModelDoubleSided
         | ShaderVariant::ModelTransparent
-        | ShaderVariant::ModelTransparentDoubleSided
-        | ShaderVariant::Shadow => mesh::vertex_layout(),
+        | ShaderVariant::ModelTransparentDoubleSided => mesh::vertex_layout(),
+        ShaderVariant::Shadow => mesh::depth_vertex_layout(),
         ShaderVariant::Line => line_vertex_layout(),
         ShaderVariant::Ssao | ShaderVariant::Grid | ShaderVariant::Composite => {
             VertexLayout::default()

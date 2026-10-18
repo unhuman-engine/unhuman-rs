@@ -3,7 +3,8 @@
 //! Per primitive: bind the pipeline its material selects, bind its uniforms and
 //! vertex and index buffers, and draw indexed. The pipeline is switched per
 //! primitive because cull mode and blending are pipeline state, not per-draw
-//! state a material can ask for.
+//! state a material can ask for. `prepare_draws` orders the draws so consecutive
+//! ones share state, and each bind is skipped when it did not change.
 //!
 //! Transparent draws are not yet a pass of their own. They should be, with their
 //! own depth-tested pipeline; `PASS_TRANSPARENT` is the slot it will record into.
@@ -89,24 +90,39 @@ impl GeometryPass {
             return Ok(());
         }
 
+        // The pipeline first, and then the frame set: a descriptor set is bound
+        // *against* a pipeline layout, and Vulkan has no layout to give it before
+        // a pipeline is bound. wgpu does not care, which is how this order stayed
+        // invisible until the same frame ran on Vulkan.
+        list.bind_pipeline(&self.pipelines.get(self.draws[0].variant));
         list.bind_group(FRAME_SET, &self.frame);
 
-        // Only rebound when the variant changes: a scene whose materials
-        // alternate between culling modes would otherwise pay a pipeline bind
-        // per draw.
-        let mut bound: Option<MaterialVariant> = None;
-        for draw in &self.draws {
-            if bound != Some(draw.variant) {
-                list.bind_pipeline(&self.pipelines.get(draw.variant));
-                bound = Some(draw.variant);
-            }
+        // Each bind is only issued when it differs from the previous draw. The
+        // draw set always changes: it is what makes this draw's model matrix
+        // different from the last. The pipeline, material and mesh are shared
+        // wherever `prepare_draws` ordered draws that share them next to each
+        // other.
+        let mut pipeline: Option<MaterialVariant> = Some(self.draws[0].variant);
+        let mut material: Option<BindGroup> = None;
+        let mut mesh: Option<GpuMesh> = None;
 
-            if let Some(material) = draw.material {
-                list.bind_group(MATERIAL_SET, &material);
+        for draw in &self.draws {
+            if pipeline != Some(draw.variant) {
+                list.bind_pipeline(&self.pipelines.get(draw.variant));
+                pipeline = Some(draw.variant);
+            }
+            if let Some(bound) = draw.material {
+                if material != Some(bound) {
+                    list.bind_group(MATERIAL_SET, &bound);
+                    material = Some(bound);
+                }
+            }
+            if mesh != Some(draw.mesh) {
+                list.bind_vertex_buffer(0, &draw.mesh.vertex, 0);
+                list.bind_index_buffer(&draw.mesh.index, 0);
+                mesh = Some(draw.mesh);
             }
             list.bind_group(DRAW_SET, &draw.uniforms);
-            list.bind_vertex_buffer(0, &draw.mesh.vertex, 0);
-            list.bind_index_buffer(&draw.mesh.index, 0);
             list.draw_indexed(draw.mesh.index_count, 1);
         }
 

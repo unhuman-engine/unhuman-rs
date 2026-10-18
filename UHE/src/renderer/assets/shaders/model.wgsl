@@ -217,31 +217,35 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         shadow = select(1.0, 0.0, stored < reference);
     }
 
+    // Occlusion scales the direct-light sum only; ambient and emissive are not
+    // cavity-shaded. The flat 0.08 ambient and the `1 - exp(-x)` exposure tone
+    // map match the original's shading curve so highlights roll off instead of
+    // clipping at 1.0.
     let occlusion_amount = 1.0 - (1.0 - occlusion) * material.factors.w;
-    let ambient = base * occlusion_amount * 0.03 * shadow;
+    let ambient = base * 0.08;
 
-    var color = ambient;
+    var lo = vec3<f32>(0.0);
     let light_count = u32(frame.params.x);
     for (var i = 0u; i < light_count; i = i + 1u) {
         let light = lights[i];
         let kind = light.type_radius_cones.x;
-        let radiance = light.color_intensity.rgb * light.color_intensity.a;
+        let radiance = light.color_intensity.rgb * light.color_intensity.a * PI;
 
         if (kind < 0.5) {
             // Directional: the direction is the axis the light travels along.
             let light_dir = normalize(-light.position_or_direction.xyz);
-            color = color + shade(normal, view_dir, light_dir, radiance * shadow, base, metallic,
-                                  roughness, f0);
+            lo = lo + shade(normal, view_dir, light_dir, radiance * shadow, base, metallic,
+                            roughness, f0);
         } else {
             let to_light = light.position_or_direction.xyz - in.world_position;
             let distance = max(length(to_light), 1e-4);
             let light_dir = to_light / distance;
 
-            // Inverse-square, limited by the light's radius so a far light stops
-            // contributing instead of adding a constant.
+            // Window falloff only: the original does not divide by distance
+            // squared, so a point light keeps its intensity out to its radius.
             let radius = light.type_radius_cones.y;
             let falloff = clamp(1.0 - (distance * distance) / max(radius * radius, 1e-4), 0.0, 1.0);
-            var attenuation = (falloff * falloff) / (distance * distance);
+            var attenuation = falloff * falloff;
 
             if (kind > 1.5) {
                 // Spot: cosines, so the cone test is two dots.
@@ -252,10 +256,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     * clamp((cos_angle - outer) / max(inner - outer, 1e-4), 0.0, 1.0);
             }
 
-            color = color + shade(normal, view_dir, light_dir, radiance * attenuation, base,
-                                  metallic, roughness, f0);
+            lo = lo + shade(normal, view_dir, light_dir, radiance * attenuation, base,
+                            metallic, roughness, f0);
         }
     }
 
-    return vec4<f32>(color + emissive, alpha);
+    let lit = ambient + lo * occlusion_amount + emissive;
+    return vec4<f32>(vec3<f32>(1.0) - exp(-lit), alpha);
 }

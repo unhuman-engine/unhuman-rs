@@ -245,7 +245,7 @@ fn newlines_start_a_line_one_line_height_down() {
 }
 
 #[test]
-fn generates_a_coverage_atlas_from_the_shipped_face() {
+fn generates_an_msdf_atlas_from_the_shipped_face() {
     let bytes = std::fs::read(asset("assets/fonts/Inter.ttf")).expect("the shipped face");
     let atlas = generate(&bytes, &GeneratorOptions::default()).expect("Inter rasterizes");
 
@@ -257,9 +257,9 @@ fn generates_a_coverage_atlas_from_the_shipped_face() {
         atlas.width as usize * atlas.height as usize * 4
     );
     assert!(atlas.metrics.line_height > 0.0);
-    // Coverage, not a distance field, and it says so.
-    assert!(!atlas.is_msdf());
-    assert_eq!(atlas.metrics.distance_range, 0.0);
+    // A distance field now, with the range the shader widens by.
+    assert!(atlas.is_msdf());
+    assert!(atlas.metrics.distance_range > 0.0);
 
     let space = atlas.glyph(SPACE).expect("a space");
     assert!(space.advance > 0.0);

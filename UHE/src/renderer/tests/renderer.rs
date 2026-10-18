@@ -14,16 +14,18 @@ use std::sync::Arc;
 use bifrost::material::{
     self, Material, MaterialCache, MaterialKey, MaterialTextures, MaterialVariant, TextureCache,
 };
-use bifrost::mesh::{self, MeshCache, MeshKey, VertexLayoutKey};
+use bifrost::mesh::{self, GpuMesh, MeshCache, MeshKey, VertexLayoutKey};
+use bifrost::passes::geometry::{GeometryPass, MaterialPipelines, PreparedDraw};
 use bifrost::passes::pipeline::{self, PipelineCache, PipelineKey, ShaderSet, ShaderVariant};
+use bifrost::passes::DrawArena;
 use bifrost::{Bifrost, EditorCamera, ViewSource};
 use chassis::graph::types::{ErrorKind, PassDesc, Queue};
 use chassis::graph::{self, ImageState, RenderGraph};
 use chassis::{
-    BindGroup, BindGroupTag, Buffer, BufferDesc, BufferTag, DescriptorKind,
-    DescriptorSetLayoutDesc, ImageView, ImageViewTag, Pipeline, PipelineDesc, PipelineTag,
-    Registry, Resources, Sampler, SamplerDesc, SamplerTag, Shader, ShaderTag, Texture, TextureDesc,
-    TextureTag,
+    BindGroup, BindGroupTag, Buffer, BufferDesc, BufferTag, CommandList, DescriptorKind,
+    DescriptorSetLayoutDesc, Extent2d, ImageView, ImageViewTag, Pipeline, PipelineDesc,
+    PipelineTag, Registry, Resources, Sampler, SamplerDesc, SamplerTag, Shader, ShaderTag,
+    SlotTable, Texture, TextureDesc, TextureTag,
 };
 use vault::AssetId;
 
@@ -45,14 +47,20 @@ struct FakeResources {
     samplers: Registry<(), SamplerTag>,
 
     buffer_creates: usize,
+    /// Every `write_buffer` call, as `(buffer, offset, byte count)`.
+    buffer_writes: Vec<(Buffer, u64, usize)>,
     buffer_destroys: Vec<Buffer>,
     texture_destroys: Vec<Texture>,
     /// Every `upload_texture` call: the texture, the byte count, and the extent
     /// it was told to fill.
     uploads: Vec<(Texture, usize, u32, u32)>,
     pipeline_creates: usize,
+    group_creates: usize,
     group_destroys: usize,
     sampler_creates: usize,
+    /// What `read_buffer` hands back: the padded bytes a copy of the readback
+    /// buffer would produce. Empty by default, which reads as "no frame".
+    readback: Vec<u8>,
 }
 
 impl FakeResources {
@@ -87,6 +95,11 @@ impl Resources for FakeResources {
         Ok(self.buffers.create(()))
     }
 
+    fn write_buffer(&mut self, buffer: &Buffer, offset: u64, data: &[u8]) -> chassis::Result<()> {
+        self.buffer_writes.push((*buffer, offset, data.len()));
+        Ok(())
+    }
+
     fn create_texture(&mut self, _desc: TextureDesc) -> chassis::Result<Texture> {
         Ok(self.textures.create(()))
     }
@@ -111,6 +124,7 @@ impl Resources for FakeResources {
         _images: &[(u32, ImageView)],
         _samplers: &[(u32, Sampler)],
     ) -> chassis::Result<BindGroup> {
+        self.group_creates += 1;
         Ok(self.groups.create(()))
     }
 
@@ -141,7 +155,7 @@ impl Resources for FakeResources {
     }
 
     fn read_buffer(&mut self, _buffer: &Buffer) -> chassis::Result<Vec<u8>> {
-        Ok(Vec::new())
+        Ok(self.readback.clone())
     }
 
     fn destroy_pipeline(&mut self, pipeline: Pipeline) {
@@ -346,11 +360,7 @@ fn a_pipeline_key_covers_the_state_a_pipeline_is_built_from() {
     // passes, and differs in everything else.
     assert_ne!(
         model,
-        PipelineKey::shadow(
-            TextureFormat::Depth32Float,
-            SampleCount::X1,
-            &mesh::vertex_layout()
-        )
+        PipelineKey::shadow(TextureFormat::Depth32Float, SampleCount::X1)
     );
 }
 
@@ -409,11 +419,7 @@ fn a_pipeline_description_matches_its_key() {
 
     // A depth-only prepass: one stage, no colour target.
     let shadow = pipeline::pipeline_desc(
-        &PipelineKey::shadow(
-            TextureFormat::Depth32Float,
-            SampleCount::X1,
-            &mesh::vertex_layout(),
-        ),
+        &PipelineKey::shadow(TextureFormat::Depth32Float, SampleCount::X1),
         &shaders,
     );
     assert_eq!(shadow.shaders.len(), 1);
@@ -455,7 +461,11 @@ fn the_pipeline_cache_creates_one_pipeline_per_key() {
     assert_eq!(fake.pipeline_creates, 1, "a hit must not create anything");
     assert_eq!(cache.len(), 1);
 
-    let other = PipelineKey::grid(TextureFormat::Rgba8Srgb, SampleCount::X1);
+    let other = PipelineKey::grid(
+        TextureFormat::Rgba8Srgb,
+        TextureFormat::Depth32Float,
+        SampleCount::X1,
+    );
     assert_ne!(
         cache
             .get_or_create(&mut fake, other, &shaders)
@@ -909,6 +919,7 @@ struct FakeGpu {
     resources: FakeResources,
     info: chassis::GpuInfo,
     graph: FakeGraph,
+    extent: chassis::Extent2d,
     frames: usize,
     passes: usize,
     slots: usize,
@@ -925,6 +936,10 @@ impl FakeGpu {
                 frames_in_flight: 1,
             },
             graph: FakeGraph,
+            extent: chassis::Extent2d {
+                width: 1280,
+                height: 720,
+            },
             frames: 0,
             passes: 0,
             slots: 0,
@@ -939,6 +954,15 @@ impl chassis::Gpu for FakeGpu {
 
     fn swapchain(&self) -> Option<&dyn chassis::Swapchain> {
         None
+    }
+
+    fn extent(&self) -> chassis::Extent2d {
+        self.extent
+    }
+
+    fn resize(&mut self, extent: chassis::Extent2d) -> chassis::Result<()> {
+        self.extent = extent;
+        Ok(())
     }
 
     fn graph(&mut self) -> &mut dyn chassis::RenderGraph {
@@ -1004,6 +1028,7 @@ struct NoFrameGpu {
     resources: FakeResources,
     info: chassis::GpuInfo,
     graph: FakeGraph,
+    extent: chassis::Extent2d,
 }
 
 impl NoFrameGpu {
@@ -1017,6 +1042,10 @@ impl NoFrameGpu {
                 frames_in_flight: 1,
             },
             graph: FakeGraph,
+            extent: chassis::Extent2d {
+                width: 1280,
+                height: 720,
+            },
         }
     }
 }
@@ -1028,6 +1057,15 @@ impl chassis::Gpu for NoFrameGpu {
 
     fn swapchain(&self) -> Option<&dyn chassis::Swapchain> {
         None
+    }
+
+    fn extent(&self) -> chassis::Extent2d {
+        self.extent
+    }
+
+    fn resize(&mut self, extent: chassis::Extent2d) -> chassis::Result<()> {
+        self.extent = extent;
+        Ok(())
     }
 
     fn graph(&mut self) -> &mut dyn chassis::RenderGraph {
@@ -1102,4 +1140,276 @@ fn an_unsupported_backend_surfaces_from_render() {
         matches!(error, chassis::Error::Unsupported(_)),
         "a refusal, named: {error:?}"
     );
+}
+
+// ---- the per-draw uniform arena ----
+
+/// The arena is refilled, not re-created: the second frame for the same draws
+/// writes into the same buffer and reuses every bind group.
+///
+/// This is the gate on the per-draw allocation the renderer used to pay. Before
+/// the arena kept its buffer and groups, each frame created one buffer and one
+/// bind group per draw, so `buffer_creates` and `group_creates` climbed with the
+/// draw count on every frame.
+#[test]
+fn the_draw_arena_reuses_its_buffer_and_groups_across_frames() {
+    let mut fake = FakeResources::new();
+    let layout = pipeline::draw_layout();
+    let blocks: Vec<Vec<u8>> = (0..64).map(|i| vec![i as u8; 96]).collect();
+    let mut arena = DrawArena::new();
+
+    let made = arena
+        .begin(&mut fake, &layout, &blocks)
+        .expect("first frame");
+    assert_eq!(made, blocks.len());
+    let buffer_creates = fake.buffer_creates;
+    let group_creates = fake.group_creates;
+    assert_eq!(
+        group_creates,
+        blocks.len(),
+        "one group per draw on the first frame"
+    );
+
+    // Same draws next frame: a write, and nothing else.
+    arena
+        .begin(&mut fake, &layout, &blocks)
+        .expect("second frame");
+    assert_eq!(
+        fake.buffer_creates, buffer_creates,
+        "the arena buffer is reused, not re-created"
+    );
+    assert_eq!(
+        fake.group_creates, group_creates,
+        "the bind groups are reused, not re-created"
+    );
+    assert_eq!(
+        fake.buffer_writes.len(),
+        2,
+        "one write per frame, for the whole frame"
+    );
+
+    // A shorter frame reuses the buffer and rebuilds only the groups it needs.
+    arena
+        .begin(&mut fake, &layout, &blocks[..4])
+        .expect("shrinks");
+    assert_eq!(fake.buffer_creates, buffer_creates, "still the one buffer");
+    assert_eq!(
+        fake.group_creates,
+        group_creates + 4,
+        "only the groups the shorter frame has"
+    );
+
+    arena.destroy(&mut fake);
+    assert!(arena.group(0).is_none(), "destroyed groups stop resolving");
+}
+
+// ---- the geometry pass's binds ----
+
+/// A `CommandList` that counts how often each bind is issued.
+#[derive(Default)]
+struct RecordingList {
+    frame_binds: usize,
+    material_binds: usize,
+    draw_binds: usize,
+    pipeline_binds: usize,
+    vertex_binds: usize,
+    index_binds: usize,
+    draws: usize,
+}
+
+impl CommandList for RecordingList {
+    fn begin_rendering(&mut self, _desc: &chassis::RenderPassDesc) {}
+    fn end_rendering(&mut self) {}
+    fn set_viewport(&mut self, _extent: Extent2d) {}
+    fn set_scissor(&mut self, _x: u32, _y: u32, _w: u32, _h: u32) {}
+
+    fn bind_pipeline(&mut self, _pipeline: &Pipeline) {
+        self.pipeline_binds += 1;
+    }
+
+    fn bind_group(&mut self, set: u32, _group: &BindGroup) {
+        match set {
+            bifrost::passes::geometry::FRAME_SET => self.frame_binds += 1,
+            bifrost::passes::geometry::MATERIAL_SET => self.material_binds += 1,
+            bifrost::passes::geometry::DRAW_SET => self.draw_binds += 1,
+            _ => {}
+        }
+    }
+
+    fn set_push_constants(&mut self, _data: &[u8]) {}
+    fn bind_vertex_buffer(&mut self, _slot: u32, _buffer: &Buffer, _offset: u64) {
+        self.vertex_binds += 1;
+    }
+    fn bind_index_buffer(&mut self, _buffer: &Buffer, _offset: u64) {
+        self.index_binds += 1;
+    }
+    fn draw(&mut self, _vertices: u32, _instances: u32) {}
+    fn draw_indexed(&mut self, _indices: u32, _instances: u32) {
+        self.draws += 1;
+    }
+    fn dispatch(&mut self, _x: u32, _y: u32, _z: u32) {}
+    fn copy_buffer(&mut self, _src: &Buffer, _dst: &Buffer) {}
+    fn copy_texture_to_buffer(&mut self, _src: &Texture, _dst: &Buffer) {}
+}
+
+/// Consecutive draws that share pipeline, material and mesh bind each of those
+/// once, while every draw still binds its own uniform block and issues one draw.
+#[test]
+fn geometry_binds_shared_state_once_per_run() {
+    let mut fake = FakeResources::new();
+    let material_a = fake.groups.create(());
+    let material_b = fake.groups.create(());
+    let mesh_a = GpuMesh {
+        vertex: fake.buffers.create(()),
+        index: fake.buffers.create(()),
+        index_count: 3,
+        vertex_count: 3,
+    };
+    let mesh_b = GpuMesh {
+        vertex: fake.buffers.create(()),
+        index: fake.buffers.create(()),
+        index_count: 3,
+        vertex_count: 3,
+    };
+
+    let draw = |mesh: GpuMesh, material: BindGroup| PreparedDraw {
+        mesh,
+        uniforms: BindGroup::null(),
+        material: Some(material),
+        variant: MaterialVariant::Opaque,
+    };
+    let draws = vec![
+        draw(mesh_a, material_a),
+        draw(mesh_a, material_a),
+        draw(mesh_a, material_a),
+        draw(mesh_a, material_b),
+        draw(mesh_b, material_b),
+    ];
+
+    let pipelines = MaterialPipelines {
+        opaque: Pipeline::null(),
+        opaque_double_sided: Pipeline::null(),
+        transparent: Pipeline::null(),
+        transparent_double_sided: Pipeline::null(),
+    };
+    let pass = GeometryPass::new(pipelines, BindGroup::null(), draws);
+
+    let slots = SlotTable::default();
+    let scope = chassis::PassScope {
+        index: 0,
+        name: bifrost::passes::PASS_OPAQUE,
+        extent: Extent2d {
+            width: 1280,
+            height: 720,
+        },
+        slots: &slots,
+    };
+
+    let mut list = RecordingList::default();
+    pass.record(&scope, &mut list).expect("records");
+
+    assert_eq!(list.pipeline_binds, 1, "one pipeline for the run");
+    assert_eq!(list.frame_binds, 1, "the frame set is bound once");
+    assert_eq!(list.material_binds, 2, "one bind per distinct material");
+    assert_eq!(list.vertex_binds, 2, "one bind per distinct mesh");
+    assert_eq!(list.index_binds, 2, "the index buffer moves with the mesh");
+    assert_eq!(list.draw_binds, 5, "every draw binds its own block");
+    assert_eq!(list.draws, 5, "and is drawn");
+}
+
+// ---- the device's extent ----
+
+/// A device resize is followed once, and the camera's viewport -- which the
+/// projection's aspect ratio is derived from -- is the device's afterwards.
+///
+/// This is what makes the editor's viewport panel its own resolution: the panel
+/// resizes the device, and the renderer picks the new extent up on the next
+/// frame instead of the frontend keeping a second copy of the size.
+#[test]
+fn a_device_resize_is_followed_once() {
+    let mut gpu = FakeGpu::new();
+    let mut plugin = bifrost::BifrostPlugin::new();
+
+    assert!(
+        !plugin.follow_extent(&mut gpu),
+        "the plugin starts at the fake's own extent"
+    );
+    assert_eq!(plugin.camera().viewport_size(), (1280.0, 720.0));
+
+    chassis::Gpu::resize(
+        &mut gpu,
+        chassis::Extent2d {
+            width: 640,
+            height: 400,
+        },
+    )
+    .expect("the fake records any extent");
+
+    assert!(plugin.follow_extent(&mut gpu), "the extent changed");
+    assert_eq!(plugin.camera().viewport_size(), (640.0, 400.0));
+    assert!(!plugin.follow_extent(&mut gpu), "and only once");
+}
+
+/// A readback frame comes back tightly packed whatever the copy's row pitch was.
+///
+/// A copy pads its rows to `COPY_BYTES_PER_ROW_ALIGNMENT`, so a viewport whose
+/// width is not a multiple of 64 texels -- any panel dragged to an arbitrary
+/// size -- produces a buffer longer than the image in it. `FrameImage` promises
+/// `width * height * 4` packed bytes, and a caller that trusted the buffer length
+/// instead would draw a sheared frame.
+#[test]
+fn a_readback_frame_is_unpadded() {
+    // 100 texels: 400 bytes of row, 512 with the copy's padding.
+    const WIDTH: u32 = 100;
+    const HEIGHT: u32 = 3;
+
+    let mut gpu = FakeGpu::new();
+    let mut renderer = renderer_for(&mut gpu);
+    let jobs = grind::Jobs::new();
+    let scene = meats::Scene::new();
+    let camera = editor_camera();
+
+    let pitch = chassis::copy_row_pitch(WIDTH, 4) as usize;
+    let packed = WIDTH as usize * 4;
+    assert!(pitch > packed, "the case only means something when it pads");
+
+    // Every row is its own byte pattern, with the padding filled to a different
+    // one, so a row taken from the wrong offset cannot pass.
+    let mut padded = Vec::with_capacity(pitch * HEIGHT as usize);
+    for row in 0..HEIGHT as usize {
+        padded.extend(std::iter::repeat_n(row as u8 + 1, packed));
+        padded.extend(std::iter::repeat_n(0xFF, pitch - packed));
+    }
+    gpu.resources.readback = padded;
+
+    chassis::Gpu::resize(
+        &mut gpu,
+        chassis::Extent2d {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+    )
+    .expect("the fake records any extent");
+
+    renderer
+        .render(&mut gpu, &jobs, &scene, ViewSource::Editor, Some(&camera))
+        .expect("a fake device takes the whole frame");
+
+    let image = renderer.frame_image().expect("a readback frame");
+    assert_eq!(image.width, WIDTH);
+    assert_eq!(image.height, HEIGHT);
+    assert_eq!(
+        image.bgra.len(),
+        packed * HEIGHT as usize,
+        "packed, no padding"
+    );
+
+    for row in 0..HEIGHT as usize {
+        let expected = vec![row as u8 + 1; packed];
+        assert_eq!(
+            &image.bgra[row * packed..(row + 1) * packed],
+            expected.as_slice(),
+            "row {row} came from the wrong offset"
+        );
+    }
 }

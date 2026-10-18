@@ -1,10 +1,11 @@
 //! The editor pass: the grid, then the gizmo lines, in one pass.
 //!
-//! Both draw into the scene colour with blending and no depth test, so they share
-//! one attachment list. Two passes writing the same colour target would be a
-//! write-after-write the graph does not order: edges come from declared *reads*
-//! (`compiler::topological_order`), and a `LoadOp::Load` is not a read in that
-//! model, so two loading writers of one texture have no edge between them at all.
+//! Both draw into the scene colour with blending and against the scene depth the
+//! pass loads, so they share one attachment list. Two passes writing the same
+//! colour target would be a write-after-write the graph does not order: edges come
+//! from declared *reads* (`compiler::topological_order`), and a `LoadOp::Load` is
+//! not a read in that model, so two loading writers of one texture have no edge
+//! between them at all.
 
 use chassis::{CommandList, PassScope};
 

@@ -237,13 +237,11 @@ impl Bifrost {
     pub fn new(gpu: &mut dyn Gpu, assets: &mut vault::Assets) -> Result<Self, Error> {
         let _ = assets;
 
-        let extent = gpu
-            .swapchain()
-            .map(|swapchain| swapchain.extent())
-            .unwrap_or(Extent2d {
-                width: 1280,
-                height: 720,
-            });
+        // The extent the executor will record at, from the GPU itself. Sizing
+        // the targets from anything else -- a fixed default, a swapchain read
+        // back separately -- puts them at odds with the passes' viewport,
+        // headless, where the executor uses the device's own extent.
+        let extent = gpu.extent();
         let swapchain_format = gpu
             .swapchain()
             .map(|swapchain| swapchain.format())
@@ -302,22 +300,6 @@ impl Bifrost {
         self.overlay.as_ref()
     }
 
-    /// Resizes the frame's own targets.
-    ///
-    /// The textures are replaced by the next `render`, which has the device;
-    /// this is called from a window event, where there is not. A zero extent is
-    /// skipped rather than clamped.
-    pub fn resize(&mut self, extent: Extent2d) {
-        if extent.width == 0 || extent.height == 0 {
-            return;
-        }
-        self.extent = extent;
-    }
-
-    pub fn extent(&self) -> Extent2d {
-        self.extent
-    }
-
     /// The last composed frame read back for the CPU.
     ///
     /// `None` before the first frame, with a surface (the frame is presented
@@ -340,7 +322,13 @@ impl Bifrost {
         // `MAP_READ` is what wgpu needs to map it; Vulkan ignores the flag and
         // makes the buffer host-visible because it is a transfer destination.
         // `TRANSFER_DST` is both.
-        let size = u64::from(extent.width.max(1)) * u64::from(extent.height.max(1)) * 4;
+        //
+        // Sized by the copy's *row pitch*, not by `width * 4`: the copy pads every
+        // row to the alignment, and a width that is not a multiple of 64 texels
+        // gets a longer buffer than the image it carries. `capture_readback`
+        // strips the padding.
+        let pitch = chassis::copy_row_pitch(extent.width.max(1), 4);
+        let size = u64::from(pitch) * u64::from(extent.height.max(1));
         match resources.create_buffer(
             BufferDesc::new(size, BufferUsage::TRANSFER_DST | BufferUsage::MAP_READ),
             None,
@@ -511,10 +499,13 @@ impl Bifrost {
     ) -> Result<(), Error> {
         let _ = jobs;
 
-        let extent = gpu
-            .swapchain()
-            .map(|swapchain| swapchain.extent())
-            .unwrap_or(self.extent);
+        // The device is the authority on the frame's size: its swapchain's when
+        // there is one, its own headless extent otherwise, which is exactly what
+        // `Gpu::extent` answers. Reading the swapchain here as well was a second
+        // answer to one question, and the headless one was stale: a device
+        // resized under the renderer left the targets at the old size while the
+        // executor recorded at the new one.
+        let extent = gpu.extent();
         if extent.width == 0 || extent.height == 0 {
             // A minimised window: a zero extent is not a frame to draw, it is a
             // frame to skip.
@@ -615,14 +606,16 @@ impl Bifrost {
             return;
         };
         let extent = self.extent;
-        let expected = extent.width as usize * extent.height as usize * 4;
+        let pitch = chassis::copy_row_pitch(extent.width, 4) as usize;
+        let packed = extent.width as usize * 4;
+        let height = extent.height as usize;
 
         match gpu.resources().read_buffer(&buffer) {
-            Ok(bgra) if bgra.len() >= expected => {
+            Ok(bgra) if bgra.len() >= pitch * height => {
                 self.frame_image = Some(FrameImage {
                     width: extent.width,
                     height: extent.height,
-                    bgra,
+                    bgra: strip_copy_padding(&bgra, pitch, packed, height),
                 });
             }
             Ok(bgra) => {
@@ -697,8 +690,12 @@ impl Bifrost {
             .color(ssao, [1.0, 1.0, 1.0, 1.0])
             .read_texture(scene_depth);
 
-        // The editor's grid and gizmos, blended, after the scene.
-        graph.pass(passes::PASS_EDITOR).color_load(scene_color);
+        // The editor's grid and gizmos, blended, after the scene. The scene depth
+        // is loaded so the grid is occluded by geometry instead of drawing over it.
+        graph
+            .pass(passes::PASS_EDITOR)
+            .color_load(scene_color)
+            .depth_load(scene_depth);
 
         // The 2D and text slice's passes, which draw into the scene colour
         // after the 3D scene does. Declared here, before the composition, so
@@ -797,13 +794,29 @@ impl Bifrost {
         self.draw_arena
             .begin(resources, &passes::pipeline::draw_layout(), &blocks)?;
 
-        // Opaque first, then the blended draws back to front, because
-        // transmission needs a sorted pass.
+        // The material slot is a stable per-material id, which makes it usable
+        // as a sort key; the mesh is keyed by its vertex handle.
+        let material_slot =
+            |draw: &Pending| draw.material.map(|entry| entry.slot).unwrap_or(u32::MAX);
+        let mesh_id = |draw: &Pending| (draw.mesh.vertex.index(), draw.mesh.vertex.generation());
+
+        // Opaque first, then the blended draws. Within the opaques the order is
+        // chosen so consecutive draws share pipeline, material and mesh, which
+        // lets `GeometryPass` bind each once. Blended draws keep their
+        // back-to-front order, which is what makes the blend correct; batching
+        // them would trade a correct image for a few binds.
         pending.sort_by(|a, b| {
-            a.variant
-                .blends()
-                .cmp(&b.variant.blends())
-                .then_with(|| b.distance.total_cmp(&a.distance))
+            a.variant.blends().cmp(&b.variant.blends()).then_with(|| {
+                if a.variant.blends() {
+                    b.distance.total_cmp(&a.distance)
+                } else {
+                    a.variant
+                        .cmp(&b.variant)
+                        .then_with(|| material_slot(a).cmp(&material_slot(b)))
+                        .then_with(|| mesh_id(a).cmp(&mesh_id(b)))
+                        .then_with(|| b.distance.total_cmp(&a.distance))
+                }
+            })
         });
 
         Ok(pending
@@ -879,7 +892,7 @@ impl Bifrost {
         if compiled.find(passes::PASS_SHADOW).is_some() {
             let pipeline = self.pipelines.get_or_create(
                 resources,
-                PipelineKey::shadow(depth, samples, &mesh::vertex_layout()),
+                PipelineKey::shadow(depth, samples),
                 &self.shaders,
             )?;
             let uniforms = uniforms::ShadowUniforms::new(shadow_matrix.to_cols_array_2d());
@@ -962,7 +975,7 @@ impl Bifrost {
             let grid = if self.show_grid {
                 let pipeline = self.pipelines.get_or_create(
                     resources,
-                    PipelineKey::grid(color, samples),
+                    PipelineKey::grid(color, depth, samples),
                     &self.shaders,
                 )?;
                 let uniforms = GridUniforms::new(view_projection.to_cols_array_2d());
@@ -983,7 +996,7 @@ impl Bifrost {
                 Some(batch) => {
                     let pipeline = self.pipelines.get_or_create(
                         resources,
-                        PipelineKey::lines(color, samples),
+                        PipelineKey::lines(color, depth, samples),
                         &self.shaders,
                     )?;
                     let uniforms = LineUniforms::new(
@@ -1062,6 +1075,20 @@ impl Bifrost {
         let textures = std::mem::replace(&mut self.textures, FrameTextures::null());
         textures.destroy(resources);
     }
+}
+
+/// Copies the rows of a padded readback into a tightly packed image.
+///
+/// A copy's rows are padded to [`chassis::COPY_BYTES_PER_ROW_ALIGNMENT`] and
+/// [`FrameImage`] promises a packed buffer -- `width * height * 4` bytes, which
+/// is what a caller turns into an image -- so the padding comes off here, once,
+/// rather than in every consumer.
+fn strip_copy_padding(bytes: &[u8], pitch: usize, packed: usize, height: usize) -> Vec<u8> {
+    let mut image = Vec::with_capacity(packed * height);
+    for row in bytes.chunks_exact(pitch).take(height) {
+        image.extend_from_slice(&row[..packed]);
+    }
+    image
 }
 
 /// The view-projection and the camera's world position for this frame.

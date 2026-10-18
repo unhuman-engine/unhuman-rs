@@ -22,6 +22,10 @@ pub struct BifrostPlugin {
     camera: EditorCamera,
     input: CameraInput,
     overlay: Option<Arc<dyn OverlayPasses>>,
+    /// World-space lines the frame draws: the editor's gizmo.
+    lines: Option<(Vec<crate::passes::LineVertex>, Vec<u32>)>,
+    /// Whether `lines` was set since it was last uploaded.
+    lines_pending: bool,
     /// Frames that failed to record, so a backend that refuses every frame does
     /// not log one error per frame for the life of the process.
     frame_failures: u32,
@@ -29,11 +33,24 @@ pub struct BifrostPlugin {
 
 impl BifrostPlugin {
     pub fn new() -> Self {
+        let mut camera = EditorCamera::new(45.0, 16.0 / 9.0, 0.1, 1000.0);
+        // Tilt off the ground plane. At the camera's default pitch of zero the
+        // focal point and the eye are both at y = 0, so the eye lies in the
+        // grid's own plane, the grid is edge-on, and the viewport is empty.
+        //
+        // Positive, because pitch is elevation: the eye is `focal - forward *
+        // distance`, and `forward.y` is `-sin(pitch)`. A negative pitch puts the
+        // eye *below* y = 0 looking up, so the first frame is the grid's
+        // underside and reads as an upside-down viewport.
+        camera.set_pitch(0.5);
+        camera.set_yaw(0.6);
         Self {
             renderer: None,
-            camera: EditorCamera::new(45.0, 16.0 / 9.0, 0.1, 1000.0),
+            camera,
             input: CameraInput::default(),
             overlay: None,
+            lines: None,
+            lines_pending: false,
             frame_failures: 0,
         }
     }
@@ -73,6 +90,34 @@ impl BifrostPlugin {
     pub fn frame_image(&self) -> Option<&crate::renderer::FrameImage> {
         self.renderer.as_ref().and_then(Bifrost::frame_image)
     }
+
+    /// Sets the world-space lines the frame draws, uploaded on the next frame.
+    ///
+    /// The editor's gizmo is the caller. Held here rather than uploaded by the
+    /// caller because uploading needs the device, and a caller holding the plugin
+    /// and the engine at once would be two mutable borrows of one `App`.
+    pub fn set_lines(&mut self, vertices: Vec<crate::passes::LineVertex>, indices: Vec<u32>) {
+        self.lines = Some((vertices, indices));
+        self.lines_pending = true;
+    }
+
+    /// Resizes the camera to the device's extent, if they differ.
+    ///
+    /// The device is the authority on the frame's size and the renderer sizes its
+    /// targets from `Gpu::extent` on the next `render`; this is the other half,
+    /// the camera's viewport, which the projection's aspect ratio comes from.
+    /// Returns whether anything changed.
+    pub fn follow_extent(&mut self, gpu: &mut dyn chassis::Gpu) -> bool {
+        let extent = gpu.extent();
+        let (width, height) = self.camera.viewport_size();
+        if (extent.width as f32, extent.height as f32) == (width, height) {
+            return false;
+        }
+
+        self.camera
+            .set_viewport_size(extent.width as f32, extent.height as f32);
+        true
+    }
 }
 
 impl Default for BifrostPlugin {
@@ -97,38 +142,39 @@ impl Plugin for BifrostPlugin {
             renderer.set_overlay(overlay);
         }
 
-        if let Some(swapchain) = gpu.swapchain() {
-            let extent = swapchain.extent();
-            self.camera
-                .set_viewport_size(extent.width as f32, extent.height as f32);
-            renderer.resize(extent);
-        }
-
         self.renderer = Some(renderer);
         Ok(())
     }
 
     fn on_frame(&mut self, eng: &mut Engine, _ctx: &mut FrameCtx) {
-        let Some(renderer) = self.renderer.as_mut() else {
-            return;
-        };
         let Some(gpu) = eng.gpu.as_mut() else {
             return;
         };
 
-        if let Some(swapchain) = gpu.swapchain() {
-            let extent = swapchain.extent();
-            let (width, height) = self.camera.viewport_size();
-            if (extent.width as f32, extent.height as f32) != (width, height) {
-                self.camera
-                    .set_viewport_size(extent.width as f32, extent.height as f32);
-                renderer.resize(extent);
-            }
-        }
+        // Before the renderer is borrowed: a frontend that resized the device
+        // gets targets at the new size for this frame, not the next one.
+        self.follow_extent(gpu.as_mut());
+
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
 
         // The editor camera moves before the scene is read, so a frame draws the
-        // camera state it was given rather than the previous frame's.
+        // camera state it was given rather than the previous frame's. Scroll is
+        // separate from `update`: the orbit drag is held state, a dolly is an
+        // event, and `update` reads only the held part.
         self.camera.update(&self.input);
+        self.camera.on_scroll(self.input.scroll.1);
+
+        if self.lines_pending {
+            self.lines_pending = false;
+            let lines = self.lines.clone();
+            if let Some((vertices, indices)) = lines {
+                if let Err(error) = renderer.set_lines(gpu.as_mut(), &vertices, &indices) {
+                    log::warn!("bifrost: gizmo lines: {error}");
+                }
+            }
+        }
 
         // Upload anything the frame will want: a hit after the first frame is a
         // hash lookup.

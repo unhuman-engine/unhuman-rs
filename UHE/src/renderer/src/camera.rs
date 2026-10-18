@@ -168,12 +168,19 @@ impl EditorCamera {
         self.yaw
     }
 
+    /// Sets the elevation, in radians, and refreshes the view.
+    ///
+    /// The view is derived from pitch, yaw and distance, so a setter that leaves
+    /// it alone renders the previous orientation: the eye is `focal - forward *
+    /// distance`, and `forward` is the orientation's.
     pub fn set_pitch(&mut self, pitch: f32) {
         self.pitch = pitch;
+        self.update_view();
     }
 
     pub fn set_yaw(&mut self, yaw: f32) {
         self.yaw = yaw;
+        self.update_view();
     }
 
     /// The focal point the camera orbits.

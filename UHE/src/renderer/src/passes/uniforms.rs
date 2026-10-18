@@ -7,10 +7,13 @@
 //! than pushing anything. The renderer never calls it, so the same values travel
 //! as uniform buffers bound through a descriptor set.
 //!
-//! Each frame's uniform buffers and bind groups are re-created because `Resources`
-//! has no update-in-place call. One `upload_buffer`, or a push-constant range in
-//! `PipelineDesc`, would remove this; until then a frame costs one small
-//! allocation per draw.
+//! Per-draw uniforms live in one arena: [`DrawArena`] keeps a single buffer and
+//! one bind group per offset across frames, refilled through
+//! [`chassis::Resources::write_buffer`]. Re-creating the buffer and its sets every
+//! frame -- the only option while the RHI had no in-place write -- cost one
+//! allocation and one group per draw, which was the per-draw CPU cost. The
+//! frame-wide sets ([`BindSet`], [`ImageSet`]) are still rebuilt each frame;
+//! there are a handful of them, not one per draw.
 
 use bytemuck::{Pod, Zeroable};
 use chassis::{
@@ -218,38 +221,49 @@ impl Default for ImageSet {
 
 /// One buffer holding a block per draw, and the group that binds each block.
 ///
-/// One buffer is created once per frame with every draw's block in it, and one
-/// group per block with its byte offset baked in, because there are no dynamic
-/// descriptor offsets either.
+/// The buffer and its groups outlive a frame. Each frame writes every draw's
+/// block into the same buffer at the same offset and reuses the group built for
+/// that offset, so the per-frame cost is one `write_buffer` rather than a buffer
+/// and a bind group per draw. The buffer is rebuilt only when the draw count
+/// grows past its capacity or the layout changes; either invalidates every group.
+///
+/// NOTE: refilling the buffer assumes the previous frame has retired, the same
+/// assumption the per-frame destroy-and-recreate it replaced made.
 pub struct DrawArena {
     buffer: Option<Buffer>,
-    groups: Vec<BindGroup>,
+    /// Bytes allocated. The buffer is kept until a frame needs more than this.
+    capacity: u64,
+    /// Byte offset between blocks, or 0 before the first `begin`.
     stride: u64,
+    groups: Vec<BindGroup>,
+    /// The layout the groups were built from. A different one cannot bind them.
+    layout: Option<DescriptorSetLayoutDesc>,
 }
 
 impl DrawArena {
     pub fn new() -> Self {
         Self {
             buffer: None,
-            groups: Vec::new(),
+            capacity: 0,
             stride: 0,
+            groups: Vec::new(),
+            layout: None,
         }
     }
 
-    /// Uploads one block per draw, in order. `groups()` then matches `blocks`.
+    /// Refills the arena in place: one block per draw, in order. `group(index)`
+    /// then matches `blocks[index]`.
     pub fn begin(
         &mut self,
         resources: &mut dyn Resources,
         layout: &DescriptorSetLayoutDesc,
         blocks: &[Vec<u8>],
     ) -> Result<usize, chassis::Error> {
-        self.destroy(resources);
-
         if blocks.is_empty() {
             // A frame with nothing to draw has no per-draw blocks, and a buffer
-            // of zero bytes is nothing a backend will accept: the first frame of
-            // an empty scene hit exactly that and failed the whole frame. No
-            // blocks, no buffer, no groups -- the callers draw nothing.
+            // of zero bytes is nothing a backend will accept. Drop the groups and
+            // keep the buffer for the next non-empty frame.
+            self.drop_groups(resources);
             self.stride = 0;
             return Ok(0);
         }
@@ -262,27 +276,59 @@ impl DrawArena {
                 .unwrap_or(0),
             UNIFORM_ALIGNMENT,
         );
-        self.stride = stride;
+        let needed = stride * blocks.len() as u64;
 
-        let mut bytes = vec![0u8; stride as usize * blocks.len()];
+        // A new buffer, or a layout the cached groups were not built for,
+        // invalidates every group; the two are rebuilt together.
+        let layout_changed = self.layout.as_ref() != Some(layout);
+        let grown = self.buffer.is_none() || self.capacity < needed;
+        if layout_changed || grown {
+            self.drop_groups(resources);
+            if let Some(buffer) = self.buffer.take() {
+                resources.destroy_buffer(buffer);
+            }
+            // `TRANSFER_DST` is what makes the buffer writable in place on both
+            // backends: Vulkan gives a `TRANSFER_DST` buffer host-visible memory
+            // and wgpu needs `COPY_DST` for `queue.write_buffer`.
+            let buffer = resources.create_buffer(
+                BufferDesc::new(needed, BufferUsage::UNIFORM | BufferUsage::TRANSFER_DST),
+                None,
+            )?;
+            self.buffer = Some(buffer);
+            self.capacity = needed;
+            self.layout = Some(layout.clone());
+        }
+
+        let buffer = self.buffer.expect("created above when absent");
+
+        // One write for the whole frame. Bytes past `needed`, left over from a
+        // larger earlier frame, are stale and unread.
+        let mut bytes = vec![0u8; needed as usize];
         for (index, block) in blocks.iter().enumerate() {
             let start = index * stride as usize;
             bytes[start..start + block.len()].copy_from_slice(block);
         }
+        resources.write_buffer(&buffer, 0, &bytes)?;
 
-        let buffer = resources.create_buffer(
-            BufferDesc::new(bytes.len() as u64, BufferUsage::UNIFORM),
-            Some(&bytes),
-        )?;
-
-        for index in 0..blocks.len() {
-            let offset = index as u64 * stride;
-            let group = resources.create_bind_group(layout, &[(0, buffer, offset)], &[], &[])?;
-            self.groups.push(group);
+        // Groups are cached by offset: a stride change moves every offset, a
+        // count change adds or removes one.
+        if self.stride != stride || self.groups.len() != blocks.len() {
+            self.drop_groups(resources);
+            for index in 0..blocks.len() {
+                let offset = index as u64 * stride;
+                let group =
+                    resources.create_bind_group(layout, &[(0, buffer, offset)], &[], &[])?;
+                self.groups.push(group);
+            }
         }
-
-        self.buffer = Some(buffer);
+        self.stride = stride;
         Ok(self.groups.len())
+    }
+
+    fn drop_groups(&mut self, resources: &mut dyn Resources) {
+        for group in self.groups.drain(..) {
+            resources.destroy_bind_group(group);
+        }
     }
 
     pub fn group(&self, index: usize) -> Option<BindGroup> {
@@ -302,12 +348,13 @@ impl DrawArena {
     }
 
     pub fn destroy(&mut self, resources: &mut dyn Resources) {
-        for group in self.groups.drain(..) {
-            resources.destroy_bind_group(group);
-        }
+        self.drop_groups(resources);
         if let Some(buffer) = self.buffer.take() {
             resources.destroy_buffer(buffer);
         }
+        self.capacity = 0;
+        self.stride = 0;
+        self.layout = None;
     }
 }
 

@@ -195,3 +195,25 @@ fn an_editor_camera_converts_to_a_camera() {
 
     assert_eq!(camera.projection(), editor.projection());
 }
+
+/// The plugin's default view is the ground from above.
+///
+/// The grid lies at y = 0. A camera below it draws the grid's underside, which
+/// is the same picture mirrored: the axes still cross at the centre, so the only
+/// way to tell is which side of the plane the eye is on, and which way it looks.
+#[test]
+fn the_plugins_default_camera_looks_down_at_the_grid_from_above() {
+    let plugin = bifrost::BifrostPlugin::new();
+    let camera = plugin.camera();
+
+    assert!(
+        camera.position().y > 0.0,
+        "the eye is below the grid at y = {}",
+        camera.position().y
+    );
+    assert!(
+        camera.forward_direction().y < 0.0,
+        "the camera looks up at the grid, forward.y = {}",
+        camera.forward_direction().y
+    );
+}

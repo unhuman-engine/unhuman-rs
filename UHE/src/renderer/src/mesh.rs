@@ -77,6 +77,23 @@ pub fn vertex_layout() -> VertexLayout {
     }
 }
 
+/// The layout the depth prepass draws with: position alone.
+///
+/// The prepass shares the mesh's vertex buffer, so the stride and the position
+/// offset are the full vertex's, but the other attributes are not declared:
+/// `depth.wgsl` reads position and nothing else, and a declared attribute the
+/// shader never consumes is still fetched and warned about.
+pub fn depth_vertex_layout() -> VertexLayout {
+    VertexLayout {
+        stride: std::mem::size_of::<Vertex>() as u32,
+        attributes: vec![VertexAttribute {
+            location: LOCATION_POSITION,
+            format: TextureFormat::R32G32B32Float,
+            offset: std::mem::offset_of!(Vertex, position) as u32,
+        }],
+    }
+}
+
 /// A layout, as a hashable cache key.
 ///
 /// `VertexLayout` is not `Hash`, and a cache key has to be: the layout a mesh was

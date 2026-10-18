@@ -220,7 +220,7 @@ pub fn fill_gpu(material: &Material) -> MaterialGpu {
 ///
 /// The pipeline is where cull mode and blending live, so they are part of the key
 /// rather than state a draw can change.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum MaterialVariant {
     /// Opaque, back-face culled.
     Opaque,

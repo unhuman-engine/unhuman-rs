@@ -1,12 +1,19 @@
 //! Fonts.
 //!
-//! Three pieces, split by what can fail and what can be tested without a device:
-//! [`atlas`] is the file format, [`generate`] rasterizes a face at startup, and
-//! [`layout`] is pure arithmetic over a loaded atlas.
+//! Split by what can fail and what can be tested without a device: [`atlas`] is
+//! the file format, [`generate`] samples a face at startup, [`layout`] is pure
+//! arithmetic over a loaded atlas, and [`shape`], [`edge_color`], [`distance`],
+//! [`raster`] and [`reconstruct`] are the MSDF half that [`generate`] is built
+//! from.
 
 pub mod atlas;
+pub mod distance;
+pub mod edge_color;
 pub mod generate;
 pub mod layout;
+pub mod raster;
+pub mod reconstruct;
+pub mod shape;
 
 pub use atlas::{Atlas, AtlasError, Glyph, Metrics};
 pub use generate::{GenerateError, GeneratorOptions};
