@@ -89,3 +89,31 @@ pollster = "0.4"
 rodio = "0.23"
 rapier3d = "0.36"
 wgpu = { version = "30", features = ["spirv"] }
+
+# A debug build still has to run at a usable frame rate.
+#
+# Rust's default `dev` profile optimises nothing: not this workspace, not the
+# dependencies. That is fine for a CLI and ruinous for a renderer, because every
+# hot path is inside a dependency -- `glam` matrix maths, `wgpu` validation,
+# `rapier`'s solver, the glTF loader -- and each is 5-20x slower at opt-level 0
+# with no inlining across the crate boundary. The C++ engine's debug build keeps
+# its maths header-only and inlined, which is the entire reason its debug FPS
+# reads better; this closes that gap without giving up debug info or `debug_assert`
+# in our own crates.
+#
+# Dependencies go to `opt-level = 3` because they are not the code being debugged
+# and their assertions only slow a frame down. The workspace goes to `1`, not
+# `3`: enough to inline the small math and iteration helpers where the time is
+# actually spent, while keeping line-level stepping and backtraces meaningful.
+#
+# Debug info stays on for dependencies too. It is what makes a `wgpu` validation
+# panic readable -- the frames above the workspace's own are in `wgpu` and
+# `naga`, and a backtrace that names them without a line is a backtrace that
+# sends you to the wrong file. The cost is real: every test binary links both
+# drivers and `gpui`, so it is paid once per binary. `cargo clean` is the answer
+# to the size, not a smaller backtrace.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

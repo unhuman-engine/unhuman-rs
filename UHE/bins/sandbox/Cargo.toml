@@ -11,6 +11,7 @@ publish = false
 adam = { workspace = true }
 engine = { workspace = true }
 eyes = { workspace = true }
+meats = { workspace = true }
 bifrost = { workspace = true }
 wire = { workspace = true }
 femur = { workspace = true }

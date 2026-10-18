@@ -14,6 +14,9 @@ meats = { workspace = true }
 bifrost = { workspace = true }
 mirror = { workspace = true }
 chassis = { workspace = true }
+# The viewport's picking and gizmo work in `mirror`'s own types, which are glam:
+# the camera matrices the panel hands them are glam's too.
+glam = { workspace = true }
 log = { workspace = true }
 # The viewport turns a readback frame into a gpui image: `RenderImage` is built
 # from an `image::Frame`, so the editor names the same `image` crate gpui does.

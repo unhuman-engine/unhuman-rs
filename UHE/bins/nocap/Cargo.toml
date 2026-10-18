@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 adam = { workspace = true }
 meats = { workspace = true }
+pings = { workspace = true }
 wire = { workspace = true }
 femur = { workspace = true }
 aimlab = { workspace = true }

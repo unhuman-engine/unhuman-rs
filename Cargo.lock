@@ -1621,6 +1621,7 @@ dependencies = [
  "bifrost",
  "chassis",
  "engine",
+ "glam 0.33.12",
  "gpui",
  "gpui_platform",
  "image",
@@ -3814,6 +3815,7 @@ dependencies = [
  "femur",
  "log",
  "meats",
+ "pings",
  "wire",
 ]
 
@@ -4763,6 +4765,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "pings"
 version = "0.1.0"
+dependencies = [
+ "meats",
+]
 
 [[package]]
 name = "piper"
@@ -5542,6 +5547,7 @@ dependencies = [
  "eyes",
  "femur",
  "log",
+ "meats",
  "mirror",
  "stormglass",
  "wire",
