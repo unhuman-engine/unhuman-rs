@@ -219,13 +219,19 @@ dependency.
 
 ## Tooling
 
-### P2 - the gate does not say what it needs
+### P2 - a skip is not a pass, and the rest of the suite is one grep away
 
-`SLANGC` is required and undocumented in the script; the vendored path it looks
-for is not on this machine.
+Fixed for the shader suites: nine tests in `stormbreaker` printed
+`skipping: the vendored slangc is not available` and returned, so a machine with
+no compiler ran them green having compiled nothing. They panic now, naming
+`SLANGC`, and `scripts/gate.sh` counts `SKIP:` lines and prints the number.
 
-**Fixed when:** `scripts/gate.sh` prints what to set when it cannot find a
-compiler, or discovery works here.
+What is left is the same audit everywhere else: the renderer's own tests run on
+`FakeGpu`, so no test would notice a backend that records nothing (see the P0
+above), and 44 device guards still skip silently on a machine with no driver.
+
+**Fixed when:** every suite's skip count is zero on a machine that has what the
+suite needs, and the gate fails when it is not.
 
 ### P3 - RenderDoc has no in-app trigger
 

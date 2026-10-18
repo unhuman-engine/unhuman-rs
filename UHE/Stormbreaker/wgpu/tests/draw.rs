@@ -41,11 +41,11 @@ fn lit(pixels: &[u8]) -> usize {
 #[test]
 fn a_triangle_drawn_through_the_command_list_reaches_the_image() {
     let Some(adapter) = Adapter::request(0) else {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return;
     };
     let Some((device, queue)) = adapter.create_device("stormglass-draw") else {
-        eprintln!("skipping: no device");
+        eprintln!("SKIP: no device");
         return;
     };
     let mut resources = WgpuResources::new(&device);

@@ -42,43 +42,52 @@ fn shader() -> PathBuf {
 
 fn open_device() -> Option<stormbreaker::Context> {
     if !device_available() {
-        eprintln!("skipping: no Vulkan loader");
+        eprintln!("SKIP: no Vulkan loader");
         return None;
     }
     match create_device(DeviceOptions::from_env(c"stormbreaker-pipelines")) {
         Ok(context) => Some(context),
         Err(BackendError::Loader(why)) => {
-            eprintln!("skipping: loader unavailable: {why}");
+            eprintln!("SKIP: loader unavailable: {why}");
             None
         }
         Err(other) => panic!("device creation failed: {other}"),
     }
 }
 
-/// Compiles both stages and returns them, or `None` when Slang is absent.
+/// Compiles both stages and returns them.
+///
+/// Panics when there is no compiler, which is the policy `docs/WORK.md` states:
+/// "the shader-dependent backend tests compile `.slang` at run time and panic
+/// rather than skip when there is no compiler, so a job that cannot find one
+/// fails loudly instead of going green having tested nothing". Every test in this
+/// file is about a pipeline built from these modules, so a silent skip here is a
+/// test that asserts nothing.
 fn stages(
     context: &stormbreaker::Context,
     shaders: &mut stormbreaker::vulkan_shader::Shaders,
-) -> Option<(chassis::Shader, chassis::Shader)> {
-    let compiler = SlangcCompiler::new(Slangc::default()).ok()?;
+) -> (chassis::Shader, chassis::Shader) {
+    let compiler = SlangcCompiler::new(Slangc::default()).unwrap_or_else(|error| {
+        panic!("no slangc: {error}. Set SLANGC=/path/to/slangc; the vendored copy lives in a C++ checkout that is not in this tree")
+    });
     let forge = forge::Forge::new(compiler, ShaderCache::disabled());
     let directory = std::env::temp_dir().join("stormbreaker-pipeline");
-    std::fs::create_dir_all(&directory).ok()?;
+    std::fs::create_dir_all(&directory).expect("a scratch directory");
     let (vertex, fragment) = forge
         .compile_pair(&shader(), "vs_main", "fs_main", &directory)
-        .ok()?;
+        .expect("the test shader compiles");
 
     let vertex = shaders
         .create_from_words(&context.device, &vertex.words, vk::ShaderStageFlags::VERTEX)
-        .ok()?;
+        .expect("a vertex module");
     let fragment = shaders
         .create_from_words(
             &context.device,
             &fragment.words,
             vk::ShaderStageFlags::FRAGMENT,
         )
-        .ok()?;
-    Some((vertex, fragment))
+        .expect("a fragment module");
+    (vertex, fragment)
 }
 
 /// `float3 position` and `float4 color`, as the shader declares them.
@@ -144,10 +153,7 @@ fn desc_with(
 fn a_vertex_and_a_fragment_stage_create_one_pipeline() {
     let Some(context) = open_device() else { return };
     let mut shaders = stormbreaker::vulkan_shader::Shaders::with_device(Some(&context.device));
-    let Some((vertex, fragment)) = stages(&context, &mut shaders) else {
-        eprintln!("skipping: the vendored slangc is not available");
-        return;
-    };
+    let (vertex, fragment) = stages(&context, &mut shaders);
 
     let mut pipelines = stormbreaker::vulkan_pipeline_state::Pipelines::new(
         &context.device,
@@ -174,10 +180,7 @@ fn a_vertex_and_a_fragment_stage_create_one_pipeline() {
 fn a_pipeline_with_a_descriptor_set_gets_a_matching_layout() {
     let Some(context) = open_device() else { return };
     let mut shaders = stormbreaker::vulkan_shader::Shaders::with_device(Some(&context.device));
-    let Some((vertex, fragment)) = stages(&context, &mut shaders) else {
-        eprintln!("skipping: the vendored slangc is not available");
-        return;
-    };
+    let (vertex, fragment) = stages(&context, &mut shaders);
 
     let set = chassis::DescriptorSetLayoutDesc::new("frame")
         .with(chassis::BindingDesc::new(
@@ -213,10 +216,7 @@ fn a_pipeline_with_a_descriptor_set_gets_a_matching_layout() {
 fn identically_shaped_sets_share_one_layout() {
     let Some(context) = open_device() else { return };
     let mut shaders = stormbreaker::vulkan_shader::Shaders::with_device(Some(&context.device));
-    let Some((vertex, fragment)) = stages(&context, &mut shaders) else {
-        eprintln!("skipping: the vendored slangc is not available");
-        return;
-    };
+    let (vertex, fragment) = stages(&context, &mut shaders);
 
     let shape = |label: &str| {
         chassis::DescriptorSetLayoutDesc::new(label).with(chassis::BindingDesc::new(
@@ -260,10 +260,7 @@ fn identically_shaped_sets_share_one_layout() {
 fn a_different_fragment_shader_is_a_different_pipeline() {
     let Some(context) = open_device() else { return };
     let mut shaders = stormbreaker::vulkan_shader::Shaders::with_device(Some(&context.device));
-    let Some((vertex, fragment)) = stages(&context, &mut shaders) else {
-        eprintln!("skipping: the vendored slangc is not available");
-        return;
-    };
+    let (vertex, fragment) = stages(&context, &mut shaders);
 
     let compiler = SlangcCompiler::new(Slangc::default()).expect("slangc");
     let forge = forge::Forge::new(compiler, ShaderCache::disabled());
@@ -320,10 +317,7 @@ fn a_different_fragment_shader_is_a_different_pipeline() {
 fn the_same_description_is_compiled_once() {
     let Some(context) = open_device() else { return };
     let mut shaders = stormbreaker::vulkan_shader::Shaders::with_device(Some(&context.device));
-    let Some((vertex, fragment)) = stages(&context, &mut shaders) else {
-        eprintln!("skipping: the vendored slangc is not available");
-        return;
-    };
+    let (vertex, fragment) = stages(&context, &mut shaders);
 
     let mut pipelines = stormbreaker::vulkan_pipeline_state::Pipelines::new(
         &context.device,
@@ -346,10 +340,7 @@ fn the_same_description_is_compiled_once() {
 fn a_pipeline_without_a_vertex_stage_is_refused() {
     let Some(context) = open_device() else { return };
     let mut shaders = stormbreaker::vulkan_shader::Shaders::with_device(Some(&context.device));
-    let Some((vertex, fragment)) = stages(&context, &mut shaders) else {
-        eprintln!("skipping: the vendored slangc is not available");
-        return;
-    };
+    let (vertex, fragment) = stages(&context, &mut shaders);
 
     let mut description = desc_with(vertex, Some(fragment), Vec::new());
     description

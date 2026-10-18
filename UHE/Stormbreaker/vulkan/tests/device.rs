@@ -11,13 +11,13 @@ use stormbreaker::{create_device, device_available, BackendError, DeviceOptions,
 /// Returns a device, or `None` when this machine cannot run the test.
 fn open_device() -> Option<stormbreaker::Context> {
     if !device_available() {
-        eprintln!("skipping: no Vulkan loader");
+        eprintln!("SKIP: no Vulkan loader");
         return None;
     }
     match create_device(DeviceOptions::from_env(c"stormbreaker-tests")) {
         Ok(context) => Some(context),
         Err(BackendError::Loader(why)) => {
-            eprintln!("skipping: loader unavailable: {why}");
+            eprintln!("SKIP: loader unavailable: {why}");
             None
         }
         Err(other) => panic!("device creation failed: {other}"),

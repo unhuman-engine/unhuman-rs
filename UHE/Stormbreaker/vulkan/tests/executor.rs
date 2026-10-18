@@ -82,13 +82,13 @@ fn shader() -> std::path::PathBuf {
 
 fn open_device() -> Option<stormbreaker::Context> {
     if !device_available() {
-        eprintln!("skipping: no Vulkan loader");
+        eprintln!("SKIP: no Vulkan loader");
         return None;
     }
     match create_device(DeviceOptions::from_env(c"stormbreaker-executor")) {
         Ok(context) => Some(context),
         Err(stormbreaker::BackendError::Loader(why)) => {
-            eprintln!("skipping: loader unavailable: {why}");
+            eprintln!("SKIP: loader unavailable: {why}");
             None
         }
         Err(other) => panic!("device creation failed: {other}"),
@@ -773,7 +773,7 @@ fn lit_pixel(pixels: &[u8]) -> [u8; 4] {
 #[test]
 fn passes_record_on_more_than_one_thread() {
     let Ok(fixture) = fixture() else {
-        eprintln!("skipping: no vulkan fixture");
+        eprintln!("SKIP: no vulkan fixture");
         return;
     };
     let pass_count = 8u32;
@@ -926,7 +926,7 @@ fn passes_record_on_more_than_one_thread() {
 #[test]
 fn every_object_on_the_descriptor_path_creates_and_resolves() {
     let Ok(fixture) = fixture() else {
-        eprintln!("skipping: no vulkan fixture");
+        eprintln!("SKIP: no vulkan fixture");
         return;
     };
 

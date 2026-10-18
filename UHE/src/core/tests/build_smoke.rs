@@ -180,7 +180,7 @@ fn the_backend_file_map_is_accounted_for() {
     // depth-sensitive path that resolves to nothing makes the test skip while
     // reporting success.
     let Some(cpp) = find_upwards(root, "UHE/src/Platform/Vulkan") else {
-        eprintln!("skipping: the C++ tree is not present");
+        eprintln!("SKIP: the C++ tree is not present");
         return;
     };
 

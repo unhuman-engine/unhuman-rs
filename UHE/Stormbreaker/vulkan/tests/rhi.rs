@@ -16,13 +16,13 @@ use stormbreaker::{create_device, device_available, DeviceOptions};
 
 fn open_device() -> Option<stormbreaker::Context> {
     if !device_available() {
-        eprintln!("skipping: no Vulkan loader");
+        eprintln!("SKIP: no Vulkan loader");
         return None;
     }
     match create_device(DeviceOptions::from_env(c"stormbreaker-resources-rhi")) {
         Ok(context) => Some(context),
         Err(stormbreaker::BackendError::Loader(why)) => {
-            eprintln!("skipping: loader unavailable: {why}");
+            eprintln!("SKIP: loader unavailable: {why}");
             None
         }
         Err(other) => panic!("device creation failed: {other}"),

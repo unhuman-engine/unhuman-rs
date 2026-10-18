@@ -421,7 +421,7 @@ fn a_gpu_with_no_surface_reports_no_swapchain() {
         height: 64,
     };
     let Ok(mut gpu) = WgpuGpu::headless(extent) else {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return;
     };
 
@@ -462,7 +462,7 @@ fn record_frame_records_offscreen_and_refuses_a_swapchain_frame_headless() {
         height: 64,
     };
     let Ok(mut gpu) = WgpuGpu::headless(extent) else {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return;
     };
 

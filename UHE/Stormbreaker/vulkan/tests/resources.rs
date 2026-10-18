@@ -13,7 +13,7 @@ use stormbreaker::{content_hash, Buffers, Context, Recorder, Shaders, Textures, 
 
 fn open() -> Option<Context> {
     if !stormbreaker::device_available() {
-        eprintln!("skipping: no Vulkan loader");
+        eprintln!("SKIP: no Vulkan loader");
         return None;
     }
     match stormbreaker::create_device(stormbreaker::DeviceOptions::from_env(c"stormbreaker-tests"))

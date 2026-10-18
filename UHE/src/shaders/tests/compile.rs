@@ -76,7 +76,7 @@ fn a_broken_shader_reports_the_line_it_is_on() {
 #[test]
 fn a_good_shader_compiles_to_valid_spirv() {
     let Some(compiler) = compiler() else {
-        eprintln!("skipping: the vendored slangc is not available");
+        eprintln!("SKIP: the vendored slangc is not available");
         return;
     };
 
@@ -108,7 +108,7 @@ fn a_good_shader_compiles_to_valid_spirv() {
 #[test]
 fn a_vertex_fragment_pair_is_two_modules_and_they_differ() {
     let Some(compiler) = compiler() else {
-        eprintln!("skipping: the vendored slangc is not available");
+        eprintln!("SKIP: the vendored slangc is not available");
         return;
     };
 
@@ -133,7 +133,7 @@ fn a_vertex_fragment_pair_is_two_modules_and_they_differ() {
 #[test]
 fn the_second_compile_is_a_cache_hit_and_the_first_is_not() {
     let Some(compiler) = compiler() else {
-        eprintln!("skipping: the vendored slangc is not available");
+        eprintln!("SKIP: the vendored slangc is not available");
         return;
     };
 
@@ -168,7 +168,7 @@ fn the_second_compile_is_a_cache_hit_and_the_first_is_not() {
 #[test]
 fn editing_the_source_misses_the_cache() {
     let Some(compiler) = compiler() else {
-        eprintln!("skipping: the vendored slangc is not available");
+        eprintln!("SKIP: the vendored slangc is not available");
         return;
     };
 
@@ -214,7 +214,7 @@ fn editing_the_source_misses_the_cache() {
 #[test]
 fn a_missing_entry_point_is_an_error_not_a_silent_success() {
     let Some(compiler) = compiler() else {
-        eprintln!("skipping: the vendored slangc is not available");
+        eprintln!("SKIP: the vendored slangc is not available");
         return;
     };
 

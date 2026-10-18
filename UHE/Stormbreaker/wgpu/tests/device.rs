@@ -14,7 +14,7 @@ use stormglass::wgpu_device::{self, Adapter};
 fn adapters() -> Vec<Adapter> {
     let found = Adapter::enumerate();
     if found.is_empty() {
-        eprintln!("skipping: no wgpu adapter on this machine");
+        eprintln!("SKIP: no wgpu adapter on this machine");
     }
     found
 }
@@ -42,7 +42,7 @@ fn an_adapter_exists() {
 #[test]
 fn a_device_can_be_created_headless() {
     let Some(adapter) = Adapter::request(0) else {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return;
     };
     let (device, queue) = adapter.create_device("stormglass-test").expect("a device");
@@ -74,7 +74,7 @@ fn a_device_can_be_created_headless() {
 #[test]
 fn a_device_can_bind_the_frame_sets_storage_buffer() {
     let Some(adapter) = Adapter::request(0) else {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return;
     };
     let (device, _queue) = adapter
@@ -217,7 +217,7 @@ fn texture_usages_translate() {
 fn backends_can_be_listed_for_a_launcher() {
     let backends = wgpu_device::enumerate_backends();
     if backends.is_empty() {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return;
     }
     for backend in &backends {

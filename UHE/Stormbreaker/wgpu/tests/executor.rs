@@ -63,7 +63,7 @@ fn bind_target(executor: &mut WgpuExecutor, slot: rg::TextureId) {
 #[test]
 fn a_compiled_frame_runs_through_the_executor() {
     let Some(adapter) = Adapter::request(0) else {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return;
     };
     let Some((device, queue)) = adapter.create_device("stormglass-executor") else {
@@ -477,7 +477,7 @@ fn a_frame_that_never_draws_the_swapchain_image_needs_no_image() {
 #[ignore = "needs a GPU adapter; the swapchain image itself needs a window"]
 fn the_recorded_scope_sees_the_bound_swapchain_image() {
     let Some(adapter) = Adapter::request(0) else {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return;
     };
     let Some((device, queue)) = adapter.create_device("stormglass-backbuffer") else {

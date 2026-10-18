@@ -55,14 +55,32 @@ else
   export UHE_VALIDATION=1
   cargo test --workspace -- "${THREADS[@]}"
 
-  step "validation errors must be zero"
-  # Re-run capturing output: a pipeline's exit status does not carry this, and a
-  # validation error is printed by the layer rather than returned by cargo.
+  step "what the run did not test"
+  # One re-run, captured, because a pipeline's exit status carries neither of the
+  # two things below: a skip is printed by a test, and a validation error is
+  # printed by the layer.
+  #
+  # The skip count is here because a green run that skipped half the suite is the
+  # failure this gate exists to prevent, and the number is what makes it visible.
+  # The one skip that is never allowed is a missing compiler: `docs/WORK.md` is
+  # explicit that a shader test must panic rather than report success having
+  # compiled nothing, so the shader suites panic instead of printing a skip, and
+  # this is the guard for the day one of them stops doing that.
+  output=$(cargo test --workspace -- "${THREADS[@]}" 2>&1 || true)
+
+  skipped=$(printf '%s\n' "$output" | grep -cE '^SKIP: ' || true)
+  if printf '%s\n' "$output" | grep -qE '^SKIP: .*(slangc|compiler)'; then
+    echo "FAIL: a shader test skipped for want of a compiler." >&2
+    echo "Set SLANGC=/path/to/slangc. A skipped shader test is a green run that" >&2
+    echo "compiled nothing." >&2
+    exit 1
+  fi
+  echo "$skipped test(s) skipped, each one having asserted nothing"
+
   # Only the Khronos layer's format (`Validation Error: [ VUID-... ]`). wgpu
   # prints its own "Validation Error" from a deliberately corrupt-shader test,
   # and that is not a Vulkan validation error.
-  count=$(cargo test --workspace -- "${THREADS[@]}" 2>&1 \
-    | grep -cE 'Validation Error: \[' || true)
+  count=$(printf '%s\n' "$output" | grep -cE 'Validation Error: \[' || true)
   if [[ "$count" != "0" ]]; then
     echo "FAIL: $count validation error(s)." >&2
     echo "These are almost always real. Run locally for the full message:" >&2

@@ -30,7 +30,7 @@ fn backend() -> Option<WgpuResources> {
 macro_rules! with_backend {
     (|$resources:ident| $body:block) => {
         let Some(mut $resources) = backend() else {
-            eprintln!("skipping: no wgpu adapter");
+            eprintln!("SKIP: no wgpu adapter");
             return;
         };
         $body
@@ -207,7 +207,7 @@ fn malformed_spirv_is_refused_with_a_reason() {
 #[test]
 fn the_shared_shader_from_forge_is_accepted() {
     let Some(mut resources) = backend() else {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return;
     };
     let compiler =
@@ -356,7 +356,7 @@ fn an_offset_at_or_past_the_end_is_refused() {
 #[test]
 fn a_graphics_pipeline_from_the_shared_shader_creates() {
     let Some(mut resources) = backend() else {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return;
     };
 
@@ -515,7 +515,7 @@ fn a_pipeline_without_a_vertex_stage_is_refused() {
 #[should_panic(expected = "Validation Error")]
 fn a_module_with_a_valid_magic_and_a_corrupt_body_panics_wgpu() {
     let Some(mut resources) = backend() else {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return;
     };
     let resources: &mut dyn Resources = &mut resources;

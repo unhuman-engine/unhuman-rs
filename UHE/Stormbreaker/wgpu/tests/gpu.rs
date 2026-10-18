@@ -126,7 +126,7 @@ fn unrelated_arguments_are_left_alone() {
 
 fn open_gpu() -> Option<WgpuGpu> {
     if Adapter::request(0).is_none() {
-        eprintln!("skipping: no wgpu adapter");
+        eprintln!("SKIP: no wgpu adapter");
         return None;
     }
     WgpuGpu::headless(chassis::Extent2d {

@@ -38,31 +38,34 @@ fn shader() -> PathBuf {
 
 fn open_device() -> Option<stormbreaker::Context> {
     if !device_available() {
-        eprintln!("skipping: no Vulkan loader");
+        eprintln!("SKIP: no Vulkan loader");
         return None;
     }
     match create_device(DeviceOptions::from_env(c"stormbreaker-shaders")) {
         Ok(context) => Some(context),
         Err(BackendError::Loader(why)) => {
-            eprintln!("skipping: loader unavailable: {why}");
+            eprintln!("SKIP: loader unavailable: {why}");
             None
         }
         Err(other) => panic!("device creation failed: {other}"),
     }
 }
 
-fn forge() -> Option<Forge> {
-    let compiler = forge::slangc::SlangcCompiler::new(Slangc::default()).ok()?;
-    Some(Forge::new(compiler, ShaderCache::disabled()))
+/// A compiler, or a panic naming the variable that is missing.
+///
+/// `docs/WORK.md`: a shader test that cannot find a compiler must fail, not
+/// report success having compiled nothing.
+fn forge() -> Forge {
+    let compiler = forge::slangc::SlangcCompiler::new(Slangc::default()).unwrap_or_else(|error| {
+        panic!("no slangc: {error}. Set SLANGC=/path/to/slangc; the vendored copy lives in a C++ checkout that is not in this tree")
+    });
+    Forge::new(compiler, ShaderCache::disabled())
 }
 
 #[test]
 fn slang_source_becomes_a_real_shader_module() {
     let Some(context) = open_device() else { return };
-    let Some(forge) = forge() else {
-        eprintln!("skipping: the vendored slangc is not available");
-        return;
-    };
+    let forge = forge();
 
     let scratch = std::env::temp_dir().join("stormbreaker-shader.vert.spv");
     let mut shaders = stormbreaker::vulkan_shader::Shaders::with_device(Some(&context.device));
@@ -95,10 +98,7 @@ fn slang_source_becomes_a_real_shader_module() {
 #[test]
 fn one_source_yields_two_distinct_stage_modules() {
     let Some(context) = open_device() else { return };
-    let Some(forge) = forge() else {
-        eprintln!("skipping: the vendored slangc is not available");
-        return;
-    };
+    let forge = forge();
 
     let directory = std::env::temp_dir().join("stormbreaker-shader-pair");
     std::fs::create_dir_all(&directory).expect("scratch");
@@ -139,10 +139,7 @@ fn one_source_yields_two_distinct_stage_modules() {
 #[test]
 fn a_rejected_shader_reports_the_compilers_own_diagnostic() {
     let _ = open_device(); // A driver is not needed to reject a shader.
-    let Some(forge) = forge() else {
-        eprintln!("skipping: the vendored slangc is not available");
-        return;
-    };
+    let forge = forge();
 
     let broken = std::env::temp_dir().join("stormbreaker-broken.slang");
     std::fs::write(
