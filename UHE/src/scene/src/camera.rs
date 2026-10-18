@@ -55,12 +55,14 @@ impl SceneCamera {
         camera
     }
 
-    /// Right-handed with a `[-1, 1]` depth range; glam spells those
-    /// `camera::rh::proj::opengl`.
+    /// Right-handed with a `[0, 1]` depth range, matching the renderer's editor
+    /// camera and the Vulkan/wgpu backends; glam spells that convention
+    /// `camera::rh::proj::directx`. An OpenGL `[-1, 1]` range here would put the
+    /// near half of the frustum behind the near plane and clip it.
     pub fn projection(&self) -> Mat4 {
         let aspect = self.effective_aspect_ratio();
         match self.projection_type {
-            ProjectionType::Perspective => glam::camera::rh::proj::opengl::perspective(
+            ProjectionType::Perspective => glam::camera::rh::proj::directx::perspective(
                 self.perspective_fov,
                 aspect,
                 self.perspective_near,
@@ -69,7 +71,7 @@ impl SceneCamera {
             ProjectionType::Orthographic => {
                 let half_height = self.orthographic_size * 0.5;
                 let half_width = half_height * aspect;
-                glam::camera::rh::proj::opengl::orthographic(
+                glam::camera::rh::proj::directx::orthographic(
                     -half_width,
                     half_width,
                     -half_height,

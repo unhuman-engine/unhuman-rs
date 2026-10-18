@@ -27,16 +27,17 @@ fn perspective_projection_at_a_known_aspect() {
     camera.set_viewport_size(16.0, 9.0);
     assert_eq!(camera.projection_type(), ProjectionType::Perspective);
 
-    // f = 1 / tan(fov / 2) = 1 at fov = pi/2, so the standard OpenGL
-    // perspective matrix: 1/aspect across, 1 up, and the near/far terms.
+    // f = 1 / tan(fov / 2) = 1 at fov = pi/2, so the standard right-handed
+    // perspective matrix with a `[0, 1]` depth range: 1/aspect across, 1 up,
+    // `-far/(far-near)` and `-near*far/(far-near)` down the z column.
     let aspect = 16.0 / 9.0;
     let near = 0.1;
     let far = 100.0;
     let expected = Mat4::from_cols(
         Vec4::new(1.0 / aspect, 0.0, 0.0, 0.0),
         Vec4::new(0.0, 1.0, 0.0, 0.0),
-        Vec4::new(0.0, 0.0, -(far + near) / (far - near), -1.0),
-        Vec4::new(0.0, 0.0, -2.0 * far * near / (far - near), 0.0),
+        Vec4::new(0.0, 0.0, -far / (far - near), -1.0),
+        Vec4::new(0.0, 0.0, -near * far / (far - near), 0.0),
     );
     assert_matrices_close(camera.projection(), expected);
 }
@@ -48,12 +49,13 @@ fn orthographic_projection_at_a_known_aspect() {
     assert_eq!(camera.projection_type(), ProjectionType::Orthographic);
 
     // half_height = size / 2 = 5, half_width = half_height * aspect = 10, so the
-    // projection spans [-10, 10] x [-5, 5] with near/far of -1 and 1.
+    // projection spans [-10, 10] x [-5, 5]. With a right-handed `[0, 1]` depth
+    // range over near/far of -1 and 1, z maps through -1/2 with a 1/2 shift.
     let expected = Mat4::from_cols(
         Vec4::new(1.0 / 10.0, 0.0, 0.0, 0.0),
         Vec4::new(0.0, 1.0 / 5.0, 0.0, 0.0),
-        Vec4::new(0.0, 0.0, -1.0, 0.0),
-        Vec4::new(0.0, 0.0, 0.0, 1.0),
+        Vec4::new(0.0, 0.0, -0.5, 0.0),
+        Vec4::new(0.0, 0.0, 0.5, 1.0),
     );
     assert_matrices_close(camera.projection(), expected);
 }
