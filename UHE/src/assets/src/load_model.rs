@@ -1,45 +1,49 @@
 //! glTF/GLB model loading entry point and scene-graph walk.
 //!
-//! This file owns everything that needs the whole asset (materials, the scene
-//! walk, resource lifetime) while primitive extraction and animation parsing
-//! live in their own modules, matching the split of the three loaders.
-//!
-//! **Not done:** `EXT_meshopt_compression`. Compressed buffer views were
-//! decoded through meshoptimizer, a C library. Reading those views without
-//! decoding yields garbage geometry, so a file that declares the extension is
-//! refused with that reason instead. The KHR extension blocks
-//! (`KHR_materials_clearcoat`, `KHR_materials_specular`,
-//! `KHR_materials_transmission`, `KHR_texture_transform`, `KHR_lights_punctual`,
-//! `KHR_texture_basisu`) are not read either: `gltf`'s accessors for them are
-//! feature-gated and the workspace manifest enables only `utils`/`names`/
-//! `extensions`. They are reported by name in
-//! [`ModelData::unsupported_extensions`] so a file that uses one is not
-//! silently mis-shaded.
+//! This file owns everything that needs the whole asset (extension reporting,
+//! the scene walk, resource lifetime), while material assembly, primitive
+//! extraction, lights and animation parsing live in their own modules.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 use glam::Mat4;
 use gltf::buffer::Data as BufferData;
 
 use crate::error::{Error, Result};
-use crate::image::{decode_image, Image, MipLevel};
-use crate::ktx2::{is_ktx2, load_ktx2};
+use crate::load_lights::{node_light, parse_lights};
+use crate::load_material::load_materials;
 use crate::load_model_animation::{parse_animations, parse_skins};
 use crate::load_model_geometry::extract_primitive;
-use crate::mesh::{
-    AlphaMode, Filter, MaterialData, MeshData, ModelData, ModelNode, SamplerData, TextureData, Wrap,
-};
+use crate::mesh::{MaterialData, MeshData, ModelData, ModelNode};
 
 /// Extensions whose values reach this crate's output.
 ///
+/// The list is the C++ loader's contract, minus `KHR_draco_mesh_compression`
+/// (no decoder, deliberately absent) and with `EXT_meshopt_compression` guarded
+/// separately below: its declared buffer views cannot be decoded here, so a file
+/// that actually compresses with it is refused before this list is consulted.
 /// An extension belongs here only if its values are actually shaded with,
 /// because a parsed-but-ignored extension renders subtly wrong with no error
-/// anywhere. This build reads no extension at all (the `gltf` features that
-/// would parse them are off), so the list is empty and every declared name is
-/// reported instead.
-const SUPPORTED_EXTENSIONS: &[&str] = &[];
+/// anywhere.
+const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "KHR_materials_pbrSpecularGlossiness",
+    "KHR_texture_transform",
+    "KHR_materials_unlit",
+    "KHR_materials_emissive_strength",
+    "KHR_materials_ior",
+    "KHR_materials_clearcoat",
+    "KHR_materials_specular",
+    "KHR_materials_sheen",
+    "KHR_materials_transmission",
+    "KHR_materials_volume",
+    "KHR_materials_iridescence",
+    "KHR_materials_anisotropy",
+    "KHR_materials_diffuse_transmission",
+    "KHR_lights_punctual",
+    "KHR_texture_basisu",
+    "EXT_meshopt_compression",
+];
 
 pub(crate) struct LoadedModel {
     pub meshes: Vec<MeshData>,
@@ -84,32 +88,25 @@ pub(crate) fn load(path: &Path, bytes: &[u8]) -> Result<LoadedModel> {
     let buffers = gltf::import_buffers(&document, Some(base), blob)
         .map_err(|error| Error::Decode(format!("glTF buffers: {error}")))?;
 
-    let mut unsupported_extensions: Vec<String> = Vec::new();
-    for name in document
-        .extensions_used()
-        .chain(document.extensions_required())
-    {
-        if name == "EXT_meshopt_compression" {
-            return Err(Error::Unsupported(
-                "EXT_meshopt_compression: the file's buffer views are meshopt-compressed and the \
-                 meshoptimizer decoder is a C library this crate does not link, so the bytes would \
-                 decode as garbage geometry"
-                    .to_owned(),
-            ));
-        }
-        if !SUPPORTED_EXTENSIONS.contains(&name)
-            && !unsupported_extensions
-                .iter()
-                .any(|seen| seen.as_str() == name)
-        {
-            unsupported_extensions.push(name.to_owned());
-        }
+    // A compressed view cannot be handed to the accessor readers, which see the
+    // buffer, not the view; the glTF crate has no hook to decode one. Refusing
+    // when a view actually uses the extension beats handing geometry bytes to a
+    // shader as if they were vertices.
+    if uses_meshopt(&document) {
+        return Err(Error::Unsupported(
+            "EXT_meshopt_compression: the file's buffer views are meshopt-compressed and this \
+             crate has no decoder, so the compressed bytes would decode as garbage geometry"
+                .to_owned(),
+        ));
     }
+
+    let unsupported_extensions = collect_unsupported(&document);
     for name in &unsupported_extensions {
         log::warn!("glTF declares unimplemented extension '{name}' - shading may be wrong");
     }
 
     let materials = load_materials(&document, base, &buffers);
+    let punctual_lights = parse_lights(&document);
     let (skins, skeleton) = parse_skins(&document, &buffers);
     let animations = parse_animations(&document, &buffers);
 
@@ -118,6 +115,7 @@ pub(crate) fn load(path: &Path, bytes: &[u8]) -> Result<LoadedModel> {
         nodes,
         buffers: buffers.as_slice(),
         materials: materials.as_slice(),
+        light_count: punctual_lights.len(),
         geometry: HashMap::new(),
         mesh_data: Vec::new(),
         model_nodes: Vec::new(),
@@ -152,9 +150,37 @@ pub(crate) fn load(path: &Path, bytes: &[u8]) -> Result<LoadedModel> {
         nodes: walk.model_nodes,
         roots,
         skins,
+        punctual_lights,
         unsupported_extensions,
     };
     Ok(LoadedModel { meshes, model })
+}
+
+/// Whether any buffer view is `EXT_meshopt_compression`-compressed.
+fn uses_meshopt(document: &gltf::Document) -> bool {
+    document
+        .views()
+        .any(|view| view.extension_value("EXT_meshopt_compression").is_some())
+}
+
+/// The declared extensions this loader does not honour, each once.
+///
+/// Both lists are consulted: `extensionsRequired` is a hard requirement the file
+/// cannot be correct without, and a file may require an extension it does not
+/// list as used.
+fn collect_unsupported(document: &gltf::Document) -> Vec<String> {
+    let mut unsupported: Vec<String> = Vec::new();
+    for name in document
+        .extensions_used()
+        .chain(document.extensions_required())
+    {
+        if !SUPPORTED_EXTENSIONS.contains(&name)
+            && !unsupported.iter().any(|seen| seen.as_str() == name)
+        {
+            unsupported.push(name.to_owned());
+        }
+    }
+    unsupported
 }
 
 /// The glTF scene walk: node records in depth-first order, geometry extracted
@@ -163,6 +189,7 @@ struct Walk<'a, 'b> {
     nodes: Vec<gltf::Node<'a>>,
     buffers: &'b [BufferData],
     materials: &'b [MaterialData],
+    light_count: usize,
     /// `glTF` mesh index -> indices into `mesh_data`.
     geometry: HashMap<usize, Vec<u32>>,
     mesh_data: Vec<MeshData>,
@@ -204,6 +231,7 @@ impl<'a, 'b> Walk<'a, 'b> {
             rotation,
             scale,
             world_transform: world_transform.to_cols_array_2d(),
+            light: node_light(&node, self.light_count),
         });
 
         let children: Vec<usize> = node.children().map(|child| child.index()).collect();
@@ -251,248 +279,19 @@ impl<'a, 'b> Walk<'a, 'b> {
     }
 }
 
-/// Decoded material textures, keyed by (image index, colour space, sampler).
-type TextureCache = HashMap<(usize, bool, SamplerData), Option<Arc<TextureData>>>;
-
-/// Every material in the file, with its textures decoded.
-///
-/// Colour space is a property of the *slot*: `baseColor` and `emissive` are
-/// sRGB, `metallicRoughness`, `normal` and `occlusion` are linear data, and
-/// using one format for all of them gamma-decodes the linear maps on every
-/// sample.
-fn load_materials(
-    document: &gltf::Document,
-    base: &Path,
-    buffers: &[BufferData],
-) -> Vec<MaterialData> {
-    // One glTF image is routinely bound by several materials and slots; without
-    // this the identical pixels are decoded and resident once per reference.
-    let mut cache = TextureCache::new();
-    let mut materials = Vec::new();
-
-    for material in document.materials() {
-        let mut out = MaterialData {
-            name: material.name().map(str::to_owned).unwrap_or_default(),
-            ..Default::default()
-        };
-
-        let pbr = material.pbr_metallic_roughness();
-        out.base_color = pbr.base_color_factor();
-        out.metallic = pbr.metallic_factor();
-        out.roughness = pbr.roughness_factor();
-        out.emissive = material.emissive_factor();
-        out.alpha = match material.alpha_mode() {
-            gltf::material::AlphaMode::Mask => AlphaMode::Mask,
-            gltf::material::AlphaMode::Blend => AlphaMode::Blend,
-            gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
-        };
-        out.alpha_cutoff = material.alpha_cutoff().unwrap_or(0.5);
-        out.double_sided = material.double_sided();
-
-        out.albedo = pbr
-            .base_color_texture()
-            .and_then(|info| load_texture(info.texture(), &mut cache, base, buffers, true));
-        out.metallic_roughness = pbr.metallic_roughness_texture().and_then(|info| {
-            // Metallic (B) and roughness (G) are scalars, not colour: gamma
-            // decoding them shifts both.
-            load_texture(info.texture(), &mut cache, base, buffers, false)
-        });
-
-        if let Some(normal) = material.normal_texture() {
-            out.normal = load_texture(normal.texture(), &mut cache, base, buffers, false);
-            out.normal_scale = normal.scale();
-        }
-        if let Some(occlusion) = material.occlusion_texture() {
-            out.occlusion = load_texture(occlusion.texture(), &mut cache, base, buffers, false);
-            out.occlusion_strength = occlusion.strength();
-        }
-        if let Some(info) = material.emissive_texture() {
-            out.emissive_texture = load_texture(info.texture(), &mut cache, base, buffers, true);
-        }
-
-        materials.push(out);
-    }
-
-    materials
-}
-
-fn load_texture(
-    texture: gltf::Texture<'_>,
-    cache: &mut TextureCache,
-    base: &Path,
-    buffers: &[BufferData],
-    srgb: bool,
-) -> Option<Arc<TextureData>> {
-    let sampler = sampler_data(texture.sampler());
-    let key = (texture.index(), srgb, sampler);
-    if let Some(cached) = cache.get(&key) {
-        return cached.clone();
-    }
-
-    let image = image_bytes(texture.source().source(), base, buffers)
-        .and_then(|bytes| decode_texture(&bytes, srgb))
-        .map(|(image, mips)| {
-            Arc::new(TextureData {
-                image: Arc::new(image),
-                mips: mips.into(),
-                sampler,
-            })
-        });
-
-    cache.insert(key, image.clone());
-    image
-}
-
-/// Decodes an image payload, KTX2 or otherwise, keeping any authored mip chain.
-fn decode_texture(bytes: &[u8], srgb: bool) -> Option<(Image, Vec<MipLevel>)> {
-    if is_ktx2(bytes) {
-        match load_ktx2(bytes) {
-            Ok(ktx) => {
-                let image = Image {
-                    width: ktx.width,
-                    height: ktx.height,
-                    rgba8: ktx.rgba8,
-                    srgb: ktx.srgb,
-                };
-                Some((image, ktx.mips))
-            }
-            Err(error) => {
-                log::warn!("model texture: {error}");
-                None
-            }
-        }
-    } else {
-        match decode_image(bytes, srgb) {
-            Ok(image) => Some((image, Vec::new())),
-            Err(error) => {
-                log::warn!("model texture: {error}");
-                None
-            }
-        }
-    }
-}
-
-/// The encoded bytes of one `glTF` image, however the file stores it.
-///
-/// An external URI, a `data:` URI, or a slice of a buffer view (which in a GLB
-/// is the common case for embedded textures).
-fn image_bytes(
-    source: gltf::image::Source<'_>,
-    base: &Path,
-    buffers: &[BufferData],
-) -> Option<Vec<u8>> {
-    match source {
-        gltf::image::Source::Uri { uri, .. } => {
-            if let Some(rest) = uri.strip_prefix("data:") {
-                let (_, payload) = rest.split_once(";base64,")?;
-                base64_decode(payload)
-            } else {
-                std::fs::read(base.join(uri)).ok()
-            }
-        }
-        gltf::image::Source::View { view, .. } => {
-            let buffer = buffers.get(view.buffer().index())?;
-            let end = view.offset().checked_add(view.length())?;
-            buffer.0.get(view.offset()..end).map(|bytes| bytes.to_vec())
-        }
-    }
-}
-
-/// The sampler a texture declares, with the spec defaults for what it omits.
-///
-/// Every mip-map variant of a filter folds into the filter itself, because mip
-/// selection is the sampler's other axis; wrap S and wrap T stay independent,
-/// since applying one mode to both axes is wrong for any atlas that clamps U
-/// and repeats V.
-fn sampler_data(sampler: gltf::texture::Sampler<'_>) -> SamplerData {
-    let default = SamplerData::default();
-    SamplerData {
-        mag_filter: sampler.mag_filter().map_or(default.mag_filter, filter),
-        min_filter: sampler.min_filter().map_or(default.min_filter, min_filter),
-        wrap_s: wrap(sampler.wrap_s()),
-        wrap_t: wrap(sampler.wrap_t()),
-    }
-}
-
-fn filter(mag: gltf::texture::MagFilter) -> Filter {
-    match mag {
-        gltf::texture::MagFilter::Nearest => Filter::Nearest,
-        gltf::texture::MagFilter::Linear => Filter::Linear,
-    }
-}
-
-fn min_filter(min: gltf::texture::MinFilter) -> Filter {
-    match min {
-        gltf::texture::MinFilter::Nearest
-        | gltf::texture::MinFilter::NearestMipmapNearest
-        | gltf::texture::MinFilter::NearestMipmapLinear => Filter::Nearest,
-        gltf::texture::MinFilter::Linear
-        | gltf::texture::MinFilter::LinearMipmapNearest
-        | gltf::texture::MinFilter::LinearMipmapLinear => Filter::Linear,
-    }
-}
-
-fn wrap(mode: gltf::texture::WrappingMode) -> Wrap {
-    match mode {
-        gltf::texture::WrappingMode::ClampToEdge => Wrap::ClampToEdge,
-        gltf::texture::WrappingMode::MirroredRepeat => Wrap::MirroredRepeat,
-        gltf::texture::WrappingMode::Repeat => Wrap::Repeat,
-    }
-}
-
-/// Standard base64, tolerating whitespace and stopping at the padding.
-///
-/// The glTF crate decodes `data:` URIs for buffers itself, but an *image*
-/// embedded that way is handed to the caller as a URI, so one of the two has to
-/// own the decoder. Kept local and small rather than adding a crate for it.
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() / 4 * 3);
-    let mut accumulator: u32 = 0;
-    let mut bits: u32 = 0;
-
-    for byte in input.bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            b'\n' | b'\r' | b' ' | b'\t' => continue,
-            _ => return None,
-        } as u32;
-        accumulator = (accumulator << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((accumulator >> bits) as u8);
-        }
-    }
-
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn base64_decodes_padding_and_ignores_whitespace() {
-        assert_eq!(base64_decode("AQIDBA=="), Some(vec![1, 2, 3, 4]));
-        assert_eq!(base64_decode("AQID\nBA=="), Some(vec![1, 2, 3, 4]));
-        assert_eq!(base64_decode(""), Some(Vec::new()));
-        assert_eq!(base64_decode("AQID*"), None);
+    fn draco_is_not_in_the_supported_list() {
+        assert!(!SUPPORTED_EXTENSIONS.contains(&"KHR_draco_mesh_compression"));
+        assert!(SUPPORTED_EXTENSIONS.contains(&"KHR_materials_clearcoat"));
+        assert!(SUPPORTED_EXTENSIONS.contains(&"KHR_texture_basisu"));
     }
 
     #[test]
-    fn min_filter_folds_the_mip_variants() {
-        assert_eq!(
-            min_filter(gltf::texture::MinFilter::LinearMipmapLinear),
-            Filter::Linear
-        );
-        assert_eq!(
-            min_filter(gltf::texture::MinFilter::NearestMipmapNearest),
-            Filter::Nearest
-        );
+    fn a_nameless_file_is_not_a_valid_document() {
+        assert!(gltf::Gltf::from_slice(b"").is_err());
     }
 }

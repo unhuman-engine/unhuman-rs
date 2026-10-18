@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use grind::Jobs;
 
+use crate::cache::{Cache, DEFAULT_CAPACITY};
+use crate::cache_hash::AssetHash;
 use crate::error::{Error, Result};
 use crate::id::{AssetData, AssetId, AssetKind, Handle};
 use crate::image::{decode_image, Image, MipLevel};
@@ -24,6 +27,13 @@ pub type LoadResult = std::result::Result<AssetKind, Error>;
 /// One type for the synchronous and the worker path, so both reach the registry
 /// through the same code and cannot diverge on what a slot holds.
 struct Decoded {
+    /// The content address of `bytes`: the asset's stable identity.
+    hash: AssetHash,
+    /// The address of everything this decode depended on. Equal to `hash` for a
+    /// pure decode; a model folds its directory in, because its external buffers
+    /// resolve relative to the file, and a kind is folded in because the same
+    /// bytes are text under one extension and binary under another.
+    key: AssetHash,
     kind: AssetKind,
     bytes: Vec<u8>,
     image: Option<Image>,
@@ -51,12 +61,11 @@ struct Slot {
     generation: u32,
     path: String,
     kind: AssetKind,
+    hash: AssetHash,
     state: LoadState,
-    bytes: Vec<u8>,
-    image: Option<Image>,
-    mips: Vec<MipLevel>,
-    meshes: Vec<MeshData>,
-    model: Option<ModelData>,
+    /// The decoded payload. Shared with the cache, so two assets with identical
+    /// bytes point at one decode without the registry duplicating it.
+    decoded: Option<Arc<Decoded>>,
 }
 
 impl Slot {
@@ -66,13 +75,14 @@ impl Slot {
             generation: 1,
             path: String::new(),
             kind: AssetKind::Binary,
+            hash: AssetHash::of(&[]),
             state: LoadState::Loading,
-            bytes: Vec::new(),
-            image: None,
-            mips: Vec::new(),
-            meshes: Vec::new(),
-            model: None,
+            decoded: None,
         }
+    }
+
+    fn data(&self) -> Option<&Decoded> {
+        self.decoded.as_deref()
     }
 }
 
@@ -89,6 +99,10 @@ impl Slot {
 pub struct Assets {
     vfs: Vfs,
     slots: Vec<Slot>,
+    /// Decoded payloads keyed by content address, so a release can drop a slot
+    /// without dropping the decode and a reload or a second path with the same
+    /// bytes is a hit.
+    cache: Cache<Arc<Decoded>>,
     /// Indices of released slots, for reuse.
     free: Vec<u32>,
     /// Virtual path -> the live id for it, so a second request shares the first
@@ -106,12 +120,20 @@ pub struct Assets {
 impl Assets {
     /// A registry with `root` as its first (and initially only) search root.
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::with_cache_capacity(root, DEFAULT_CAPACITY)
+    }
+
+    /// A registry whose payload cache holds at most `capacity` decodes. A small
+    /// capacity is how a caller bounds memory, and how eviction is exercised
+    /// without loading hundreds of assets.
+    pub fn with_cache_capacity(root: impl Into<PathBuf>, capacity: usize) -> Self {
         let mut vfs = Vfs::new();
         vfs.mount(root);
         let (sender, receiver) = mpsc::channel();
         Self {
             vfs,
             slots: Vec::new(),
+            cache: Cache::new(capacity),
             free: Vec::new(),
             paths: HashMap::new(),
             sender,
@@ -146,8 +168,37 @@ impl Assets {
             return Ok(id);
         }
         let physical = self.vfs.resolve(path)?;
-        let decoded = decode_file(&physical, path)?;
+        let bytes = std::fs::read(&physical)?;
+        let hash = AssetHash::of(&bytes);
+        // Identical bytes already decoded the same way are shared, so a copy of
+        // a texture is a hit rather than a second decode.
+        let key = decode_key(hash, classify(path), &physical);
+        if let Some(decoded) = self.cache.get(key).cloned() {
+            return Ok(self.store(path, decoded));
+        }
+        let decoded = decode_bytes(&physical, path, bytes, hash)?;
+        let decoded = self.intern(decoded);
         Ok(self.store(path, decoded))
+    }
+
+    /// Releases the live id for `path`, then decodes the file again.
+    ///
+    /// The new id differs from the old one even though the slot index is reused,
+    /// because `release` bumps the generation: a caller still holding the old id
+    /// stops resolving it rather than reading new bytes under the old name.
+    pub fn reload(&mut self, path: &str) -> Result<AssetId> {
+        if let Some(id) = self.find(path) {
+            self.release(id);
+        }
+        self.load(path)
+    }
+
+    /// The asynchronous counterpart of [`Assets::reload`].
+    pub fn reload_async(&mut self, jobs: &Jobs, path: &str) -> Result<AssetId> {
+        if let Some(id) = self.find(path) {
+            self.release(id);
+        }
+        self.load_async(jobs, path)
     }
 
     /// Submits a load to the job system and returns its id immediately.
@@ -171,7 +222,7 @@ impl Assets {
         let virtual_path = path.to_owned();
         jobs.execute(
             Box::new(move || {
-                let decoded = decode_file(&physical, &virtual_path);
+                let decoded = read_and_decode(&physical, &virtual_path);
                 // A closed receiver means the registry is gone; the result has
                 // nowhere to go and nothing to clean up.
                 let _ = sender.send(Finished { id, decoded });
@@ -205,6 +256,7 @@ impl Assets {
             match finished.decoded {
                 Ok(decoded) => {
                     let kind = decoded.kind;
+                    let decoded = self.intern(decoded);
                     self.store_at(id, decoded);
                     out.push((id, Ok(kind)));
                 }
@@ -221,34 +273,38 @@ impl Assets {
     /// The encoded file bytes, for every kind. Valid UTF-8 for a text asset is
     /// not a promise this makes; [`Assets::text`] is the accessor for that.
     pub fn bytes(&self, id: AssetId) -> Option<&[u8]> {
-        self.slot(id).map(|slot| slot.bytes.as_slice())
+        self.slot(id)?.data().map(|data| data.bytes.as_slice())
     }
 
     /// The decoded image, which is level 0 of a KTX2 chain.
     pub fn image(&self, id: AssetId) -> Option<&Image> {
-        self.slot(id)?.image.as_ref()
+        self.slot(id)?.data()?.image.as_ref()
     }
 
     /// The mip levels the file shipped, empty when it shipped none or the
     /// asset is not an image.
     pub fn mips(&self, id: AssetId) -> Option<&[MipLevel]> {
-        self.slot(id).map(|slot| slot.mips.as_slice())
+        self.slot(id)
+            .and_then(|slot| slot.data())
+            .map(|data| data.mips.as_slice())
     }
 
     /// The first mesh of a model, which is also the one carrying the model's
     /// animation clips and skeleton.
     pub fn mesh(&self, id: AssetId) -> Option<&MeshData> {
-        self.slot(id)?.meshes.first()
+        self.slot(id)?.data()?.meshes.first()
     }
 
     /// Every mesh primitive of a model, in file order.
     pub fn meshes(&self, id: AssetId) -> Option<&[MeshData]> {
-        self.slot(id).map(|slot| slot.meshes.as_slice())
+        self.slot(id)
+            .and_then(|slot| slot.data())
+            .map(|data| data.meshes.as_slice())
     }
 
     /// A model's node graph, skins and unimplemented-extension list.
     pub fn model(&self, id: AssetId) -> Option<&ModelData> {
-        self.slot(id)?.model.as_ref()
+        self.slot(id)?.data()?.model.as_ref()
     }
 
     /// The asset as text, or `None` when it is not a text asset or not UTF-8.
@@ -257,11 +313,28 @@ impl Assets {
         if slot.kind != AssetKind::Text {
             return None;
         }
-        std::str::from_utf8(&slot.bytes).ok()
+        std::str::from_utf8(&slot.data()?.bytes).ok()
     }
 
     pub fn kind(&self, id: AssetId) -> Option<AssetKind> {
         self.slot(id).map(|slot| slot.kind)
+    }
+
+    /// The content address of the bytes this asset was decoded from. Same bytes
+    /// always give the same value; a changed file gives a different one and so a
+    /// different id.
+    pub fn hash(&self, id: AssetId) -> Option<AssetHash> {
+        self.slot(id).map(|slot| slot.hash)
+    }
+
+    /// Decoded payloads currently held by the cache, which is at most its
+    /// capacity. A release drops a slot but not its cache entry.
+    pub fn cached(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn cache_capacity(&self) -> usize {
+        self.cache.capacity()
     }
 
     /// The virtual path this asset was loaded from.
@@ -313,11 +386,11 @@ impl Assets {
         slot.state = LoadState::Loading;
         slot.path.clear();
         slot.kind = AssetKind::Binary;
-        slot.bytes = Vec::new();
-        slot.image = None;
-        slot.mips.clear();
-        slot.meshes.clear();
-        slot.model = None;
+        slot.hash = AssetHash::of(&[]);
+        // The cache still holds the decode until it is evicted, so a reload of
+        // the same content is a hit even though this slot no longer points at
+        // it.
+        slot.decoded = None;
 
         self.free.push(id.index());
         self.live -= 1;
@@ -376,7 +449,19 @@ impl Assets {
         id
     }
 
-    fn store(&mut self, path: &str, decoded: Decoded) -> AssetId {
+    /// Files a freshly decoded payload in the cache and returns the shared
+    /// handle, reusing an existing entry with the same content rather than
+    /// keeping a second copy of the decode.
+    fn intern(&mut self, decoded: Decoded) -> Arc<Decoded> {
+        if let Some(cached) = self.cache.get(decoded.key).cloned() {
+            return cached;
+        }
+        let decoded = Arc::new(decoded);
+        let _ = self.cache.insert(decoded.key, Arc::clone(&decoded));
+        decoded
+    }
+
+    fn store(&mut self, path: &str, decoded: Arc<Decoded>) -> AssetId {
         match self.live_id(path) {
             Some(id) => {
                 self.store_at(id, decoded);
@@ -390,7 +475,7 @@ impl Assets {
         }
     }
 
-    fn store_at(&mut self, id: AssetId, decoded: Decoded) {
+    fn store_at(&mut self, id: AssetId, decoded: Arc<Decoded>) {
         let Some(slot) = self.slots.get_mut(id.index() as usize) else {
             return;
         };
@@ -399,12 +484,9 @@ impl Assets {
         }
 
         slot.kind = decoded.kind;
+        slot.hash = decoded.hash;
         slot.state = LoadState::Ready;
-        slot.bytes = decoded.bytes;
-        slot.image = decoded.image;
-        slot.mips = decoded.mips;
-        slot.meshes = decoded.meshes;
-        slot.model = decoded.model;
+        slot.decoded = Some(decoded);
     }
 }
 
@@ -429,15 +511,48 @@ fn classify(path: &str) -> AssetKind {
     }
 }
 
-/// Reads one file and decodes whatever its extension claims it is.
+/// The cache key for a decode: a content address over everything the decode
+/// reads, not just the bytes.
+///
+/// The loader-kind is folded in because an extension decides how the same bytes
+/// are decoded (text versus binary), so keying on bytes alone would hand a text
+/// asset's payload to a `.bin` of the same content. A model folds in its
+/// directory because its external buffers and images resolve relative to the
+/// file, so identical `.gltf` bytes in two trees can decode differently.
+fn decode_key(hash: AssetHash, kind: AssetKind, physical: &Path) -> AssetHash {
+    let mut context = hash.to_bytes().to_vec();
+    context.push(kind as u8);
+    if kind == AssetKind::Model {
+        context.extend_from_slice(physical.as_os_str().as_encoded_bytes());
+    }
+    AssetHash::of(&context)
+}
+
+/// Reads one file and decodes it, the job-system entry point.
+///
+/// The synchronous path reads the bytes first so it can look them up in the
+/// cache; this is the same work for the worker, which has no cache of its own.
+fn read_and_decode(physical: &Path, virtual_path: &str) -> Result<Decoded> {
+    let bytes = std::fs::read(physical)?;
+    let hash = AssetHash::of(&bytes);
+    decode_bytes(physical, virtual_path, bytes, hash)
+}
+
+/// Decodes bytes that were already read and hashed.
 ///
 /// The single place a load happens, shared by the synchronous path and the job
 /// system. A file that is read but does not match its extension is an error,
 /// not a silent binary asset: the caller asked for it as the other kind.
-fn decode_file(physical: &Path, virtual_path: &str) -> Result<Decoded> {
-    let bytes = std::fs::read(physical)?;
+fn decode_bytes(
+    physical: &Path,
+    virtual_path: &str,
+    bytes: Vec<u8>,
+    hash: AssetHash,
+) -> Result<Decoded> {
     let kind = classify(virtual_path);
     let mut decoded = Decoded {
+        hash,
+        key: decode_key(hash, kind, physical),
         kind,
         bytes,
         image: None,

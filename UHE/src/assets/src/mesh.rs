@@ -161,13 +161,228 @@ pub struct TextureData {
     pub sampler: SamplerData,
 }
 
-/// A material's PBR factors and the five core texture slots.
+/// How many per-material texture slots a `KHR_texture_transform` can ride on.
 ///
-/// The optional `KHR_materials_*` blocks, the specular-glossiness path and
-/// `KHR_texture_transform` are **not** read: the workspace enables `gltf`'s
-/// `utils`/`names`/`extensions` features only, so those accessors do not exist
-/// in this build. A file that declares them still loads; it renders without
-/// them.
+/// Mirrors the renderer's per-material GPU slot order.
+pub const MATERIAL_TEXTURE_SLOT_COUNT: usize = 19;
+
+/// Indices into [`MaterialData::uv_transforms`], in GPU slot order.
+pub mod texture_slot {
+    pub const ALBEDO: usize = 0;
+    pub const METALLIC_ROUGHNESS: usize = 1;
+    pub const NORMAL: usize = 2;
+    pub const OCCLUSION: usize = 3;
+    pub const EMISSIVE: usize = 4;
+    pub const CLEARCOAT: usize = 5;
+    pub const CLEARCOAT_ROUGHNESS: usize = 6;
+    pub const CLEARCOAT_NORMAL: usize = 7;
+    pub const SPECULAR: usize = 8;
+    pub const SPECULAR_COLOR: usize = 9;
+    pub const SHEEN_COLOR: usize = 10;
+    pub const SHEEN_ROUGHNESS: usize = 11;
+    pub const TRANSMISSION: usize = 12;
+    pub const THICKNESS: usize = 13;
+    pub const IRIDESCENCE: usize = 14;
+    pub const IRIDESCENCE_THICKNESS: usize = 15;
+    pub const ANISOTROPY: usize = 16;
+    pub const DIFFUSE_TRANSMISSION: usize = 17;
+    pub const DIFFUSE_TRANSMISSION_COLOR: usize = 18;
+}
+
+/// `KHR_texture_transform`, converted to the engine's V-flipped UV convention.
+///
+/// [`crate::load_model_geometry`] flips V while importing TEXCOORD_0, so the raw
+/// glTF offset cannot be applied on top of the imported coordinates. The stored
+/// parameters are engine-space: the shader computes
+/// `uv' = R(rotation) * (uv * scale) + offset` in that space, with `cos`/`sin`
+/// of the *original* glTF angle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UVTransform {
+    pub cos_rotation: f32,
+    pub sin_rotation: f32,
+    pub scale: [f32; 2],
+    pub offset: [f32; 2],
+    /// The `texCoordIndex` the map asked for. Only TEXCOORD_0 is extracted, so a
+    /// non-zero value cannot be honoured and is warned about at load time.
+    pub tex_coord_set: u32,
+    pub has_transform: bool,
+}
+
+impl Default for UVTransform {
+    fn default() -> Self {
+        Self {
+            cos_rotation: 1.0,
+            sin_rotation: 0.0,
+            scale: [1.0, 1.0],
+            offset: [0.0, 0.0],
+            tex_coord_set: 0,
+            has_transform: false,
+        }
+    }
+}
+
+/// How a `KHR_materials_transmission` surface is composited.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BlendApproach {
+    Opaque,
+    /// Drawn in the opaque pass, ignoring transmission. Wrong but stable for a
+    /// thin surface with a small factor.
+    #[default]
+    OpaqueWithTransmission,
+    /// Drawn after opaques, blended. Needs depth sorting to avoid artefacts.
+    Blend,
+}
+
+/// The optional PBR extension values of one material.
+///
+/// Kept in one aggregate so "which extensions did this material use" is a
+/// single question, and a material declaring none renders byte-identically to
+/// one loaded before this existed. Defaults are the *spec* defaults, not zero:
+/// a zeroed attenuation distance or sheen roughness silently disables the
+/// feature it names.
+#[derive(Clone, Debug)]
+pub struct MaterialExtensions {
+    /// `KHR_materials_emissive_strength`, spec default 1.0.
+    pub emissive_strength: f32,
+    /// `KHR_materials_ior`, spec default 1.5 (dielectric F0).
+    pub ior: f32,
+    /// `KHR_materials_unlit`.
+    pub unlit: bool,
+
+    /// `KHR_materials_clearcoat`.
+    pub has_clearcoat: bool,
+    pub clearcoat_factor: f32,
+    pub clearcoat_roughness_factor: f32,
+    pub clearcoat_normal_scale: f32,
+    pub clearcoat_texture: Option<Arc<TextureData>>,
+    pub clearcoat_roughness_texture: Option<Arc<TextureData>>,
+    pub clearcoat_normal_texture: Option<Arc<TextureData>>,
+
+    /// `KHR_materials_specular`. A factor of 1.0 reproduces the fixed 0.04 F0.
+    pub has_specular: bool,
+    pub specular_factor: f32,
+    pub specular_color_factor: [f32; 3],
+    pub specular_texture: Option<Arc<TextureData>>,
+    pub specular_color_texture: Option<Arc<TextureData>>,
+
+    /// `KHR_materials_sheen`.
+    pub has_sheen: bool,
+    pub sheen_color_factor: [f32; 3],
+    pub sheen_roughness_factor: f32,
+    pub sheen_color_texture: Option<Arc<TextureData>>,
+    pub sheen_roughness_texture: Option<Arc<TextureData>>,
+
+    /// `KHR_materials_transmission` and `KHR_materials_volume`. Attenuation
+    /// distance defaults to infinity: light travels without attenuation.
+    pub has_transmission: bool,
+    pub transmission_factor: f32,
+    pub thickness_factor: f32,
+    pub attenuation_distance: f32,
+    pub attenuation_color: [f32; 3],
+    pub transmission_texture: Option<Arc<TextureData>>,
+    pub thickness_texture: Option<Arc<TextureData>>,
+    /// How transmission is drawn, chosen once at load time.
+    pub transmission_blend: BlendApproach,
+
+    /// `KHR_materials_iridescence`.
+    pub has_iridescence: bool,
+    pub iridescence_factor: f32,
+    pub iridescence_ior: f32,
+    pub iridescence_thickness_minimum: f32,
+    pub iridescence_thickness_maximum: f32,
+    pub iridescence_texture: Option<Arc<TextureData>>,
+    pub iridescence_thickness_texture: Option<Arc<TextureData>>,
+
+    /// `KHR_materials_anisotropy`.
+    pub has_anisotropy: bool,
+    pub anisotropy_strength: f32,
+    pub anisotropy_rotation: f32,
+    pub anisotropy_texture: Option<Arc<TextureData>>,
+
+    /// `KHR_materials_diffuse_transmission`: thin-surface translucency.
+    pub has_diffuse_transmission: bool,
+    pub diffuse_transmission_factor: f32,
+    pub diffuse_transmission_color: [f32; 3],
+    pub diffuse_transmission_texture: Option<Arc<TextureData>>,
+    pub diffuse_transmission_color_texture: Option<Arc<TextureData>>,
+
+    /// `KHR_materials_pbrSpecularGlossiness`. The workload this replaces uses
+    /// these in place of the metallic-roughness factors when present.
+    pub has_specular_glossiness: bool,
+    pub sg_diffuse_factor: [f32; 4],
+    pub sg_diffuse_texture: Option<Arc<TextureData>>,
+    pub sg_specular_factor: [f32; 3],
+    pub sg_glossiness_factor: f32,
+    pub sg_specular_glossiness_texture: Option<Arc<TextureData>>,
+}
+
+impl Default for MaterialExtensions {
+    fn default() -> Self {
+        Self {
+            emissive_strength: 1.0,
+            ior: 1.5,
+            unlit: false,
+
+            has_clearcoat: false,
+            clearcoat_factor: 0.0,
+            clearcoat_roughness_factor: 0.0,
+            clearcoat_normal_scale: 1.0,
+            clearcoat_texture: None,
+            clearcoat_roughness_texture: None,
+            clearcoat_normal_texture: None,
+
+            has_specular: false,
+            specular_factor: 1.0,
+            specular_color_factor: [1.0, 1.0, 1.0],
+            specular_texture: None,
+            specular_color_texture: None,
+
+            has_sheen: false,
+            sheen_color_factor: [0.0, 0.0, 0.0],
+            sheen_roughness_factor: 0.0,
+            sheen_color_texture: None,
+            sheen_roughness_texture: None,
+
+            has_transmission: false,
+            transmission_factor: 0.0,
+            thickness_factor: 0.0,
+            attenuation_distance: f32::INFINITY,
+            attenuation_color: [1.0, 1.0, 1.0],
+            transmission_texture: None,
+            thickness_texture: None,
+            transmission_blend: BlendApproach::OpaqueWithTransmission,
+
+            has_iridescence: false,
+            iridescence_factor: 0.0,
+            iridescence_ior: 1.3,
+            iridescence_thickness_minimum: 100.0,
+            iridescence_thickness_maximum: 400.0,
+            iridescence_texture: None,
+            iridescence_thickness_texture: None,
+
+            has_anisotropy: false,
+            anisotropy_strength: 0.0,
+            anisotropy_rotation: 0.0,
+            anisotropy_texture: None,
+
+            has_diffuse_transmission: false,
+            diffuse_transmission_factor: 0.0,
+            diffuse_transmission_color: [1.0, 1.0, 1.0],
+            diffuse_transmission_texture: None,
+            diffuse_transmission_color_texture: None,
+
+            has_specular_glossiness: false,
+            sg_diffuse_factor: [1.0, 1.0, 1.0, 1.0],
+            sg_diffuse_texture: None,
+            sg_specular_factor: [1.0, 1.0, 1.0],
+            sg_glossiness_factor: 1.0,
+            sg_specular_glossiness_texture: None,
+        }
+    }
+}
+
+/// A material's PBR factors, the five core texture slots, and the optional
+/// `KHR_materials_*` values that reach shading.
 #[derive(Clone, Debug)]
 pub struct MaterialData {
     pub name: String,
@@ -193,6 +408,11 @@ pub struct MaterialData {
     pub normal: Option<Arc<TextureData>>,
     pub occlusion: Option<Arc<TextureData>>,
     pub emissive_texture: Option<Arc<TextureData>>,
+    /// Per-slot `KHR_texture_transform`, identity where the file declared none.
+    /// Indexed by [`texture_slot`].
+    pub uv_transforms: [UVTransform; MATERIAL_TEXTURE_SLOT_COUNT],
+    /// The optional PBR extension values.
+    pub extensions: MaterialExtensions,
 }
 
 impl Default for MaterialData {
@@ -216,6 +436,8 @@ impl Default for MaterialData {
             normal: None,
             occlusion: None,
             emissive_texture: None,
+            uv_transforms: [UVTransform::default(); MATERIAL_TEXTURE_SLOT_COUNT],
+            extensions: MaterialExtensions::default(),
         }
     }
 }
@@ -262,6 +484,47 @@ pub struct MeshData {
     pub skeleton: Option<SkeletonData>,
 }
 
+/// The kind of a `KHR_lights_punctual` light.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LightType {
+    Directional,
+    Spot,
+    #[default]
+    Point,
+}
+
+/// One `KHR_lights_punctual` light definition.
+///
+/// Scene placement lives on the node that references it ([`ModelNode::light`]);
+/// this is only the light's own definition.
+#[derive(Clone, Debug)]
+pub struct PunctualLight {
+    pub light_type: LightType,
+    /// Linear-space colour.
+    pub color: [f32; 3],
+    pub intensity: f32,
+    /// Point/spot only; infinite when the file omitted it.
+    pub range: f32,
+    /// Spot only, radians. Spec defaults 0 and PI/4.
+    pub inner_cone_angle: f32,
+    pub outer_cone_angle: f32,
+    pub name: String,
+}
+
+impl Default for PunctualLight {
+    fn default() -> Self {
+        Self {
+            light_type: LightType::Point,
+            color: [1.0, 1.0, 1.0],
+            intensity: 1.0,
+            range: f32::INFINITY,
+            inner_cone_angle: 0.0,
+            outer_cone_angle: std::f32::consts::FRAC_PI_4,
+            name: String::new(),
+        }
+    }
+}
+
 /// One node of the `glTF` scene graph, flattened.
 ///
 /// The editor turns each node into a controllable child entity instead of one
@@ -287,6 +550,8 @@ pub struct ModelNode {
     /// apply on top of it, and rewriting every vertex per instance would defeat
     /// the geometry sharing.
     pub world_transform: [[f32; 4]; 4],
+    /// Index into [`ModelData::punctual_lights`] this node places, -1 when none.
+    pub light: i32,
 }
 
 /// Everything about a loaded model that is not per-primitive geometry.
@@ -300,6 +565,8 @@ pub struct ModelData {
     /// Root node indices, in scene order.
     pub roots: Vec<u32>,
     pub skins: Vec<SkinData>,
+    /// `KHR_lights_punctual` definitions; nodes reference them by index.
+    pub punctual_lights: Vec<PunctualLight>,
     /// Extensions the file declares that this loader does not honour, by name.
     ///
     /// Reported at load time because a parsed-but-ignored extension makes an

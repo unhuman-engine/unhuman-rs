@@ -20,6 +20,11 @@ pub enum Error {
     Unsupported(String),
     /// The container parsed and the payload did not.
     Decode(String),
+    /// A path could not be watched. Distinct from [`Error::NotFound`] because
+    /// watching is a different request: a watch that fails here relies on the
+    /// path resolving now and forever, and a later disappearance is reported as
+    /// a removal, not this error.
+    Watch(String),
 }
 
 impl fmt::Display for Error {
@@ -30,6 +35,7 @@ impl fmt::Display for Error {
             Error::Io(error) => write!(f, "io: {error}"),
             Error::Unsupported(why) => write!(f, "unsupported: {why}"),
             Error::Decode(why) => write!(f, "decode failed: {why}"),
+            Error::Watch(path) => write!(f, "cannot watch: {path}"),
         }
     }
 }
