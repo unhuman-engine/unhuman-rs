@@ -7,20 +7,25 @@
 
 use std::sync::Arc;
 
-use gpui::{div, img, prelude::*, px, IntoElement, RenderImage};
+use gpui::{div, img, prelude::*, px, IntoElement, ObjectFit, RenderImage};
 
 use crate::theme::EditorTheme;
 use crate::viewport::MISSING_FRAME_REASON;
 
-pub fn panel(theme: &EditorTheme, frame: Option<&Arc<RenderImage>>) -> impl IntoElement {
+pub fn panel(
+    theme: &EditorTheme,
+    frame: Option<&Arc<RenderImage>>,
+    measure: impl IntoElement,
+) -> impl IntoElement {
     let body = match frame {
         Some(image) => div()
             .flex_1()
             .min_h_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(img(image.clone()).max_w_full().max_h_full())
+            .child(
+                img(image.clone())
+                    .size_full()
+                    .object_fit(ObjectFit::Contain),
+            )
             .into_any_element(),
         None => div()
             .max_w(px(420.0))
@@ -40,5 +45,19 @@ pub fn panel(theme: &EditorTheme, frame: Option<&Arc<RenderImage>>) -> impl Into
         .gap_2()
         .bg(theme.bg)
         .child(div().text_xs().text_color(theme.text_dim).child("VIEWPORT"))
-        .child(body)
+        // The frame's own box, and the only element whose size is the render
+        // size. The measure element paints over it and reports that size, so the
+        // engine renders at the resolution the image is shown at rather than a
+        // fixed one scaled into it.
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(body)
+                .child(measure),
+        )
 }

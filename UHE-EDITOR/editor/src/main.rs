@@ -30,7 +30,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let view = cx.new(|_| app::EditorApp::new());
+                let view = cx.new(app::EditorApp::new);
                 view.update(cx, |this, cx| this.start_frame_loop(window, cx));
                 view
             },
