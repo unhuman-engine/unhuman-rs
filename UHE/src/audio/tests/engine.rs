@@ -8,7 +8,10 @@
 
 use glam::Vec3;
 use meats::{AudioSource, Scene};
-use wire::{attenuation, channel_gains, pan, Listener, SoundId, VoicePool, VoiceSpec};
+use wire::{
+    attenuation, attenuation_modeled, channel_gains, pan, AttenuationModel, Listener, SoundId,
+    VoicePool, VoiceSpec,
+};
 
 /// A scene component as `meats` stores it. `clip` is `None` -- the resolver in these
 /// tests answers for any source, which is what the engine's resolver does once
@@ -52,6 +55,93 @@ fn attenuation_never_rises_with_distance() {
         distance += 0.25;
     }
     assert_eq!(previous, 0.0);
+}
+
+#[test]
+fn distance_model_selection_changes_the_curve_but_not_the_bound() {
+    let range = 8.0;
+    let linear = attenuation(4.0, range);
+    let inverse = attenuation_modeled(AttenuationModel::Inverse, 4.0, range, 1.0);
+    let exponential = attenuation_modeled(AttenuationModel::Exponential, 4.0, range, 1.0);
+    assert_eq!(linear, 0.5);
+    assert!(inverse < linear, "inverse {inverse} vs linear {linear}");
+    assert!(
+        exponential < linear,
+        "exponential {exponential} vs linear {linear}"
+    );
+    for model in [
+        AttenuationModel::Linear,
+        AttenuationModel::Inverse,
+        AttenuationModel::Exponential,
+    ] {
+        assert_eq!(attenuation_modeled(model, range, range, 1.0), 0.0);
+        assert_eq!(attenuation_modeled(model, 0.0, range, 1.0), 1.0);
+    }
+}
+
+#[test]
+fn doppler_shifts_pitch_with_relative_motion_and_clamps() {
+    use wire::doppler::doppler_factor;
+    use wire::{MAX_DOPPLER, MIN_DOPPLER, SPEED_OF_SOUND};
+
+    let listener = Listener::default();
+    let source = Vec3::new(0.0, 0.0, 10.0);
+    let shift = |source_velocity| {
+        doppler_factor(
+            SPEED_OF_SOUND,
+            1.0,
+            Vec3::ZERO,
+            source_velocity,
+            listener.position,
+            source,
+        )
+    };
+    assert_eq!(shift(Vec3::ZERO), 1.0);
+    assert!(shift(Vec3::new(0.0, 0.0, -5.0)) > 1.0, "approaching rises");
+    assert!(shift(Vec3::new(0.0, 0.0, 5.0)) < 1.0, "receding falls");
+    // At the speed of sound the denominator is singular, so the shift is capped.
+    assert_eq!(shift(Vec3::new(0.0, 0.0, -SPEED_OF_SOUND)), MAX_DOPPLER);
+    assert_eq!(shift(Vec3::new(0.0, 0.0, SPEED_OF_SOUND)), MIN_DOPPLER);
+}
+
+#[test]
+fn a_full_pool_keeps_the_higher_priority_voice() {
+    let mut pool = VoicePool::new(1);
+    let music = pool
+        .spawn(
+            None,
+            SoundId::new(1),
+            VoiceSpec {
+                priority: 10,
+                ..VoiceSpec::default()
+            },
+        )
+        .expect("room for one");
+    // A one-shot below the music is refused rather than silencing it.
+    assert!(pool
+        .spawn(
+            None,
+            SoundId::new(2),
+            VoiceSpec {
+                priority: 0,
+                ..VoiceSpec::default()
+            },
+        )
+        .is_none());
+    assert!(pool.get(music).is_some());
+    // An equal-priority one-shot displaces the oldest.
+    let shot = pool
+        .spawn(
+            None,
+            SoundId::new(3),
+            VoiceSpec {
+                priority: 10,
+                ..VoiceSpec::default()
+            },
+        )
+        .expect("steals the oldest");
+    assert!(pool.get(music).is_none());
+    assert!(pool.get(shot).is_some());
 }
 
 #[test]

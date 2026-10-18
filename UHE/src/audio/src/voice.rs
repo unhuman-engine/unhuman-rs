@@ -4,55 +4,9 @@ use adam::VoiceId;
 use glam::Vec3;
 use meats::{AudioSource, Entity};
 
-use crate::sound::{Bus, SoundId};
+use crate::sound::SoundId;
 use crate::spatial::PanHandle;
-
-/// The range a spatial voice falls off over when nothing names one.
-pub const DEFAULT_RANGE: f32 = 50.0;
-
-/// How one voice sounds. In the live path this is copied off the scene's
-/// `AudioSource` once a frame, which is how a gain changed in the editor reaches a
-/// sound that is already playing.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct VoiceSpec {
-    pub gain: f32,
-    pub pitch: f32,
-    pub looping: bool,
-    pub spatial: bool,
-    pub range: f32,
-    pub position: Vec3,
-    pub bus: Bus,
-}
-
-impl VoiceSpec {
-    /// What a scene source asks for, at the entity's world position: the component
-    /// carries no position of its own.
-    pub fn from_source(source: &AudioSource, position: Vec3) -> Self {
-        Self {
-            gain: source.gain,
-            pitch: source.pitch,
-            looping: source.looping,
-            spatial: source.spatial,
-            range: source.range,
-            position,
-            bus: Bus::Sfx,
-        }
-    }
-}
-
-impl Default for VoiceSpec {
-    fn default() -> Self {
-        Self {
-            gain: 1.0,
-            pitch: 1.0,
-            looping: false,
-            spatial: false,
-            range: DEFAULT_RANGE,
-            position: Vec3::ZERO,
-            bus: Bus::Sfx,
-        }
-    }
-}
+use crate::spec::VoiceSpec;
 
 /// One playing sound.
 #[derive(Debug)]
@@ -65,16 +19,36 @@ pub struct Voice {
     pub spec: VoiceSpec,
     /// Written by the engine once a frame, read by the audio thread.
     pub pan: PanHandle,
+    /// Where the voice was last frame, for [`Voice::advance`].
+    prev_position: Vec3,
+    /// World velocity in metres per second, from the last advance.
+    velocity: Vec3,
     /// Set while [`VoicePool::reconcile`] walks the scene, sweeping the voices whose
     /// entity it did not visit.
     seen: bool,
 }
 
+impl Voice {
+    /// World velocity in metres per second, written by [`Voice::advance`].
+    pub fn velocity(&self) -> Vec3 {
+        self.velocity
+    }
+
+    /// Fold this frame's position into a velocity, for the engine's Doppler. A
+    /// non-positive `dt` leaves the velocity at zero.
+    pub fn advance(&mut self, dt: f32) {
+        self.velocity = crate::doppler::velocity(self.prev_position, self.spec.position, dt);
+        self.prev_position = self.spec.position;
+    }
+}
+
 /// The active voices.
 ///
-/// Bounded on purpose: a spawn into a full pool drops the voice that has been
-/// playing longest, so a scene that starts a sound every frame cannot grow the
-/// table without limit.
+/// Bounded on purpose. When a spawn meets a full pool it displaces the voice with
+/// the lowest [`VoiceSpec::priority`], oldest first among equals; a spawn whose
+/// priority is below that lowest one is refused instead. That keeps a burst of
+/// equal-priority one-shots cycling through the oldest voice while music at a
+/// higher priority survives them. A capacity of zero still refuses everything.
 #[derive(Debug)]
 pub struct VoicePool {
     capacity: usize,
@@ -107,6 +81,10 @@ impl VoicePool {
         &self.voices
     }
 
+    pub fn voices_mut(&mut self) -> &mut [Voice] {
+        &mut self.voices
+    }
+
     pub fn get(&self, id: VoiceId) -> Option<&Voice> {
         self.voices.iter().find(|voice| voice.id == id)
     }
@@ -121,8 +99,8 @@ impl VoicePool {
             .find(|voice| voice.entity == Some(entity))
     }
 
-    /// Add a voice. `None` when the pool has no room at all: a capacity of zero
-    /// means "audio off", not "evict everything".
+    /// Add a voice, stealing when the pool is full. `None` when the pool has no
+    /// room at all, or when the new voice would not outrank the weakest one.
     ///
     /// An entity already sounding is replaced rather than shadowed, so a re-used
     /// entity never inherits a stale voice.
@@ -144,9 +122,12 @@ impl VoicePool {
                 self.voices.remove(index);
             }
         }
-        while self.voices.len() >= self.capacity {
-            // Voice ids only increase, so the front of the table is the oldest.
-            self.voices.remove(0);
+        if self.voices.len() >= self.capacity {
+            let victim = self.weakest();
+            if spec.priority < self.voices[victim].spec.priority {
+                return None;
+            }
+            self.voices.remove(victim);
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -156,6 +137,8 @@ impl VoicePool {
             entity,
             spec,
             pan: PanHandle::default(),
+            prev_position: spec.position,
+            velocity: Vec3::ZERO,
             seen: true,
         });
         Some(id)
@@ -170,6 +153,19 @@ impl VoicePool {
             }
             None => false,
         }
+    }
+
+    /// The index of the voice to evict: lowest priority, oldest first among
+    /// equals. Voice ids only increase and the table keeps insertion order, so the
+    /// earliest index with the minimum priority is also the oldest.
+    fn weakest(&self) -> usize {
+        let mut index = 0;
+        for (candidate, voice) in self.voices.iter().enumerate() {
+            if voice.spec.priority < self.voices[index].spec.priority {
+                index = candidate;
+            }
+        }
+        index
     }
 
     /// One frame of bookkeeping against the scene's `AudioSource` components: a
@@ -223,6 +219,7 @@ impl VoicePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::DEFAULT_RANGE;
     use meats::Scene;
 
     fn source(playing: bool) -> AudioSource {
@@ -241,6 +238,13 @@ mod tests {
     /// Entities are `meats`', not wire's: the only way to make one is a scene.
     fn entity(name: &str) -> Entity {
         Scene::new().spawn(name)
+    }
+
+    fn spec(priority: i32) -> VoiceSpec {
+        VoiceSpec {
+            priority,
+            ..VoiceSpec::default()
+        }
     }
 
     #[test]
@@ -268,6 +272,56 @@ mod tests {
             .spawn(None, SoundId::new(1), VoiceSpec::default())
             .is_none());
         assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn a_full_pool_steals_the_lowest_priority_and_refuses_below_it() {
+        let mut pool = VoicePool::new(2);
+        let quiet = pool
+            .spawn(None, SoundId::new(1), spec(1))
+            .expect("room for one");
+        let loud = pool
+            .spawn(None, SoundId::new(2), spec(5))
+            .expect("room for two");
+
+        // Lower than the weakest (1): refused, nothing is stolen.
+        assert!(pool.spawn(None, SoundId::new(3), spec(0)).is_none());
+        assert_eq!(pool.len(), 2);
+        assert!(pool.get(quiet).is_some());
+        assert!(pool.get(loud).is_some());
+
+        // Equal to the weakest: the weakest is displaced.
+        let equal = pool
+            .spawn(None, SoundId::new(4), spec(1))
+            .expect("displaces the weakest");
+        assert!(pool.get(quiet).is_none());
+        assert!(pool.get(loud).is_some());
+        assert!(pool.get(equal).is_some());
+    }
+
+    #[test]
+    fn equal_priority_evicts_the_oldest() {
+        let mut pool = VoicePool::new(2);
+        let first = pool.spawn(None, SoundId::new(1), spec(0)).expect("room");
+        let second = pool.spawn(None, SoundId::new(2), spec(0)).expect("room");
+        let third = pool.spawn(None, SoundId::new(3), spec(0)).expect("room");
+        assert!(pool.get(first).is_none());
+        assert!(pool.get(second).is_some());
+        assert!(pool.get(third).is_some());
+    }
+
+    #[test]
+    fn advance_turns_a_moved_voice_into_a_velocity() {
+        let mut pool = VoicePool::new(1);
+        let id = pool
+            .spawn(None, SoundId::new(1), VoiceSpec::default())
+            .expect("room");
+        pool.get_mut(id).expect("voice").spec.position = Vec3::new(2.0, 0.0, 0.0);
+        pool.get_mut(id).expect("voice").advance(0.5);
+        assert_eq!(pool.get(id).expect("voice").velocity(), Vec3::X * 4.0);
+        // A second tick with no movement is still.
+        pool.get_mut(id).expect("voice").advance(0.5);
+        assert_eq!(pool.get(id).expect("voice").velocity(), Vec3::ZERO);
     }
 
     #[test]

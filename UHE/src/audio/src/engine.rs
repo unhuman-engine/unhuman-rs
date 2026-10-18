@@ -1,32 +1,35 @@
-//! The audio engine, and the plugin that installs it.
+//! The audio engine.
 //!
 //! One owner holds the voices and the clip table, and the device is an `Option`, so
 //! the bookkeeping runs with the `Option` empty and is testable without a sound card.
 
 use glam::Vec3;
 
-use adam::{AudioBackend, Engine, FrameCtx, Listener, Plugin, Result, VoiceId};
+use adam::{AudioBackend, Listener, VoiceId};
 use meats::hecs;
 use meats::{AudioSource, Scene};
 use vault::{AssetId, Assets};
 
+use crate::attenuation::{attenuation_modeled, AttenuationModel};
 use crate::backend::Backend;
+use crate::doppler;
+use crate::mixer::Mixer;
 use crate::sound::{Bus, SoundId, SoundTable};
-use crate::spatial::{attenuation, pan};
-use crate::voice::{VoicePool, VoiceSpec};
+use crate::spatial::pan;
+use crate::spec::VoiceSpec;
+use crate::voice::VoicePool;
 
 /// Voices an engine runs at once when nothing asks for another number.
 pub const DEFAULT_VOICES: usize = 64;
 
-/// Playback: the voice table, the clips, and the device if there is one.
+/// Playback: the voice table, the clips, the output settings, and the device if
+/// there is one.
 ///
 /// With no output device this is a silent engine: it answers every call, counts no
 /// voices and plays nothing. That is what makes registering it safe on a build
 /// machine, and it is the only reason `WirePlugin::build` cannot fail.
 pub struct AudioEngine {
-    listener: Listener,
-    master_gain: f32,
-    bus_gains: [f32; Bus::COUNT],
+    mixer: Mixer,
     pool: VoicePool,
     sounds: SoundTable,
     device: Option<Backend>,
@@ -42,9 +45,7 @@ impl AudioEngine {
     /// zero refuses every voice, which is a valid way to switch audio off.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            listener: Listener::default(),
-            master_gain: 1.0,
-            bus_gains: [1.0; Bus::COUNT],
+            mixer: Mixer::new(),
             pool: VoicePool::new(capacity),
             sounds: SoundTable::new(),
             device: Backend::open(),
@@ -57,11 +58,11 @@ impl AudioEngine {
     }
 
     pub fn listener(&self) -> Listener {
-        self.listener
+        self.mixer.listener()
     }
 
     pub fn set_listener(&mut self, listener: Listener) {
-        self.listener = listener;
+        self.mixer.set_listener(listener);
     }
 
     /// Voices playing right now. Zero in silent mode, because nothing was started.
@@ -70,11 +71,43 @@ impl AudioEngine {
     }
 
     pub fn bus_gain(&self, bus: Bus) -> f32 {
-        self.bus_gains[bus.slot()]
+        self.mixer.bus_gain(bus)
     }
 
     pub fn set_bus_gain(&mut self, bus: Bus, gain: f32) {
-        self.bus_gains[bus.slot()] = gain;
+        self.mixer.set_bus_gain(bus, gain);
+    }
+
+    pub fn attenuation_model(&self) -> AttenuationModel {
+        self.mixer.attenuation_model()
+    }
+
+    /// Choose the falloff curve for every spatial voice.
+    pub fn set_attenuation_model(&mut self, model: AttenuationModel) {
+        self.mixer.set_attenuation_model(model);
+    }
+
+    pub fn rolloff(&self) -> f32 {
+        self.mixer.rolloff()
+    }
+
+    /// Shape the inverse and exponential curves; 1.0 is neutral.
+    pub fn set_rolloff(&mut self, rolloff: f32) {
+        self.mixer.set_rolloff(rolloff);
+    }
+
+    pub fn doppler_factor(&self) -> f32 {
+        self.mixer.doppler_factor()
+    }
+
+    /// Strength of the Doppler shift; 0.0 switches it off.
+    pub fn set_doppler_factor(&mut self, doppler: f32) {
+        self.mixer.set_doppler_factor(doppler);
+    }
+
+    /// Speed the listener is moving at, from the last `update`'s listener pose.
+    pub fn listener_velocity(&self) -> Vec3 {
+        self.mixer.listener_velocity()
     }
 
     /// The clip id for an asset, registering it the first time `vault` has its
@@ -148,13 +181,24 @@ impl AudioEngine {
     }
 
     /// One frame: the voices are brought in line with the scene's playing sources,
-    /// then the device is driven to match. A no-op with no device.
-    pub fn update(&mut self, scene: &Scene, assets: &Assets) {
+    /// their velocities are advanced by `dt`, then the device is driven to match.
+    /// A no-op with no device.
+    pub fn update(&mut self, scene: &Scene, assets: &Assets, dt: f32) {
         if self.device.is_none() {
             return;
         }
         self.reconcile(scene, assets);
+        self.advance(dt);
         self.drive();
+    }
+
+    /// Listener and voice velocities for this frame. The listener's previous
+    /// position starts level with it, so the first frame has no phantom speed.
+    fn advance(&mut self, dt: f32) {
+        self.mixer.advance_listener(dt);
+        for voice in self.pool.voices_mut() {
+            voice.advance(dt);
+        }
     }
 
     /// Start the player of a voice that has none, failing when its clip cannot be
@@ -195,9 +239,8 @@ impl AudioEngine {
     /// Bring the device in line with the pool: start what has no player yet, apply
     /// gain, pitch and pan, and reap what has finished.
     fn drive(&mut self) {
-        let listener = self.listener;
-        let master = self.master_gain;
-        let buses = self.bus_gains;
+        let mixer = self.mixer;
+        let listener = mixer.listener();
 
         // Voices the scene added this frame have no player yet.
         let pending: Vec<VoiceId> = match &self.device {
@@ -235,12 +278,31 @@ impl AudioEngine {
                 voice.pan.set_gains(1.0, 1.0);
             }
             let falloff = if voice.spec.spatial {
-                attenuation(distance, voice.spec.range)
+                attenuation_modeled(
+                    mixer.attenuation_model(),
+                    distance,
+                    voice.spec.range,
+                    mixer.rolloff(),
+                )
             } else {
                 1.0
             };
-            let volume = voice.spec.gain * falloff * buses[voice.spec.bus.slot()] * master;
-            backend.set_gain(voice.id, volume, voice.spec.pitch);
+            let speed = if voice.spec.spatial {
+                voice.spec.pitch
+                    * doppler::doppler_factor(
+                        doppler::SPEED_OF_SOUND,
+                        mixer.doppler_factor(),
+                        mixer.listener_velocity(),
+                        voice.velocity(),
+                        listener.position,
+                        voice.spec.position,
+                    )
+            } else {
+                voice.spec.pitch
+            };
+            let volume =
+                voice.spec.gain * falloff * mixer.bus_gain(voice.spec.bus) * mixer.master_gain();
+            backend.set_gain(voice.id, volume, speed);
         }
     }
 }
@@ -257,17 +319,18 @@ impl AudioBackend for AudioEngine {
     }
 
     fn listener(&self) -> Listener {
-        self.listener
+        self.mixer.listener()
     }
 
     fn set_listener(&mut self, listener: Listener) {
-        self.listener = listener;
+        self.mixer.set_listener(listener);
     }
 
-    /// `dt` is unused: rodio's clock is the device's, and the mixer has already been
-    /// playing for however long the frame took.
-    fn update(&mut self, scene: &Scene, assets: &Assets, _dt: f32) {
-        AudioEngine::update(self, scene, assets);
+    /// `dt` drives the Doppler shift: the velocity is the listener's and each
+    /// voice's change in position over this frame. rodio's clock still runs the
+    /// mixer; `dt` is only for the shift.
+    fn update(&mut self, scene: &Scene, assets: &Assets, dt: f32) {
+        AudioEngine::update(self, scene, assets, dt);
     }
 
     fn play(&mut self, assets: &Assets, clip: AssetId, gain: f32) -> Option<VoiceId> {
@@ -283,69 +346,10 @@ impl AudioBackend for AudioEngine {
     }
 
     fn master_gain(&self) -> f32 {
-        self.master_gain
+        self.mixer.master_gain()
     }
 
     fn set_master_gain(&mut self, gain: f32) {
-        self.master_gain = gain;
+        self.mixer.set_master_gain(gain);
     }
-}
-
-/// Installs [`AudioEngine`] into `Engine::audio` and drives it once a frame.
-pub struct WirePlugin {
-    capacity: usize,
-}
-
-impl WirePlugin {
-    pub fn new() -> Self {
-        Self {
-            capacity: DEFAULT_VOICES,
-        }
-    }
-
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self { capacity }
-    }
-}
-
-impl Default for WirePlugin {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Plugin for WirePlugin {
-    fn name(&self) -> &'static str {
-        "wire"
-    }
-
-    fn build(&mut self, eng: &mut Engine) -> Result<()> {
-        eng.audio = Some(Box::new(AudioEngine::with_capacity(self.capacity)));
-        Ok(())
-    }
-
-    /// Once a frame, not once per fixed step: the listener follows the camera, which
-    /// moves per frame, and a frame whose accumulator reached no step runs no
-    /// substeps at all.
-    fn on_frame(&mut self, eng: &mut Engine, _ctx: &mut FrameCtx) {
-        let Some(audio) = eng.audio.as_mut() else {
-            return;
-        };
-        audio.set_listener(listener_from(&eng.scene));
-        audio.update(&eng.scene, &eng.assets, 0.0);
-    }
-}
-
-/// The primary camera's pose as the ear.
-pub fn listener_from(scene: &Scene) -> Listener {
-    let Some(camera) = scene.primary_camera() else {
-        return Listener::default();
-    };
-    let transform = scene.world_transform(camera);
-    Listener::new(
-        transform.w_axis.truncate(),
-        // Right-handed: a camera looks down its own -Z.
-        -transform.z_axis.truncate(),
-        transform.y_axis.truncate(),
-    )
 }

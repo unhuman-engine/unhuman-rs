@@ -1,9 +1,7 @@
-//! Distance falloff and stereo placement.
+//! Stereo placement.
 //!
-//! miniaudio's defaults would run inverse attenuation with `maxDistance = FLT_MAX`,
-//! a falloff that only reaches silence at infinity, so a source has a range of its
-//! own here and falls off linearly to zero at it. The panning maths is miniaudio's,
-//! floor included.
+//! The panning maths is miniaudio's, floor included; distance falloff moved to
+//! [`crate::attenuation`], which now offers more than the linear curve.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -22,15 +20,6 @@ pub(crate) const CHANNELS: ChannelCount = rodio::math::nz!(2);
 /// "doesn't even remotely represent the real world", so the speaker a sound is
 /// turned away from never goes fully silent.
 pub const MIN_CHANNEL_GAIN: f32 = 0.2;
-
-/// Linear falloff: 1.0 at the listener, 0.0 at `range` and beyond it. A range of
-/// zero or less means no falloff at all.
-pub fn attenuation(distance: f32, range: f32) -> f32 {
-    if range.is_nan() || range <= 0.0 {
-        return 1.0;
-    }
-    (1.0 - distance / range).clamp(0.0, 1.0)
-}
 
 /// Where a source sits relative to the listener: -1.0 hard left, 0.0 directly in
 /// front of it, +1.0 hard right. The listener's right vector is `forward x up`,
@@ -168,15 +157,6 @@ mod tests {
 
     fn stereo(samples: Vec<f32>) -> SamplesBuffer {
         SamplesBuffer::new(CHANNELS, rodio::math::nz!(48_000), samples)
-    }
-
-    #[test]
-    fn attenuation_is_one_at_the_listener_and_zero_at_the_range() {
-        assert_eq!(attenuation(0.0, 10.0), 1.0);
-        assert_eq!(attenuation(5.0, 10.0), 0.5);
-        assert_eq!(attenuation(10.0, 10.0), 0.0);
-        assert_eq!(attenuation(99.0, 10.0), 0.0);
-        assert_eq!(attenuation(0.0, 0.0), 1.0);
     }
 
     #[test]
