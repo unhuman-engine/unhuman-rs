@@ -1,8 +1,11 @@
-# Issues
+# Engine
 
-A work queue, by subsystem. `docs/WORK.md` is the plan and the phase order; this
-is the list of what is actually wrong, with the evidence that says so and the
-thing that would say it is fixed.
+Renderer, backends, editor, physics, assets, tooling. Part of the queue in
+`docs/issues/README.md`.
+
+`docs/WORK.md` is the plan and the phase order; this is the list of what is
+actually wrong, with the evidence that says so and the thing that would say it is
+fixed.
 
 Priority is about what blocks what, not about difficulty:
 
@@ -10,16 +13,6 @@ Priority is about what blocks what, not about difficulty:
 - **P1** correctness, or a claim the repo makes that is not true yet
 - **P2** cost, or a capability a phase needs
 - **P3** polish, or a decision left open
-
-## Working through it
-
-- The gate is `scripts/gate.sh`. It needs `SLANGC` set: the vendored Slang it
-  looks for lives in a C++ checkout that is not on this machine, so every local
-  run is `SLANGC=/opt/shader-slang-bin/bin/slangc ./scripts/gate.sh`. Without it
-  the shader-dependent backend tests panic by design.
-- `UHE_VALIDATION=1` is what makes the Vulkan suites mean anything.
-- Measurements below were taken on this machine: RADV on a RENOIR iGPU, release
-  build, 1998x1135 unless a size is given.
 
 ## Renderer (bifrost)
 
