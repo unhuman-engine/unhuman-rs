@@ -122,6 +122,12 @@ pub trait CommandList {
     fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32);
 
     fn bind_pipeline(&mut self, pipeline: &Pipeline);
+    /// Binds a set at `set`, against the *bound pipeline's* layout.
+    ///
+    /// A pipeline must be bound first. Vulkan takes the pipeline layout as an
+    /// argument to `vkCmdBindDescriptorSets` and has none before a pipeline is
+    /// bound; wgpu ignores it, so a pass that binds a set first works there and
+    /// fails here.
     fn bind_group(&mut self, set: u32, group: &BindGroup);
     fn set_push_constants(&mut self, data: &[u8]);
 
@@ -148,6 +154,16 @@ pub trait CommandList {
 /// creation thread-safe while frame recording stays single-owner.
 pub trait Resources {
     fn create_buffer(&mut self, desc: BufferDesc, initial: Option<&[u8]>) -> Result<Buffer>;
+
+    /// Uploads `data` into `buffer` at `offset`, replacing what was there.
+    ///
+    /// The handle stays valid, and so does every bind group that names it, which
+    /// is the point: a per-frame arena is refilled once instead of re-created
+    /// along with every set that binds it. The buffer must have been created with
+    /// [`crate::format::BufferUsage::TRANSFER_DST`] (wgpu's `COPY_DST`), and the
+    /// write must stay inside it.
+    fn write_buffer(&mut self, buffer: &Buffer, offset: u64, data: &[u8]) -> Result<()>;
+
     fn create_texture(&mut self, desc: TextureDesc) -> Result<Texture>;
     fn create_image_view(&mut self, texture: &Texture) -> Result<ImageView>;
     /// `spirv` is the output of `forge`; the module is cached by hash so a
@@ -256,6 +272,27 @@ pub trait Gpu {
     /// A headless run has a real `Gpu` and no swapchain; a bare reference would
     /// force every caller to carry a dummy.
     fn swapchain(&self) -> Option<&dyn Swapchain>;
+
+    /// The extent the executor records a frame at.
+    ///
+    /// The swapchain's when there is one, the configured headless size
+    /// otherwise. A frontend must size its render targets from this: the passes
+    /// it declares are recorded at this extent, so a mismatch draws into a
+    /// corner of a larger target.
+    fn extent(&self) -> Extent2d;
+
+    /// Changes the extent a frame is recorded at.
+    ///
+    /// Headless this is the size asked for: the editor's viewport panel, which
+    /// then renders at its own resolution instead of a fixed one scaled to fit.
+    /// With a swapchain the surface owns the size -- the backend reconfigures or
+    /// marks the swapchain for recreation -- so what [`Gpu::extent`] reports
+    /// afterwards is the size that resulted, not necessarily the one passed.
+    ///
+    /// A frontend resizes its render targets when `extent()` changes; this call
+    /// only changes the device's answer.
+    fn resize(&mut self, extent: Extent2d) -> Result<()>;
+
     fn graph(&mut self) -> &mut dyn RenderGraph;
     fn resources(&mut self) -> &mut dyn Resources;
 

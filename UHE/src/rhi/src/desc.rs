@@ -401,13 +401,17 @@ pub struct PipelineDesc {
     pub samples: SampleCount,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct ColorAttachmentDesc {
     /// The attachment. Present because the graph has to name what a pass writes,
     /// not just what shape it is.
     pub texture: crate::Texture,
     pub format: TextureFormat,
     pub load: LoadOp,
+    /// Used when `load` is `LoadOp::Clear`. Carried as data, not as a variant,
+    /// because the backends take the clear value as a side argument and an enum
+    /// payload would make every `Load` construction spell a value it ignores.
+    pub clear: [f32; 4],
     pub store: bool,
     /// MSAA resolve target, or `Texture::default()` for none.
     pub resolve: crate::Texture,
@@ -421,11 +425,13 @@ pub enum LoadOp {
     DontCare,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct DepthAttachmentDesc {
     pub texture: crate::Texture,
     pub format: TextureFormat,
     pub load: LoadOp,
+    /// Used when `load` is `LoadOp::Clear`; the far plane, usually.
+    pub clear_depth: f32,
     pub store: bool,
 }
 
@@ -433,7 +439,7 @@ pub struct DepthAttachmentDesc {
 ///
 /// Carries no layouts: transitions and barriers are the render graph's job,
 /// derived from the declared read/write sets. A pass gets no barrier API.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct RenderPassDesc {
     pub label: String,
     pub colors: Vec<ColorAttachmentDesc>,
@@ -448,6 +454,7 @@ impl RenderPassDesc {
                 texture: crate::Texture::null(),
                 format,
                 load: LoadOp::Clear,
+                clear: [0.0; 4],
                 store: true,
                 resolve: crate::Texture::null(),
             }],
@@ -460,6 +467,7 @@ impl RenderPassDesc {
             texture: crate::Texture::null(),
             format,
             load: LoadOp::Clear,
+            clear_depth: 1.0,
             store: true,
         });
         self
@@ -469,4 +477,23 @@ impl RenderPassDesc {
         self.label = label.into();
         self
     }
+}
+
+/// The row pitch a texture-to-buffer copy must use, in bytes.
+///
+/// wgpu validates the pitch against this alignment
+/// (`COPY_BYTES_PER_ROW_ALIGNMENT`) and refuses a tighter one, so a readback of a
+/// width that is not a multiple of 64 texels fails validation rather than
+/// returning a wrong image. Vulkan has no such rule for a buffer-image copy, and
+/// both backends write the same bytes, so the pitch is computed here and used by
+/// both: the caller that reads the buffer back strips the padding, and only the
+/// caller knows whether it wants to.
+pub const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
+
+/// The row pitch for `width` texels of `bytes_per_texel` bytes each.
+///
+/// At least `width * bytes_per_texel`, rounded up to the copy alignment.
+pub const fn copy_row_pitch(width: u32, bytes_per_texel: u32) -> u32 {
+    let tight = width * bytes_per_texel;
+    tight.div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT) * COPY_BYTES_PER_ROW_ALIGNMENT
 }

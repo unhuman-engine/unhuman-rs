@@ -22,10 +22,11 @@ pub use backend::{
     ENVIRONMENT_VARIABLE as BACKEND_ENVIRONMENT_VARIABLE, FLAG as BACKEND_FLAG,
 };
 pub use desc::{
-    AddressMode, BindingDesc, BlendState, BufferDesc, ColorAttachmentDesc, ColorTargetState,
-    DepthAttachmentDesc, DepthState, DescriptorKind, DescriptorSetLayoutDesc, Extent, Filter,
-    IndexFormat, LoadOp, PipelineDesc, PrimitiveState, RenderPassDesc, SamplerDesc, ShaderStage,
-    ShaderStageDesc, StageMask, TextureDesc, VertexAttribute, VertexLayout,
+    copy_row_pitch, AddressMode, BindingDesc, BlendState, BufferDesc, ColorAttachmentDesc,
+    ColorTargetState, DepthAttachmentDesc, DepthState, DescriptorKind, DescriptorSetLayoutDesc,
+    Extent, Filter, IndexFormat, LoadOp, PipelineDesc, PrimitiveState, RenderPassDesc, SamplerDesc,
+    ShaderStage, ShaderStageDesc, StageMask, TextureDesc, VertexAttribute, VertexLayout,
+    COPY_BYTES_PER_ROW_ALIGNMENT,
 };
 pub use format::{BufferUsage, SampleCount, TextureFormat, TextureUsage};
 pub use graph::{PassRecorder, PassScope, SlotTable};
