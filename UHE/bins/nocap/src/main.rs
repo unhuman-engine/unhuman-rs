@@ -1,15 +1,19 @@
-//! Headless binary: the same frame loop with no window and no GPU.
+//! Headless binary: the engine loop with no window and no GPU, plus a
+//! deterministic capture/replay layer.
 //!
-//! The engine with `gpu: None`, the game plugins registered, a fixed number of
-//! steps, and a summary line instead of editor panels.
+//! `--record` writes a frame sequence to a file; `--replay` runs it back and
+//! checks it. Both are windowless and need no device, which is what makes a
+//! capture replayable on a machine that has none.
 
+mod capture;
 mod config;
+mod event;
+mod input;
+mod plugins;
+mod runner;
+mod session;
 
-use adam::App;
-use aimlab::AimLabPlugin;
 use config::Config;
-use femur::FemurPlugin;
-use wire::WirePlugin;
 
 fn main() {
     adam::logging::init();
@@ -28,52 +32,14 @@ fn main() {
         return;
     }
 
-    if let Err(error) = run(config) {
+    let result = match (&config.record, &config.replay) {
+        (Some(path), _) => runner::record(&config, path),
+        (None, Some(path)) => runner::replay(&config, path),
+        (None, None) => runner::summary(&config),
+    };
+
+    if let Err(error) = result {
         eprintln!("nocap: {error}");
         std::process::exit(1);
     }
-}
-
-fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new()
-        .add(AimLabPlugin::new())
-        .add(WirePlugin::new())
-        .add(FemurPlugin);
-
-    // Scene and aimlab paths resolve from the repository's `assets/`.
-    app.engine_mut().assets.mount("assets");
-
-    log::info!("nocap: plugins {}", app.plugin_names().join(", "));
-
-    if config.list_plugins {
-        for name in app.plugin_names() {
-            println!("{name}");
-        }
-        return Ok(());
-    }
-
-    if let Some(path) = &config.scene {
-        let adam::Engine { scene, assets, .. } = app.engine_mut();
-        *scene =
-            meats::load(path).map_err(|error| format!("--scene {}: {error}", path.display()))?;
-        for error in scene.resolve_assets(assets) {
-            log::warn!("nocap: {error}");
-        }
-    }
-
-    app.run(config.frames())?;
-
-    let engine = app.engine();
-    // Sleeping bodies count: there is no awake-body accessor, and zero is the
-    // honest "physics did nothing".
-    println!(
-        "nocap: frames={} entities={} bodies={}",
-        engine.time.frame(),
-        engine.scene.entities().len(),
-        engine
-            .physics
-            .as_ref()
-            .map_or(0, |physics| physics.body_count()),
-    );
-    Ok(())
 }

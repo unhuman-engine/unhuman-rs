@@ -18,6 +18,8 @@ fn default_is_ten_thousand_steps_and_nothing_else() {
     assert_eq!(config.steps, DEFAULT_STEPS);
     assert_eq!(config.steps, 10_000);
     assert_eq!(config.scene, None);
+    assert_eq!(config.record, None);
+    assert_eq!(config.replay, None);
     assert!(!config.list_plugins);
     assert!(!config.help);
 }
@@ -62,6 +64,24 @@ fn list_plugins_and_help_are_flags() {
     assert!(parse(&["--list-plugins"]).unwrap().list_plugins);
     assert!(parse(&["--help"]).unwrap().help);
     assert!(parse(&["-h"]).unwrap().help);
+}
+
+#[test]
+fn record_and_replay_take_paths_either_way() {
+    assert_eq!(
+        parse(&["--record", "run.cap"]).unwrap().record,
+        Some(PathBuf::from("run.cap"))
+    );
+    assert_eq!(
+        parse(&["--record=run.cap"]).unwrap().record,
+        Some(PathBuf::from("run.cap"))
+    );
+    assert_eq!(
+        parse(&["--replay=run.cap"]).unwrap().replay,
+        Some(PathBuf::from("run.cap"))
+    );
+    assert!(parse(&["--record"]).is_err());
+    assert!(parse(&["--replay"]).is_err());
 }
 
 #[test]

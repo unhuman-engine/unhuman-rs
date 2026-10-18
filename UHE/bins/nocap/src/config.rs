@@ -16,6 +16,8 @@ pub const STEPS_UNTIL_QUIT: u64 = 0;
 pub struct Config {
     pub steps: u64,
     pub scene: Option<PathBuf>,
+    pub record: Option<PathBuf>,
+    pub replay: Option<PathBuf>,
     pub list_plugins: bool,
     pub help: bool,
 }
@@ -25,6 +27,8 @@ impl Default for Config {
         Self {
             steps: DEFAULT_STEPS,
             scene: None,
+            record: None,
+            replay: None,
             list_plugins: false,
             help: false,
         }
@@ -48,6 +52,14 @@ impl Config {
                 "--scene" => {
                     let value = value_of(name, inline, &mut rest)?;
                     config.scene = Some(PathBuf::from(value));
+                }
+                "--record" => {
+                    let value = value_of(name, inline, &mut rest)?;
+                    config.record = Some(PathBuf::from(value));
+                }
+                "--replay" => {
+                    let value = value_of(name, inline, &mut rest)?;
+                    config.replay = Some(PathBuf::from(value));
                 }
                 "--list-plugins" => config.list_plugins = true,
                 "--help" | "-h" => config.help = true,
@@ -113,5 +125,12 @@ USAGE:
 OPTIONS:
     --steps N        frames to simulate (0 = until a plugin quits) [default: 10000]
     --scene PATH     load a .unhuman scene before the plugins build
+    --record PATH    record N frames of scripted input to PATH as a capture
+    --replay PATH    replay a capture from PATH and check every frame digest
     --list-plugins   print the plugin names in registration order and exit
-    -h, --help       print this help";
+    -h, --help       print this help
+
+A capture is a deterministic frame sequence: the input delivered to each frame,
+its fixed step, and a digest of the resulting scene. `--replay` runs the same
+engine with no window and no GPU and fails on the first frame whose digest
+differs.";
