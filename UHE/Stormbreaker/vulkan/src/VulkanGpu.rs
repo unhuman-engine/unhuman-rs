@@ -543,6 +543,28 @@ impl chassis::Gpu for VulkanGpu {
         self.swapchain.as_ref().map(|_| self as &dyn Swapchain)
     }
 
+    fn extent(&self) -> chassis::Extent2d {
+        // The `Swapchain` impl below already answers this -- the swapchain's
+        // extent, or the stored headless one -- so this only lifts it onto `Gpu`
+        // where a frontend holding `&mut dyn Gpu` can reach it.
+        Swapchain::extent(self)
+    }
+
+    fn resize(&mut self, extent: chassis::Extent2d) -> RhiResult<()> {
+        // With a swapchain the surface owns the size, and this backend has no
+        // path that rebuilds one: `is_out_of_date` is reported and nothing
+        // recreates it. Refused by name rather than ignored, because a resize
+        // that silently does nothing is a window that never redraws.
+        if self.swapchain.is_some() {
+            return Err(chassis::Error::Unsupported(
+                "resize: the swapchain owns the size and this backend cannot rebuild it".to_owned(),
+            ));
+        }
+
+        self.set_extent(extent);
+        Ok(())
+    }
+
     fn graph(&mut self) -> &mut dyn RenderGraphTrait {
         &mut self.graph
     }
@@ -559,7 +581,7 @@ impl chassis::Gpu for VulkanGpu {
     ) -> RhiResult<()> {
         // The swapchain's extent when there is one: it is the clamped, configured
         // size, and the frontend sized this frame's targets from the same one.
-        self.executor.set_extent(self.extent());
+        self.executor.set_extent(Swapchain::extent(self));
 
         // The frontend's table is the frame's table. It minted the textures the
         // graph names by slot, so it is the only side that knows which handle is

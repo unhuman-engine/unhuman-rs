@@ -143,12 +143,27 @@ pub fn write_buffer(
     size: u64,
     data: &[u8],
 ) -> Result<()> {
-    if data.len() as u64 > size {
+    write_buffer_at(device, memory, size, 0, data)
+}
+
+/// Copies `data` into a host-visible buffer at `offset`.
+///
+/// The whole buffer is mapped and the slice written into it: mapping a sub-range
+/// would have to satisfy `minMemoryMapAlignment`, and the offsets a uniform arena
+/// uses (256-aligned) are not guaranteed to.
+pub fn write_buffer_at(
+    device: &ash::Device,
+    memory: vk::DeviceMemory,
+    size: u64,
+    offset: u64,
+    data: &[u8],
+) -> Result<()> {
+    if offset + data.len() as u64 > size {
         return Err(BackendError::InvalidSize);
     }
     unsafe {
         with_mapped_memory(device, memory, size, vk::MemoryMapFlags::empty(), |slice| {
-            slice[..data.len()].copy_from_slice(data);
+            slice[offset as usize..offset as usize + data.len()].copy_from_slice(data);
         })
     }
 }

@@ -33,6 +33,7 @@ impl ComputePipelineDesc {
 
 pub fn create(
     pipelines: &mut Pipelines,
+    descriptors: &mut crate::vulkan_descriptor_manager::Descriptors,
     desc: &ComputePipelineDesc,
     shaders: &Shaders,
 ) -> Result<Pipeline> {
@@ -43,7 +44,7 @@ pub fn create(
     }
 
     // A compute pipeline declares its sets on the description, like graphics.
-    let layout = pipelines.create_layout(&desc.set_layouts)?;
+    let layout = pipelines.create_layout(&desc.set_layouts, descriptors)?;
     let handle = build(pipelines, desc, shaders, layout)?;
     Ok(pipelines.insert(hash, PipelineResource::new(handle, layout, &desc.label)))
 }
@@ -78,7 +79,8 @@ fn build(
         return Err(BackendError::InvalidHandle);
     };
 
-    let entry_name = c"main";
+    // One module is one entry point, named `forge::ENTRY_POINT`.
+    let entry_name = std::ffi::CString::new(forge::ENTRY_POINT).expect("no interior NUL");
     let stage = vk::PipelineShaderStageCreateInfo {
         stage: vk::ShaderStageFlags::COMPUTE,
         module: shader.module(),

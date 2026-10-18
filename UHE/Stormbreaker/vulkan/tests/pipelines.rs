@@ -12,6 +12,7 @@ use forge::cache::ShaderCache;
 use forge::slangc::SlangcCompiler;
 use forge::{CompileRequest, Slangc, Stage};
 use std::path::{Path, PathBuf};
+use stormbreaker::vulkan_descriptor_manager::Descriptors;
 use stormbreaker::{create_device, device_available, graphic::create, BackendError, DeviceOptions};
 
 /// A path inside the workspace, found by walking up from this crate.
@@ -152,8 +153,10 @@ fn a_vertex_and_a_fragment_stage_create_one_pipeline() {
         &context.device,
         vk::PipelineCache::null(),
     );
+    let mut descriptors = Descriptors::new(&context.device);
     let handle = create(
         &mut pipelines,
+        &mut descriptors,
         &desc_with(vertex, Some(fragment), Vec::new()),
         &shaders,
     )
@@ -193,10 +196,12 @@ fn a_pipeline_with_a_descriptor_set_gets_a_matching_layout() {
         vk::PipelineCache::null(),
     );
     let description = desc_with(vertex, Some(fragment), vec![set]);
-    create(&mut pipelines, &description, &shaders).expect("a pipeline with one set");
+    let mut descriptors = Descriptors::new(&context.device);
+    create(&mut pipelines, &mut descriptors, &description, &shaders)
+        .expect("a pipeline with one set");
 
     assert_eq!(
-        pipelines.set_layout_count(),
+        descriptors.layout_count(),
         1,
         "one set layout created, not zero",
     );
@@ -225,21 +230,24 @@ fn identically_shaped_sets_share_one_layout() {
         &context.device,
         vk::PipelineCache::null(),
     );
+    let mut descriptors = Descriptors::new(&context.device);
     create(
         &mut pipelines,
+        &mut descriptors,
         &desc_with(vertex, Some(fragment), vec![shape("first")]),
         &shaders,
     )
     .expect("first pipeline");
     create(
         &mut pipelines,
+        &mut descriptors,
         &desc_with(vertex, Some(fragment), vec![shape("second")]),
         &shaders,
     )
     .expect("second pipeline");
 
     assert_eq!(
-        pipelines.set_layout_count(),
+        descriptors.layout_count(),
         1,
         "the same shape under two labels is still one driver layout",
     );
@@ -282,14 +290,17 @@ fn a_different_fragment_shader_is_a_different_pipeline() {
         &context.device,
         vk::PipelineCache::null(),
     );
+    let mut descriptors = Descriptors::new(&context.device);
     let first = create(
         &mut pipelines,
+        &mut descriptors,
         &desc_with(vertex, Some(fragment), Vec::new()),
         &shaders,
     )
     .expect("first pipeline");
     let second = create(
         &mut pipelines,
+        &mut descriptors,
         &desc_with(vertex, Some(other_fragment), Vec::new()),
         &shaders,
     )
@@ -319,8 +330,9 @@ fn the_same_description_is_compiled_once() {
         vk::PipelineCache::null(),
     );
     let description = desc_with(vertex, Some(fragment), Vec::new());
-    let first = create(&mut pipelines, &description, &shaders).expect("first");
-    let second = create(&mut pipelines, &description, &shaders).expect("second");
+    let mut descriptors = Descriptors::new(&context.device);
+    let first = create(&mut pipelines, &mut descriptors, &description, &shaders).expect("first");
+    let second = create(&mut pipelines, &mut descriptors, &description, &shaders).expect("second");
 
     assert_eq!(first, second, "the same description is the same pipeline");
     let (created, hits) = pipelines.stats();
@@ -348,8 +360,9 @@ fn a_pipeline_without_a_vertex_stage_is_refused() {
         &context.device,
         vk::PipelineCache::null(),
     );
+    let mut descriptors = Descriptors::new(&context.device);
     assert!(
-        create(&mut pipelines, &description, &shaders).is_err(),
+        create(&mut pipelines, &mut descriptors, &description, &shaders).is_err(),
         "a pipeline with no vertex stage must not be created",
     );
 }

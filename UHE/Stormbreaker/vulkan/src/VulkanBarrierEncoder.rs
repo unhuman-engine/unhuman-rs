@@ -45,6 +45,29 @@ pub fn layout_for(state: chassis::graph::types::ImageState) -> vk::ImageLayout {
 }
 
 impl Target {
+    /// A range whose aspects are the ones `format` actually has.
+    ///
+    /// The constructor to reach for: [`subresource_for`] intersects this with the
+    /// format's own aspects, so a range built with [`Target::color`] for a depth
+    /// image intersects to nothing and the barrier is invalid.
+    pub fn for_format(
+        image: vk::Image,
+        format: chassis::TextureFormat,
+        mip_levels: u32,
+        layers: u32,
+    ) -> Self {
+        Self {
+            image,
+            subresource: vk::ImageSubresourceRange {
+                aspect_mask: vulkan_types::aspect(format),
+                base_mip_level: 0,
+                level_count: mip_levels,
+                base_array_layer: 0,
+                layer_count: layers,
+            },
+        }
+    }
+
     pub fn color(image: vk::Image, mip_levels: u32, layers: u32) -> Self {
         Self {
             image,

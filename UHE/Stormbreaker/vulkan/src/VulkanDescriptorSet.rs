@@ -37,16 +37,22 @@ pub fn descriptor_type_of(kind: DescriptorKind) -> vk::DescriptorType {
     }
 }
 
-/// A live `VkDescriptorSet` with the layout it was allocated against.
+/// A live `VkDescriptorSet` with the layout it was allocated against, and the
+/// pool that owns it.
+///
+/// The pool matters because a set is freed through it, and because more than one
+/// pool exists: a pool that has no room for a new set is left alone rather than
+/// reset, since resetting it would free the sets live bind groups still hold.
 #[derive(Clone, Copy, Debug)]
 pub struct DescriptorSet {
     set: vk::DescriptorSet,
     layout: vk::DescriptorSetLayout,
+    pool: usize,
 }
 
 impl DescriptorSet {
-    pub fn new(set: vk::DescriptorSet, layout: vk::DescriptorSetLayout) -> Self {
-        Self { set, layout }
+    pub fn new(set: vk::DescriptorSet, layout: vk::DescriptorSetLayout, pool: usize) -> Self {
+        Self { set, layout, pool }
     }
 
     pub fn handle(&self) -> vk::DescriptorSet {
@@ -55,6 +61,10 @@ impl DescriptorSet {
 
     pub fn layout(&self) -> vk::DescriptorSetLayout {
         self.layout
+    }
+
+    pub fn pool(&self) -> usize {
+        self.pool
     }
 }
 
@@ -94,4 +104,34 @@ pub fn check_binding_count(count: usize) -> Result<()> {
         return Err(BackendError::TooManyBindings { count });
     }
     Ok(())
+}
+
+/// The Vulkan stage flags for a binding's declared stages.
+///
+/// One function for both things that build a `vk::DescriptorSetLayoutBinding`: a
+/// pipeline's layout and a bind group's. Two copies is how a set ends up
+/// incompatible with the pipeline it is bound to -- the stage flags are part of
+/// the layout's definition, not a hint, so a set that says `ALL` where the
+/// pipeline says `FRAGMENT` is a different layout.
+pub fn stage_flags_of(mask: chassis::StageMask) -> vk::ShaderStageFlags {
+    let mut flags = vk::ShaderStageFlags::empty();
+    if mask.contains(chassis::ShaderStage::Vertex) {
+        flags |= vk::ShaderStageFlags::VERTEX;
+    }
+    if mask.contains(chassis::ShaderStage::Fragment) {
+        flags |= vk::ShaderStageFlags::FRAGMENT;
+    }
+    if mask.contains(chassis::ShaderStage::Compute) {
+        flags |= vk::ShaderStageFlags::COMPUTE;
+    }
+    if mask.contains(chassis::ShaderStage::Geometry) {
+        flags |= vk::ShaderStageFlags::GEOMETRY;
+    }
+    if mask.contains(chassis::ShaderStage::TessellationControl) {
+        flags |= vk::ShaderStageFlags::TESSELLATION_CONTROL;
+    }
+    if mask.contains(chassis::ShaderStage::TessellationEvaluation) {
+        flags |= vk::ShaderStageFlags::TESSELLATION_EVALUATION;
+    }
+    flags
 }

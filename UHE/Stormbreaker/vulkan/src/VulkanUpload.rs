@@ -49,8 +49,14 @@ impl UploadRing {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
+        // `RESET_COMMAND_BUFFER` because the ring re-records its one command
+        // buffer after every submit: without it, the second upload is
+        // `VUID-vkBeginCommandBuffer-commandBuffer-00050`.
         let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .flags(
+                vk::CommandPoolCreateFlags::TRANSIENT
+                    | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+            )
             .queue_family_index(family);
         let command_pool = match unsafe { device.create_command_pool(&pool_info, None) } {
             Ok(pool) => pool,
@@ -160,6 +166,8 @@ impl UploadRing {
             self.device.unmap_memory(self.device_memory);
         }
 
+        self.retire()?;
+
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         let command_buffer = self.command_buffer;
@@ -266,6 +274,8 @@ impl UploadRing {
                 })
         };
 
+        self.retire()?;
+
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         let command_buffer = self.command_buffer;
@@ -344,13 +354,30 @@ impl UploadRing {
 
     /// Blocks until every queued upload has been read, then rewinds the ring.
     pub fn wait(&mut self) -> Result<()> {
+        self.retire()?;
+        self.offset = 0;
+        Ok(())
+    }
+
+    /// Waits the previous submit out and makes the command buffer recordable again.
+    ///
+    /// One command buffer and one fence per ring, so neither can be reused while
+    /// a submit is pending: re-beginning a pending buffer is
+    /// `VUID-vkBeginCommandBuffer-commandBuffer-00049`, submitting one twice is
+    /// `VUID-vkQueueSubmit-pCommandBuffers-00071`, and resetting a fence a submit
+    /// still owns is `VUID-vkResetFences-pFences-01123`. All three are this call
+    /// missing. Unlike [`UploadRing::wait`] it leaves the write cursor alone: the
+    /// bytes just written are at the cursor, and rewinding here would copy from
+    /// the wrong offset.
+    fn retire(&mut self) -> Result<()> {
         if !self.pending {
             return Ok(());
         }
         unsafe {
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
         }
-        self.offset = 0;
         self.pending = false;
         Ok(())
     }

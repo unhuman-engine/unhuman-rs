@@ -231,10 +231,12 @@ fn fixture() -> Result<Fixture, String> {
     );
     let mut textures = stormbreaker::vulkan_texture::Textures::new(&context.device, memory);
     let mut buffers = stormbreaker::vulkan_buffer::Buffers::new(&context.device, memory);
-    let descriptors = stormbreaker::vulkan_descriptor_manager::Descriptors::new(&context.device);
+    let mut descriptors =
+        stormbreaker::vulkan_descriptor_manager::Descriptors::new(&context.device);
 
-    let pipeline = stormbreaker::graphic::create(&mut pipelines, &description, &shaders)
-        .map_err(|e| format!("pipeline creation: {e}"))?;
+    let pipeline =
+        stormbreaker::graphic::create(&mut pipelines, &mut descriptors, &description, &shaders)
+            .map_err(|e| format!("pipeline creation: {e}"))?;
 
     // Created with `initial`, so the upload staging buffer is filled and the
     // command copied in one step: the draw reads device memory, not a mapped

@@ -50,6 +50,7 @@ fn two_colour_attachments_create() {
         texture: chassis::Texture::null(),
         format: chassis::TextureFormat::Rgba16Float,
         load: chassis::LoadOp::Clear,
+        clear: [0.0; 4],
         store: true,
         resolve: chassis::Texture::null(),
     });
@@ -124,6 +125,7 @@ fn mixed_colour_formats_create() {
             texture: chassis::Texture::null(),
             format,
             load: chassis::LoadOp::DontCare,
+            clear: [0.0; 4],
             store: false,
             resolve: chassis::Texture::null(),
         });

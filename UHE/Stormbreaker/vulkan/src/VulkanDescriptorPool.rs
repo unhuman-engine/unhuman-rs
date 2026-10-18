@@ -21,22 +21,19 @@ impl PoolSizes {
     /// Adds a layout's worth of descriptors. Repeated calls for the same type
     /// accumulate rather than overwrite, so declaring two bind groups of the same
     /// shape does not under-count the second.
-    pub fn account_for(&mut self, bindings: &[crate::vulkan_descriptor_manager::Binding]) {
+    pub fn account_for(&mut self, bindings: &[chassis::BindingDesc]) {
         for binding in bindings {
-            let size = vk::DescriptorPoolSize {
-                ty: crate::vulkan_descriptor_set::descriptor_type_of(binding.kind),
-                descriptor_count: binding.count,
-            };
-            match self
-                .sizes
-                .get_mut(&crate::vulkan_descriptor_set::descriptor_type_of(
-                    binding.kind,
-                )) {
-                Some(existing) => existing.descriptor_count += binding.count,
+            let count = binding.count.max(1);
+            let ty = crate::vulkan_descriptor_set::descriptor_type_of(binding.kind);
+            match self.sizes.get_mut(&ty) {
+                Some(existing) => existing.descriptor_count += count,
                 None => {
                     self.sizes.insert(
-                        crate::vulkan_descriptor_set::descriptor_type_of(binding.kind),
-                        size,
+                        ty,
+                        vk::DescriptorPoolSize {
+                            ty,
+                            descriptor_count: count,
+                        },
                     );
                 }
             }
@@ -88,7 +85,11 @@ impl DescriptorPool {
                 descriptor_count: size.descriptor_count.saturating_mul(max_sets),
             })
             .collect();
+        // `FREE_DESCRIPTOR_SET`: a bind group is destroyed on its own, long
+        // before the pool is. Without the flag the only way to reclaim one set is
+        // a pool reset, which frees the sets a frame in flight is still using.
         let info = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
             .max_sets(max_sets)
             .pool_sizes(&scaled);
         let pool = unsafe { device.create_descriptor_pool(&info, None) }
@@ -130,6 +131,18 @@ impl DescriptorPool {
             .map_err(|e| BackendError::vk("vkAllocateDescriptorSets", e))?;
         self.allocated += 1;
         Ok(sets.remove(0))
+    }
+
+    /// Frees one set, returning its slot to the pool.
+    ///
+    /// A destroyed bind group goes through here rather than waiting for a pool
+    /// reset: a reset frees *every* set in the pool, including the ones a frame in
+    /// flight is still using.
+    pub fn free(&mut self, set: vk::DescriptorSet) {
+        unsafe {
+            let _ = self.device.free_descriptor_sets(self.pool, &[set]);
+        }
+        self.allocated = self.allocated.saturating_sub(1);
     }
 
     /// Frees sets and resets the pool for reuse. Only safe when nothing

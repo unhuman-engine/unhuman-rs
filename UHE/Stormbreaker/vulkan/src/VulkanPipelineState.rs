@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use ash::vk;
 use chassis::{Pipeline, Registry};
 
+use crate::vulkan_descriptor_manager::Descriptors;
 use crate::vulkan_error::Result;
 use crate::vulkan_shader::content_hash;
 
@@ -139,10 +140,10 @@ pub struct Pipelines {
     driver_cache: vk::PipelineCache,
     created: u32,
     cache_hits: u32,
-    /// The shape each set layout was built from, next to the driver object, so
-    /// dedup can compare shapes and teardown can destroy them in order.
-    set_layouts: Vec<(chassis::DescriptorSetLayoutDesc, vk::DescriptorSetLayout)>,
-    pipeline_layouts: Vec<(PipelineHash, vk::PipelineLayout)>,
+    /// Every `VkPipelineLayout` this object created, for teardown. No key:
+    /// nothing looks one up, and the set layouts it references live in
+    /// `Descriptors`.
+    pipeline_layouts: Vec<vk::PipelineLayout>,
 }
 
 impl Pipelines {
@@ -154,15 +155,8 @@ impl Pipelines {
             driver_cache,
             created: 0,
             cache_hits: 0,
-            set_layouts: Vec::new(),
             pipeline_layouts: Vec::new(),
         }
-    }
-
-    /// Number of distinct set layouts created. A pipeline that needs no
-    /// descriptors leaves this at zero.
-    pub fn set_layout_count(&self) -> usize {
-        self.set_layouts.len()
     }
 
     pub fn device(&self) -> &ash::Device {
@@ -196,25 +190,21 @@ impl Pipelines {
     /// Set layouts are deduplicated by shape, not by label: two sets that bind
     /// the same things at the same bindings are the same layout, and splitting
     /// them by name means a rename changes the driver objects for no reason.
+    /// The `VkPipelineLayout` for a pipeline's declared sets.
+    ///
+    /// The set layouts come from [`Descriptors`], which is the one place a layout
+    /// is created: a bind group asks the same cache for the same description, so
+    /// the two cannot disagree. This used to keep a second cache of its own, built
+    /// by a second conversion -- which dropped the stage flags and made every set
+    /// incompatible with its pipeline.
     pub fn create_layout(
         &mut self,
         desc: &[chassis::DescriptorSetLayoutDesc],
+        descriptors: &mut Descriptors,
     ) -> Result<vk::PipelineLayout> {
         let mut set_layouts = Vec::with_capacity(desc.len());
         for set in desc {
-            let existing = self
-                .set_layouts
-                .iter()
-                .find(|(key, _)| key.is_compatible(set))
-                .map(|(_, handle)| *handle);
-            match existing {
-                Some(handle) => set_layouts.push(handle),
-                None => {
-                    let handle = self.create_set_layout(set)?;
-                    self.set_layouts.push((set.clone(), handle));
-                    set_layouts.push(handle);
-                }
-            }
+            set_layouts.push(descriptors.layout(set)?);
         }
 
         let info = vk::PipelineLayoutCreateInfo::default()
@@ -223,39 +213,10 @@ impl Pipelines {
         let layout = unsafe { self.device.create_pipeline_layout(&info, None) }
             .map_err(|e| crate::vulkan_error::BackendError::vk("vkCreatePipelineLayout", e))?;
 
-        // Record it before returning. If the pipeline build that follows fails --
-        // a missing vertex stage, a bad description -- the layout is already
-        // allocated and nothing else will free it. Validation reported the
-        // orphan only at `vkDestroyDevice`, naming a VkPipelineLayout and nothing
-        // about which pipeline never happened.
-        self.pipeline_layouts.push((PipelineHash(0), layout));
+        // Recorded before returning: if the pipeline build that follows fails, the
+        // layout is already allocated and nothing else will free it.
+        self.pipeline_layouts.push(layout);
         Ok(layout)
-    }
-
-    fn create_set_layout(
-        &mut self,
-        desc: &chassis::DescriptorSetLayoutDesc,
-    ) -> Result<vk::DescriptorSetLayout> {
-        // Sorted, because the driver does not require order and a set declared
-        // in a different order is the same layout -- but hashing it unordered
-        // would mean the dedup above missed.
-        let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = desc
-            .bindings
-            .iter()
-            .map(|binding| vk::DescriptorSetLayoutBinding {
-                binding: binding.binding,
-                descriptor_type: crate::vulkan_descriptor_set::descriptor_type_of(binding.kind),
-                descriptor_count: binding.count.max(1),
-                stage_flags: stage_flags_of(binding.stages),
-                p_immutable_samplers: std::ptr::null(),
-                ..Default::default()
-            })
-            .collect();
-        bindings.sort_by_key(|binding| binding.binding);
-
-        let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-        unsafe { self.device.create_descriptor_set_layout(&info, None) }
-            .map_err(|e| crate::vulkan_error::BackendError::vk("vkCreateDescriptorSetLayout", e))
     }
 
     /// Destroy every pipeline layout and set layout this object created.
@@ -287,12 +248,15 @@ impl Pipelines {
         removed
     }
 
+    /// Destroys every `VkPipelineLayout` this object created.
+    ///
+    /// The set layouts are not here: they belong to [`Descriptors`], which created
+    /// them and destroys them. This object used to own a second set of them, and
+    /// two owners of one layout is how one is destroyed while the other still
+    /// references it.
     pub fn destroy_layouts(&mut self) {
-        for (_, pipeline_layout) in self.pipeline_layouts.drain(..) {
+        for pipeline_layout in self.pipeline_layouts.drain(..) {
             unsafe { self.device.destroy_pipeline_layout(pipeline_layout, None) };
-        }
-        for (_, set_layout) in self.set_layouts.drain(..) {
-            unsafe { self.device.destroy_descriptor_set_layout(set_layout, None) };
         }
     }
 
@@ -336,34 +300,4 @@ impl Drop for Pipelines {
         // names nothing about which set leaked.
         self.destroy_layouts();
     }
-}
-
-fn stage_flags_of(mask: chassis::StageMask) -> vk::ShaderStageFlags {
-    let mut flags = vk::ShaderStageFlags::empty();
-    if mask.contains(chassis::ShaderStage::Vertex) {
-        flags |= vk::ShaderStageFlags::VERTEX;
-    }
-    if mask.contains(chassis::ShaderStage::Fragment) {
-        flags |= vk::ShaderStageFlags::FRAGMENT;
-    }
-    if mask.contains(chassis::ShaderStage::Compute) {
-        flags |= vk::ShaderStageFlags::COMPUTE;
-    }
-    if mask.contains(chassis::ShaderStage::Geometry) {
-        flags |= vk::ShaderStageFlags::GEOMETRY;
-    }
-    if mask.contains(chassis::ShaderStage::TessellationControl) {
-        flags |= vk::ShaderStageFlags::TESSELLATION_CONTROL;
-    }
-    if mask.contains(chassis::ShaderStage::TessellationEvaluation) {
-        flags |= vk::ShaderStageFlags::TESSELLATION_EVALUATION;
-    }
-    // An empty visibility mask is a `vkCreateGraphicsPipelines` error whose
-    // message names a binding number and nothing else. Everything is visible
-    // instead: one redundant barrier at worst, versus a pipeline that will not
-    // create.
-    if flags.is_empty() {
-        flags = vk::ShaderStageFlags::ALL_GRAPHICS;
-    }
-    flags
 }

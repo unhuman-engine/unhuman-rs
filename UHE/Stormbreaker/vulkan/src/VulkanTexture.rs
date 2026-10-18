@@ -46,9 +46,20 @@ impl TextureResource {
         &self.label
     }
 
-    /// The view plus the subresource range every barrier for this texture uses.
+    /// The image plus the subresource range every barrier for this texture uses.
+    ///
+    /// The aspect comes from the texture's own format. `Target::color` would say
+    /// "colour" for a depth image, and the barrier encoder intersects that with
+    /// the format's aspects, so the depth buffer's barriers carried an empty
+    /// aspect mask -- `VUID-VkImageSubresourceRange-aspectMask-requiredbitmask`,
+    /// which validation reports as a barrier with no aspect at all.
     pub fn barrier_target(&self) -> crate::vulkan_barrier_encoder::Target {
-        crate::vulkan_barrier_encoder::Target::color(self.image, self.mip_levels, 1)
+        crate::vulkan_barrier_encoder::Target::for_format(
+            self.image,
+            self.format,
+            self.mip_levels,
+            1,
+        )
     }
 
     pub fn destroy(&self, device: &ash::Device) {

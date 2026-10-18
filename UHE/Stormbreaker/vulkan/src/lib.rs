@@ -88,7 +88,7 @@ pub use vulkan_command_buffer::Recording;
 pub use vulkan_compute_pipeline::ComputePipelineDesc;
 pub use vulkan_context::Context;
 pub use vulkan_deletion_queue::{DeletionQueue, Pending};
-pub use vulkan_descriptor_manager::{BindGroupLayoutDesc, Binding, Descriptors};
+pub use vulkan_descriptor_manager::Descriptors;
 pub use vulkan_descriptor_pool::{DescriptorPool, PoolSizes};
 pub use vulkan_descriptor_set::{descriptor_type_of, DescriptorSet};
 pub use vulkan_device::{create_device, device_available, DeviceOptions};

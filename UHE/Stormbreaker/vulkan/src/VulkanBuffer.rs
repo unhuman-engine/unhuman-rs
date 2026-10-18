@@ -47,12 +47,18 @@ impl BufferResource {
     }
 
     pub fn write(&self, device: &ash::Device, data: &[u8]) -> Result<()> {
+        self.write_at(device, 0, data)
+    }
+
+    /// Writes `data` at `offset`. Only valid when the buffer is host-visible; a
+    /// buffer created with `TRANSFER_DST` is.
+    pub fn write_at(&self, device: &ash::Device, offset: u64, data: &[u8]) -> Result<()> {
         if !self.host_visible {
             return Err(BackendError::NotHostVisible {
                 label: self.label.clone(),
             });
         }
-        vulkan_allocation::write_buffer(device, self.device_memory, self.size, data)
+        vulkan_allocation::write_buffer_at(device, self.device_memory, self.size, offset, data)
     }
 
     pub fn destroy(&self, device: &ash::Device) {

@@ -340,14 +340,6 @@ impl VulkanResources {
 /// types on purpose: the RHI's carries `stages`, which a set layout does not, and
 /// a `From` would invite someone to reach for it and lose the stage mask without
 /// being told.
-fn convert_binding(binding: &chassis::BindingDesc) -> crate::vulkan_descriptor_manager::Binding {
-    crate::vulkan_descriptor_manager::Binding {
-        binding: binding.binding,
-        count: binding.count,
-        kind: binding.kind,
-    }
-}
-
 /// The `vk::DescriptorType` a layout declares for `binding`.
 ///
 /// An error rather than a default, because the two failure modes are different:
@@ -448,6 +440,23 @@ impl chassis::Resources for VulkanResources {
             .map_err(Into::into)
     }
 
+    fn write_buffer(
+        &mut self,
+        buffer: &chassis::Buffer,
+        offset: u64,
+        data: &[u8],
+    ) -> chassis::Result<()> {
+        // A buffer created with `TRANSFER_DST` is host-visible, so the copy is a
+        // direct map rather than a staging buffer and a submit. `write_at`
+        // refuses a buffer that is not host-visible by name.
+        let device = self.device.clone();
+        let buffers = self.buffers();
+        let resource = buffers.get(*buffer).ok_or(chassis::Error::InvalidHandle)?;
+        resource
+            .write_at(&device, offset, data)
+            .map_err(chassis::Error::from)
+    }
+
     fn create_texture(&mut self, desc: chassis::TextureDesc) -> chassis::Result<chassis::Texture> {
         // `TextureDesc` has no label field. That is a gap in the RHI worth
         // closing -- a texture with no name is a texture nobody can find in a
@@ -509,7 +518,9 @@ impl chassis::Resources for VulkanResources {
         // are genuinely disjoint, so the split is real rather than asserted.
         let shaders = self.shaders.read().expect("registry lock");
         let mut pipelines = self.pipelines.write().expect("registry lock");
-        crate::vulkan_graphic_pipeline::create(&mut pipelines, &desc, &shaders).map_err(Into::into)
+        let mut descriptors = self.descriptors.write().expect("registry lock");
+        crate::vulkan_graphic_pipeline::create(&mut pipelines, &mut descriptors, &desc, &shaders)
+            .map_err(Into::into)
     }
 
     fn create_bind_group(
@@ -526,9 +537,7 @@ impl chassis::Resources for VulkanResources {
         // pipeline legal at all.
         let set_layout = self
             .descriptors_mut()
-            .layout(&crate::vulkan_descriptor_manager::BindGroupLayoutDesc {
-                bindings: layout.bindings.iter().map(convert_binding).collect(),
-            })
+            .layout(layout)
             .map_err(chassis::Error::from)?;
 
         let group = self
@@ -820,5 +829,10 @@ impl chassis::Resources for VulkanResources {
         self.shaders_mut().destroy(&device, shader);
     }
 
-    fn destroy_bind_group(&mut self, _group: chassis::BindGroup) {}
+    fn destroy_bind_group(&mut self, group: chassis::BindGroup) {
+        // The registry entry goes with the set: without this, every group the
+        // renderer rebuilds each frame stays allocated, the pool fills, and the
+        // next pool creation used to wipe the handle registry under it.
+        self.descriptors_mut().destroy(group);
+    }
 }

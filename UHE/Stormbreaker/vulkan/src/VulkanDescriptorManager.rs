@@ -23,61 +23,17 @@ use ash::vk;
 use chassis::{BindGroup, Registry};
 
 use crate::vulkan_descriptor_pool::{DescriptorPool, PoolSizes};
-use crate::vulkan_descriptor_set::{self, DescriptorKind, DescriptorSet};
+use crate::vulkan_descriptor_set::{self, DescriptorSet};
 use crate::vulkan_error::{BackendError, Result};
-use crate::vulkan_shader::content_hash;
 
 pub use crate::vulkan_descriptor_set::DescriptorKind as Kind;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub struct Binding {
-    pub binding: u32,
-    pub count: u32,
-    pub kind: DescriptorKind,
-}
+/// Sets one pool holds before another is created. Large enough that a frame's
+/// worth of bind groups fits in one, small enough that a pool's descriptor memory
+/// is not a per-frame allocation.
+const POOL_MAX_SETS: u32 = 256;
 
-/// The binding set a pipeline declares. Hashable, so a layout can be shared.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct BindGroupLayoutDesc {
-    pub bindings: Vec<Binding>,
-}
-
-impl BindGroupLayoutDesc {
-    pub fn uniform(binding: u32) -> Self {
-        Self::uniforms(binding, 1)
-    }
-
-    pub fn uniforms(binding: u32, count: u32) -> Self {
-        Self {
-            bindings: vec![Binding {
-                binding,
-                count,
-                kind: DescriptorKind::UniformBuffer,
-            }],
-        }
-    }
-
-    pub fn combined_sampler(binding: u32, count: u32) -> Self {
-        Self {
-            bindings: vec![Binding {
-                binding,
-                count,
-                kind: DescriptorKind::CombinedImageSampler,
-            }],
-        }
-    }
-
-    pub fn hash(&self) -> u64 {
-        let mut bytes = Vec::new();
-        for binding in &self.bindings {
-            bytes.extend_from_slice(&binding.binding.to_le_bytes());
-            bytes.extend_from_slice(&binding.count.to_le_bytes());
-            bytes.extend_from_slice(&(binding.kind as u32).to_le_bytes());
-        }
-        content_hash(&bytes)
-    }
-}
-
+/// One cached layout, next to the driver object.
 struct LayoutEntry {
     layout: vk::DescriptorSetLayout,
     /// Layouts may not be freed while a pipeline referencing them is alive, so
@@ -89,7 +45,14 @@ pub struct Descriptors {
     device: ash::Device,
     layouts: HashMap<u64, LayoutEntry>,
     pool_sizes: PoolSizes,
-    pool: Option<DescriptorPool>,
+    /// Every pool created, and which one to allocate from.
+    ///
+    /// A pool is never destroyed to make room. A live bind group holds a
+    /// `VkDescriptorSet` allocated from one, and destroying the pool frees it
+    /// under the caller -- which is what wiped the handle registry and made every
+    /// earlier bind group alias a later one.
+    pools: Vec<DescriptorPool>,
+    current: Option<usize>,
     sets: Registry<DescriptorSet, chassis::BindGroupTag>,
     layout_hits: u32,
     layout_misses: u32,
@@ -101,7 +64,8 @@ impl Descriptors {
             device: device.clone(),
             layouts: HashMap::new(),
             pool_sizes: PoolSizes::default(),
-            pool: None,
+            pools: Vec::new(),
+            current: None,
             sets: Registry::new(),
             layout_hits: 0,
             layout_misses: 0,
@@ -109,7 +73,15 @@ impl Descriptors {
     }
 
     /// A layout for this binding set, created on first sight.
-    pub fn layout(&mut self, desc: &BindGroupLayoutDesc) -> Result<vk::DescriptorSetLayout> {
+    ///
+    /// Keyed by the description's own hash and built from it by the same
+    /// conversion a pipeline uses -- one description, one layout, whichever side
+    /// asks first. Building it from a second, stage-less copy of the description
+    /// is what made every set on this backend incompatible with its pipeline.
+    pub fn layout(
+        &mut self,
+        desc: &chassis::DescriptorSetLayoutDesc,
+    ) -> Result<vk::DescriptorSetLayout> {
         let hash = desc.hash();
         if let Some(entry) = self.layouts.get_mut(&hash) {
             entry.ref_count += 1;
@@ -118,25 +90,29 @@ impl Descriptors {
         }
         self.layout_misses += 1;
 
-        let bindings: Vec<vk::DescriptorSetLayoutBinding> = desc
+        let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = desc
             .bindings
             .iter()
             .map(|binding| vk::DescriptorSetLayoutBinding {
                 binding: binding.binding,
                 descriptor_type: vulkan_descriptor_set::descriptor_type_of(binding.kind),
-                descriptor_count: binding.count,
-                stage_flags: vk::ShaderStageFlags::ALL,
+                descriptor_count: binding.count.max(1),
+                stage_flags: vulkan_descriptor_set::stage_flags_of(binding.stages),
                 p_immutable_samplers: std::ptr::null(),
                 ..Default::default()
             })
             .collect();
+        bindings.sort_by_key(|binding| binding.binding);
 
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         let layout = unsafe { self.device.create_descriptor_set_layout(&layout_info, None) }
             .map_err(|e| BackendError::vk("vkCreateDescriptorSetLayout", e))?;
 
+        // The sizes grew, so the pool in use may not cover the new descriptor
+        // type. The next allocation makes a new pool; this one stays alive for the
+        // sets already allocated from it.
         self.pool_sizes.account_for(&desc.bindings);
-        self.pool = None; // sizes changed; rebuild on next allocation
+        self.current = None;
 
         self.layouts.insert(
             hash,
@@ -150,29 +126,45 @@ impl Descriptors {
 
     /// Allocates a set. Rebuilds the pool when the accumulated sizes changed or
     /// the current one is full.
-    fn pool_mut(&mut self) -> Result<&mut DescriptorPool> {
-        let needs_new = match &self.pool {
-            None => true,
-            Some(pool) => !pool.has_room(),
-        };
-        if needs_new {
-            // Dropping the old pool frees its sets, which is why the registry
-            // below is cleared with it.
-            self.pool = Some(DescriptorPool::create(
-                &self.device,
-                &self.pool_sizes.as_slice(),
-                64,
-            )?);
-            self.sets = Registry::new();
+    /// The index of a pool with room for another set.
+    ///
+    /// A new pool is created when the current one is full or was invalidated by a
+    /// new descriptor type. The old pool is kept: its sets are live.
+    fn pool_index(&mut self) -> Result<usize> {
+        if let Some(index) = self.current {
+            if self.pools[index].has_room() {
+                return Ok(index);
+            }
         }
-        self.pool.as_mut().ok_or(BackendError::NoDescriptorPool)
+
+        let pool =
+            DescriptorPool::create(&self.device, &self.pool_sizes.as_slice(), POOL_MAX_SETS)?;
+        self.pools.push(pool);
+        let index = self.pools.len() - 1;
+        self.current = Some(index);
+        Ok(index)
     }
 
     /// Allocates a set from `layout`.
     pub fn allocate(&mut self, layout: vk::DescriptorSetLayout) -> Result<BindGroup> {
-        let pool = self.pool_mut()?;
-        let set = pool.allocate(layout)?;
-        Ok(self.sets.create(DescriptorSet::new(set, layout)))
+        let index = self.pool_index()?;
+        let set = self.pools[index].allocate(layout)?;
+        Ok(self.sets.create(DescriptorSet::new(set, layout, index)))
+    }
+
+    /// Frees a bind group's set and forgets its handle.
+    ///
+    /// The registry entry goes with the set, so a handle used after this resolves
+    /// to nothing -- which is the difference between a stale handle that is
+    /// reported and one that silently aliases whatever was allocated next.
+    pub fn destroy(&mut self, handle: BindGroup) -> bool {
+        let Some(entry) = self.sets.remove(handle) else {
+            return false;
+        };
+        if let Some(pool) = self.pools.get_mut(entry.pool()) {
+            pool.free(entry.handle());
+        }
+        true
     }
 
     /// Applies writes to an allocated set.
@@ -205,7 +197,9 @@ impl Descriptors {
     }
 
     pub fn pool(&self) -> Option<vk::DescriptorPool> {
-        self.pool.as_ref().map(DescriptorPool::handle)
+        self.current
+            .and_then(|index| self.pools.get(index))
+            .map(DescriptorPool::handle)
     }
 
     pub fn set_count(&self) -> usize {
@@ -215,9 +209,10 @@ impl Descriptors {
 
 impl Drop for Descriptors {
     fn drop(&mut self) {
-        // Pool first: it owns the sets, and freeing layouts while a pool
+        // Pools first: they own the sets, and freeing layouts while a pool
         // references them is what the destruction order rules forbid.
-        self.pool = None;
+        self.pools.clear();
+        self.current = None;
         unsafe {
             for entry in self.layouts.values() {
                 self.device

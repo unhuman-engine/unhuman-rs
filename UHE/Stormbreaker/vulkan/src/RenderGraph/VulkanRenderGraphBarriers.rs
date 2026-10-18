@@ -200,6 +200,7 @@ pub fn open_render_scope(
                 chassis::graph::LoadOp::Load => chassis::LoadOp::Load,
                 chassis::graph::LoadOp::DontCare => chassis::LoadOp::DontCare,
             },
+            clear: color.clear,
             store: true,
             resolve: chassis::Texture::null(),
         });
@@ -212,7 +213,12 @@ pub fn open_render_scope(
         desc.depth = Some(chassis::DepthAttachmentDesc {
             texture: handle,
             format: resource.format(),
-            load: chassis::LoadOp::Clear,
+            load: match depth.load {
+                chassis::graph::LoadOp::Clear => chassis::LoadOp::Clear,
+                chassis::graph::LoadOp::Load => chassis::LoadOp::Load,
+                chassis::graph::LoadOp::DontCare => chassis::LoadOp::DontCare,
+            },
+            clear_depth: depth.clear_depth,
             store: true,
         });
     }

@@ -18,6 +18,7 @@ use crate::vulkan_types;
 
 pub fn create(
     pipelines: &mut Pipelines,
+    descriptors: &mut crate::vulkan_descriptor_manager::Descriptors,
     desc: &chassis::PipelineDesc,
     shaders: &Shaders,
 ) -> Result<Pipeline> {
@@ -27,7 +28,7 @@ pub fn create(
         return Ok(existing);
     }
 
-    let layout = pipelines.create_layout(&desc.set_layouts)?;
+    let layout = pipelines.create_layout(&desc.set_layouts, descriptors)?;
     let handle = build(pipelines, desc, shaders, layout)?;
 
     Ok(pipelines.insert(hash, PipelineResource::new(handle, layout, &desc.label)))
@@ -56,11 +57,11 @@ fn build(
 
     // Every stage's module, as one array.
     //
-    // NOTE: Slang emits the entry point as `main` regardless of what it was
-    // called in source, so `p_name` is always `c"main"`. That is a property of
-    // the compiler's output, not a convention this backend chose, and it is the
-    // single most common reason a correctly compiled shader fails to create.
-    let entry_name = c"main";
+    // One module is one entry point, named `forge::ENTRY_POINT`: Slang renames
+    // the source's entry point to that, and so does `forge::wgsl::to_spirv_entry`.
+    // Naming the source's own name here creates no pipeline at all -- and the
+    // driver reports it as a shader error, which points at the wrong file.
+    let entry_name = std::ffi::CString::new(forge::ENTRY_POINT).expect("no interior NUL");
     let mut stage_infos: Vec<vk::PipelineShaderStageCreateInfo> =
         Vec::with_capacity(desc.shaders.len());
     for declared in &desc.shaders {

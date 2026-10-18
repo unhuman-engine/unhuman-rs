@@ -128,12 +128,51 @@ struct RecordedPass {
     barriers: u32,
 }
 
+/// The size a pass records at: its first attachment's.
+///
+/// Not the frame's. A shadow pass renders into a square map of its own while the
+/// frame is a wide rectangle, so recording it at the frame's extent draws into a
+/// corner of the map -- and a depth-only pass with no colour attachment has no
+/// colour extent to fall back on, which is a zero-area render pass on Vulkan.
+fn attachment_extent(
+    pass: &chassis::graph::CompiledPass,
+    slots: &SlotTable,
+    textures: &Textures,
+    frame: chassis::Extent2d,
+) -> chassis::Extent2d {
+    let color = pass
+        .colors
+        .first()
+        .and_then(|color| slots.texture(color.texture))
+        .and_then(|handle| textures.get(handle))
+        .map(|texture| chassis::Extent2d {
+            width: texture.extent().width,
+            height: texture.extent().height,
+        });
+
+    color
+        .or_else(|| {
+            pass.depth
+                .as_ref()
+                .and_then(|depth| slots.texture(depth.texture))
+                .and_then(|handle| textures.get(handle))
+                .map(|texture| chassis::Extent2d {
+                    width: texture.extent().width,
+                    height: texture.extent().height,
+                })
+        })
+        // The backbuffer has no `chassis::Texture` on Vulkan -- the swapchain owns
+        // it -- so a pass writing to it falls back to the frame's own extent.
+        .unwrap_or(frame)
+}
+
 /// Record one pass into its own list.
 ///
 /// A named function rather than an inline block, for one reason: a closure handed
 /// to `grind::parallel_for` cannot borrow, so the body had to be reachable
 /// without capturing anything from the frame. That it is now separately testable
 /// is a side benefit.
+///
 #[allow(clippy::too_many_arguments)]
 fn record_pass(
     pass: &chassis::graph::CompiledPass,
@@ -167,12 +206,13 @@ fn record_pass(
         // to open the scope could open it on the wrong attachments, and
         // validation would say `vkCmdDraw must be issued inside an active render
         // pass` with nothing naming who was responsible.
-        let rendering = open_render_scope(pass, slots, textures, extent, list)?;
+        let pass_extent = attachment_extent(pass, slots, textures, *extent);
+        let rendering = open_render_scope(pass, slots, textures, &pass_extent, list)?;
 
         let scope = PassScope {
             index: pass.index,
             name: &pass.name,
-            extent: *extent,
+            extent: pass_extent,
             slots,
         };
 

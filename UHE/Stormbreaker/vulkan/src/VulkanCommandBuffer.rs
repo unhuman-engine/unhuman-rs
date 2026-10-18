@@ -84,33 +84,10 @@ impl Recording {
     /// match its pipeline's formats is a validation error, and that is the check.
     pub fn begin_rendering(
         &mut self,
-        color_views: &[vk::ImageView],
-        depth_view: Option<vk::ImageView>,
+        color_attachments: &[vk::RenderingAttachmentInfo],
+        depth_attachment: Option<vk::RenderingAttachmentInfo>,
         extent: vk::Extent2D,
     ) {
-        let color_attachments: Vec<vk::RenderingAttachmentInfo> = color_views
-            .iter()
-            .map(|view| vk::RenderingAttachmentInfo {
-                image_view: *view,
-                image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                resolve_image_view: vk::ImageView::null(),
-                resolve_mode: vk::ResolveModeFlags::NONE,
-                load_op: vk::AttachmentLoadOp::CLEAR,
-                store_op: vk::AttachmentStoreOp::STORE,
-                ..Default::default()
-            })
-            .collect();
-
-        let depth_attachment = depth_view.map(|view| vk::RenderingAttachmentInfo {
-            image_view: view,
-            image_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            resolve_image_view: vk::ImageView::null(),
-            resolve_mode: vk::ResolveModeFlags::NONE,
-            load_op: vk::AttachmentLoadOp::CLEAR,
-            store_op: vk::AttachmentStoreOp::STORE,
-            ..Default::default()
-        });
-
         let info = vk::RenderingInfo {
             render_area: vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
@@ -415,22 +392,53 @@ impl CommandList<'_> {
 
 impl chassis::CommandList for CommandList<'_> {
     fn begin_rendering(&mut self, desc: &chassis::RenderPassDesc) {
-        let views: Vec<vk::ImageView> = desc
+        let color_attachments: Vec<vk::RenderingAttachmentInfo> = desc
             .colors
             .iter()
-            .filter_map(|c| self.textures.get(c.texture))
-            .map(|t| t.view())
+            .filter_map(|c| self.textures.get(c.texture).map(|t| (c, t)))
+            .map(|(c, t)| vk::RenderingAttachmentInfo {
+                image_view: t.view(),
+                image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                resolve_image_view: vk::ImageView::null(),
+                resolve_mode: vk::ResolveModeFlags::NONE,
+                load_op: attachment_load(c.load),
+                store_op: vk::AttachmentStoreOp::STORE,
+                clear_value: vk::ClearValue {
+                    color: vk::ClearColorValue { float32: c.clear },
+                },
+                ..Default::default()
+            })
             .collect();
-        let depth_view = desc
+        let depth_attachment = desc
             .depth
             .as_ref()
-            .and_then(|d| self.textures.get(d.texture))
-            .map(|t| t.view());
-        // The viewport follows the first colour attachment. A depth-only pass has
-        // to carry a colour attachment for there to be a viewport at all, which is
-        // also what the Vulkan spec requires for a non-zero render area.
-        let first = desc.colors.first().map(|c| c.texture);
-        let extent = first.and_then(|texture| self.textures.get(texture)).map_or(
+            .and_then(|d| self.textures.get(d.texture).map(|t| (d, t)))
+            .map(|(d, t)| vk::RenderingAttachmentInfo {
+                image_view: t.view(),
+                image_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                resolve_image_view: vk::ImageView::null(),
+                resolve_mode: vk::ResolveModeFlags::NONE,
+                load_op: attachment_load(d.load),
+                store_op: vk::AttachmentStoreOp::STORE,
+                clear_value: vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: d.clear_depth,
+                        stencil: 0,
+                    },
+                },
+                ..Default::default()
+            });
+        // The render area is the first attachment's, colour or depth: a
+        // depth-only pass -- the shadow map -- has no colour attachment and still
+        // has an area. Falling back to a zero extent was
+        // `VUID-VkRenderingInfo-None-08994`, reported as a render pass with no
+        // area at all.
+        let area = desc
+            .colors
+            .first()
+            .map(|color| color.texture)
+            .or_else(|| desc.depth.as_ref().map(|depth| depth.texture));
+        let extent = area.and_then(|texture| self.textures.get(texture)).map_or(
             vk::Extent2D {
                 width: 0,
                 height: 0,
@@ -438,7 +446,8 @@ impl chassis::CommandList for CommandList<'_> {
             |t| vulkan_types::vk_extent_2d(t.extent()),
         );
 
-        self.recording.begin_rendering(&views, depth_view, extent);
+        self.recording
+            .begin_rendering(&color_attachments, depth_attachment, extent);
     }
 
     fn end_rendering(&mut self) {
@@ -538,8 +547,10 @@ impl chassis::CommandList for CommandList<'_> {
         let extent = texture.extent();
         let region = vk::BufferImageCopy {
             buffer_offset: 0,
-            // 0 means "tightly packed", which is what a readback wants.
-            buffer_row_length: 0,
+            // The aligned pitch, in *texels* (`bufferRowLength` is texels, not
+            // bytes). The same pitch the wgpu backend uses, so a caller reading
+            // the buffer back strips the same padding either way.
+            buffer_row_length: chassis::copy_row_pitch(extent.width, 4) / 4,
             buffer_image_height: 0,
             image_subresource: vk::ImageSubresourceLayers {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -574,5 +585,15 @@ impl chassis::CommandList for CommandList<'_> {
                 size: vk::WHOLE_SIZE,
             }],
         );
+    }
+}
+
+/// The RHI's load op as Vulkan's. `DontCare` is safe to name here: the caller
+/// declared it, and this backend carries no unsafe marker to launder.
+fn attachment_load(load: chassis::LoadOp) -> vk::AttachmentLoadOp {
+    match load {
+        chassis::LoadOp::Clear => vk::AttachmentLoadOp::CLEAR,
+        chassis::LoadOp::Load => vk::AttachmentLoadOp::LOAD,
+        chassis::LoadOp::DontCare => vk::AttachmentLoadOp::DONT_CARE,
     }
 }
