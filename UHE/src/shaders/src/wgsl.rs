@@ -107,21 +107,41 @@ pub fn to_spirv(source: &str, label: &str) -> Result<Vec<u8>, WgslError> {
 ///
 /// The pipeline stage comes from `forge::Stage`, not from naga, so a caller does
 /// not have to depend on the SPIR-V backend to describe a shader.
+///
+/// The emitted module names its entry point [`crate::ENTRY_POINT`], not the name
+/// the source declared. Slang renames it the same way -- `Triangle.slang`
+/// declares `vs_main` and the module's `OpEntryPoint` is `main` -- and both
+/// backends' pipeline creation names it when it builds a stage. A module that
+/// kept the source name creates no pipeline on Vulkan and reports it as a shader
+/// error.
 pub fn to_spirv_entry(
     source: &str,
     label: &str,
     entry_point: &str,
     stage: Stage,
 ) -> Result<Vec<u8>, WgslError> {
-    let module = naga::front::wgsl::parse_str(source).map_err(|e| WgslError::Parse {
+    let mut module = naga::front::wgsl::parse_str(source).map_err(|e| WgslError::Parse {
         label: label.to_owned(),
         message: e.to_string(),
     })?;
     let info = validate(source, label)?;
 
+    let entry_name = match module
+        .entry_points
+        .iter_mut()
+        .find(|entry| entry.name == entry_point)
+    {
+        Some(entry) => {
+            entry.name = crate::ENTRY_POINT.to_owned();
+            crate::ENTRY_POINT
+        }
+        // Left alone, so naga reports the name the caller asked for.
+        None => entry_point,
+    };
+
     let pipeline = naga::back::spv::PipelineOptions {
         shader_stage: shader_stage(stage, label)?,
-        entry_point: entry_point.to_owned(),
+        entry_point: entry_name.to_owned(),
     };
 
     let options = naga::back::spv::Options::default();

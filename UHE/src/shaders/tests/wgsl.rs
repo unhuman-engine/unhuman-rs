@@ -105,3 +105,52 @@ fn the_same_source_compiles_to_the_same_bytes() {
 
     assert_eq!(once, twice);
 }
+
+/// The module's entry point is named `main`, whatever the source called it.
+///
+/// The backends name the entry point when they build a pipeline stage, and a
+/// module that kept the source name (`vs_main`) creates no pipeline on Vulkan:
+/// the driver reports it as a shader error, which points at the wrong file.
+#[test]
+fn the_emitted_module_names_its_entry_point_main() {
+    let vertex = wgsl::to_spirv_entry(TRIANGLE, "triangle", "vs_main", Stage::Vertex).unwrap();
+    let fragment = wgsl::to_spirv_entry(TRIANGLE, "triangle", "fs_main", Stage::Fragment).unwrap();
+
+    assert_eq!(entry_point_name(&vertex), forge::ENTRY_POINT);
+    assert_eq!(entry_point_name(&fragment), forge::ENTRY_POINT);
+}
+
+/// The first `OpEntryPoint`'s name, read out of the word stream.
+///
+/// The instruction is `OpEntryPoint <execution model> <function id> <name>`:
+/// the name is the third word onwards, NUL-terminated and padded to a word.
+fn entry_point_name(spirv: &[u8]) -> String {
+    const OP_ENTRY_POINT: u32 = 15;
+
+    let words: Vec<u32> = spirv
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
+        .collect();
+
+    let mut index = 5;
+    while index < words.len() {
+        let word = words[index];
+        let (count, opcode) = ((word >> 16) as usize, word & 0xffff);
+        if opcode == OP_ENTRY_POINT {
+            let literal: Vec<u8> = words[index + 3..index + count]
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect();
+            let end = literal
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(literal.len());
+            return String::from_utf8_lossy(&literal[..end]).into_owned();
+        }
+        index += count;
+    }
+
+    panic!("the module has no OpEntryPoint");
+}
