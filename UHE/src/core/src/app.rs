@@ -51,6 +51,14 @@ impl App {
             .find_map(|plugin| (plugin.as_mut() as &mut dyn std::any::Any).downcast_mut::<T>())
     }
 
+    /// The same plugin, for reading: a caller that only needs the camera or the
+    /// last frame does not have to borrow the whole `App` mutably to ask.
+    pub fn plugin<T: Plugin>(&self) -> Option<&T> {
+        self.plugins
+            .iter()
+            .find_map(|plugin| (plugin.as_ref() as &dyn std::any::Any).downcast_ref::<T>())
+    }
+
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
