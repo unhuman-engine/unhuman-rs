@@ -10,6 +10,7 @@
 //! engine's ownership and lets a headless run build the same model.
 
 pub mod commands;
+pub mod console;
 pub mod content_browser;
 pub mod gizmo;
 pub mod hierarchy;
@@ -20,6 +21,7 @@ pub mod selection;
 pub mod theme;
 
 pub use commands::{Command, History, DEFAULT_CAPACITY};
+pub use console::{Console, Level, LogEntry};
 pub use content_browser::{ContentBrowser, DragPayload, Entry};
 pub use gizmo::{snap_angle, snap_scale, snap_translate, Axis, GizmoMode, GizmoTransform, Snap};
 pub use hierarchy::{Hierarchy, Row};
@@ -73,6 +75,7 @@ pub struct Editor {
     pub play: PlayState,
     pub history: History,
     pub stats: Stats,
+    pub console: Console,
 }
 
 impl Default for Editor {
@@ -93,6 +96,7 @@ impl Editor {
             play: PlayState::new(),
             history: History::new(),
             stats: Stats::default(),
+            console: Console::new(),
         }
     }
 
@@ -208,6 +212,69 @@ impl Editor {
             name: EMPTY_ENTITY.to_string(),
         });
         entity
+    }
+
+    /// Spawns an entity drawing the model at `path`, loaded through the
+    /// registry. `path` is the registry's virtual path, not a filesystem one.
+    pub fn add_model(
+        &mut self,
+        scene: &mut Scene,
+        assets: &mut vault::Assets,
+        path: &str,
+        name: &str,
+    ) -> Entity {
+        let entity = scene.spawn(name);
+        scene.insert(
+            entity,
+            meats::MeshRenderer {
+                mesh_path: path.to_string(),
+                ..Default::default()
+            },
+        );
+        self.resolve_dropped(scene, assets, entity, name);
+        entity
+    }
+
+    /// Spawns an entity drawing the image at `path`. `path` is the registry's
+    /// virtual path.
+    pub fn add_image(
+        &mut self,
+        scene: &mut Scene,
+        assets: &mut vault::Assets,
+        path: &str,
+        name: &str,
+    ) -> Entity {
+        let entity = scene.spawn(name);
+        scene.insert(
+            entity,
+            meats::SpriteRenderer {
+                texture_path: path.to_string(),
+                ..Default::default()
+            },
+        );
+        self.resolve_dropped(scene, assets, entity, name);
+        entity
+    }
+
+    /// Loads the component paths a freshly spawned asset entity carries, then
+    /// makes the drop undoable and visible.
+    fn resolve_dropped(
+        &mut self,
+        scene: &mut Scene,
+        assets: &mut vault::Assets,
+        entity: Entity,
+        name: &str,
+    ) {
+        for error in scene.resolve_assets(assets) {
+            log::warn!("mirror: {error}");
+        }
+        self.selection.select(Some(entity));
+        self.inspector.mark_dirty(entity);
+        self.history.push(Command::CreateEntity {
+            entity,
+            parent: None,
+            name: name.to_string(),
+        });
     }
 
     /// Destroys the entity and its subtree. A selection inside that subtree is
@@ -386,6 +453,18 @@ impl Editor {
         self.history.clear();
     }
 
+    /// Replaces the scene with [`starter_scene`] and resolves its asset paths.
+    /// A fresh launch and File > New both land here, so the panels always have
+    /// something to show instead of an empty hierarchy.
+    pub fn new_starter_scene(&mut self, scene: &mut Scene, assets: &mut vault::Assets) {
+        self.new_scene(scene);
+        starter_scene(scene);
+        for error in scene.resolve_assets(assets) {
+            self.console.warn(error.to_string());
+        }
+        self.console.info("new scene");
+    }
+
     fn reset(&mut self, scene: &mut Scene) {
         self.play.stop(scene);
         self.selection.clear();
@@ -401,6 +480,80 @@ impl Editor {
             }
         }
     }
+}
+
+/// The entities a fresh scene starts with: a camera, a directional light and a
+/// visible model.
+///
+/// The camera is not primary, so the editor's orbit camera keeps driving the
+/// viewport; a primary scene camera would take the view over on the first
+/// frame. The mesh path is a registry path, so it stays unresolved until a
+/// caller runs [`meats::Scene::resolve_assets`].
+pub fn starter_scene(scene: &mut Scene) {
+    let camera = scene.spawn("Camera");
+    scene.insert(
+        camera,
+        meats::Camera {
+            primary: false,
+            ..Default::default()
+        },
+    );
+    set_transform(
+        scene,
+        camera,
+        glam::Vec3::new(0.0, 2.0, -6.0),
+        glam::Vec3::ZERO,
+    );
+
+    let light = scene.spawn("Directional Light");
+    scene.insert(light, meats::Light::default());
+    set_transform(
+        scene,
+        light,
+        glam::Vec3::new(0.0, 3.0, 0.0),
+        glam::Vec3::new(-50.0, -30.0, 0.0),
+    );
+
+    let model = scene.spawn("Sphere");
+    scene.insert(
+        model,
+        meats::MeshRenderer {
+            mesh_path: "models/Sphere.glb".to_string(),
+            ..Default::default()
+        },
+    );
+    set_transform(scene, model, glam::Vec3::ZERO, glam::Vec3::ZERO);
+}
+
+fn set_transform(scene: &mut Scene, entity: Entity, translation: glam::Vec3, rotation: glam::Vec3) {
+    if let Some(mut entry) = scene.get_mut(entity) {
+        if let Some(transform) = entry.get_mut::<meats::Transform>() {
+            transform.translation = translation;
+            transform.rotation = rotation;
+        }
+    }
+}
+
+/// The registry's virtual path for a file, mounting its directory if it sits
+/// outside every root.
+///
+/// A file already under a root keeps its root-relative path. Anything else is
+/// addressed by file name after its directory is mounted, so a file dropped
+/// from anywhere still loads. Callers store the returned virtual path: that is
+/// what a saved scene needs to resolve on the next launch, not the absolute
+/// path the drop carried.
+pub fn import_path(assets: &mut vault::Assets, path: &Path) -> Option<String> {
+    let roots = assets.roots().to_vec();
+    for root in &roots {
+        if let Ok(relative) = path.strip_prefix(root) {
+            return Some(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    let parent = path.parent()?;
+    if !roots.iter().any(|root| root.as_path() == parent) {
+        assets.mount(parent);
+    }
+    Some(path.file_name()?.to_string_lossy().into_owned())
 }
 
 /// The world-space transform the gizmo draws at for `entity`.

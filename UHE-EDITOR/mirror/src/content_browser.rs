@@ -33,10 +33,14 @@ pub struct ContentBrowser {
     /// The primary mount, kept for callers that only ever have one.
     pub root: PathBuf,
     pub current: PathBuf,
-    /// Extension filter; empty shows every file.
-    pub filter: String,
     pub selected: Option<String>,
     roots: Vec<PathBuf>,
+    /// Extension filter; empty shows every file.
+    filter: String,
+    /// The last directory listing. Kept, because a panel redraws every frame and
+    /// a `read_dir` per frame is filesystem work the user did not ask for.
+    /// [`ContentBrowser::refresh`] rebuilds it.
+    entries: Vec<Entry>,
 }
 
 impl Default for ContentBrowser {
@@ -47,13 +51,16 @@ impl Default for ContentBrowser {
 
 impl ContentBrowser {
     pub fn new(root: PathBuf) -> Self {
-        Self {
+        let mut browser = Self {
             current: root.clone(),
             roots: vec![root.clone()],
             root,
             filter: String::new(),
             selected: None,
-        }
+            entries: Vec::new(),
+        };
+        browser.refresh();
+        browser
     }
 
     /// Adds a directory to the search path. An already-mounted directory is not
@@ -68,11 +75,30 @@ impl ContentBrowser {
         &self.roots
     }
 
-    /// Contents of the current directory: directories first, then files, both
-    /// by name. An unreadable directory is empty rather than fatal.
-    pub fn entries(&self) -> Vec<Entry> {
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Sets the extension filter and rebuilds the listing.
+    pub fn set_filter(&mut self, filter: impl Into<String>) {
+        self.filter = filter.into();
+        self.refresh();
+    }
+
+    /// The cached contents of the current directory: directories first, then
+    /// files, both by name. A caller that changed the filesystem calls
+    /// [`ContentBrowser::refresh`].
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// Re-reads the current directory into the cache.
+    ///
+    /// An unreadable directory is empty rather than fatal.
+    pub fn refresh(&mut self) {
         let Ok(read) = std::fs::read_dir(&self.current) else {
-            return Vec::new();
+            self.entries.clear();
+            return;
         };
         let mut entries: Vec<Entry> = read
             .filter_map(|item| item.ok())
@@ -105,7 +131,7 @@ impl ContentBrowser {
                     .cmp(&b.name.to_ascii_lowercase())
             })
         });
-        entries
+        self.entries = entries;
     }
 
     /// From the mounted root down to the current directory, inclusive.
@@ -137,6 +163,7 @@ impl ContentBrowser {
             return false;
         }
         self.current = dir.to_path_buf();
+        self.refresh();
         true
     }
 
@@ -157,6 +184,7 @@ impl ContentBrowser {
         match self.current.parent() {
             Some(parent) if parent.starts_with(&root) => {
                 self.current = parent.to_path_buf();
+                self.refresh();
                 true
             }
             _ => false,
@@ -239,11 +267,32 @@ mod tests {
     }
 
     #[test]
+    fn the_listing_is_cached_until_refreshed() {
+        let base = temp_tree("cache");
+        let mut browser = ContentBrowser::new(base.clone());
+        let before = browser.entries().len();
+        std::fs::write(base.join("new.txt"), b"new").unwrap();
+
+        // Reading again does not walk the disk, so the new file is not there.
+        assert_eq!(
+            browser.entries().len(),
+            before,
+            "a read must not hit the disk"
+        );
+        browser.refresh();
+        assert_eq!(browser.entries().len(), before + 1);
+        assert!(browser
+            .entries()
+            .iter()
+            .any(|entry| entry.name == "new.txt"));
+    }
+
+    #[test]
     fn filters_files_by_extension_and_keeps_directories() {
         let base = temp_tree("filter");
         let mut browser = ContentBrowser::new(base.clone());
-        browser.filter = "unhuman".into();
-        let names: Vec<String> = browser.entries().into_iter().map(|e| e.name).collect();
+        browser.set_filter("unhuman");
+        let names: Vec<String> = browser.entries().iter().map(|e| e.name.clone()).collect();
         // Directories are kept whatever the filter; `readme.txt` is filtered out,
         // and the only `.unhuman` file lives under `scenes/`, seen on navigate.
         assert_eq!(names, vec!["scenes", "textures"]);
@@ -290,9 +339,10 @@ mod tests {
         assert!(browser.navigate(&base.join("textures")));
         let entry = browser
             .entries()
-            .into_iter()
+            .iter()
             .find(|e| e.name == "rock.png")
-            .unwrap();
+            .unwrap()
+            .clone();
         assert_eq!(browser.path_string(&entry), "textures/rock.png");
         assert_eq!(browser.payload(&entry).path, "textures/rock.png");
         assert!(entry.is_image());

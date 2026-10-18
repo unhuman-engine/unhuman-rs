@@ -10,11 +10,19 @@ use glam::{Mat4, Quat, Vec2, Vec3};
 
 /// World length of the drawn axis arrows. Only the *screen* length matters to
 /// picking, which is why this can be any unit.
-const AXIS_LENGTH: f32 = 1.0;
+///
+/// Public because drawing and picking have to agree: the editor builds the
+/// arrows from this, and [`TransformGizmo::pick_axis`] tests against the same
+/// length. Two copies of the number is how "the handle I clicked is not the
+/// handle I see" happens.
+pub const AXIS_LENGTH: f32 = 1.0;
 /// How close to the projected axis, in pixels, counts as a pick.
 const PICK_RADIUS: f32 = 6.0;
 /// Pixels of drag that scale an axis by one.
 const SCALE_PIXELS_PER_UNIT: f32 = 100.0;
+/// Segments in one rotation ring. Enough that the ring reads as a circle at any
+/// viewport size the editor opens at.
+const RING_SEGMENTS: usize = 48;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum GizmoMode {
@@ -306,6 +314,88 @@ fn signed_angle(from: Vec2, to: Vec2) -> f32 {
     cross.atan2(from.dot(to))
 }
 
+/// The gizmo's line segments, in world space, as `(from, to, axis)`.
+///
+/// One shape per mode: arrows for translate, a ring per axis for rotate, arrows
+/// with a box at the tip for scale. The axis comes back with each segment so the
+/// drawing side colours it without repeating any of the geometry -- and so that
+/// the shape that is drawn is the shape [`TransformGizmo::pick_axis`] tests.
+pub fn segments(mode: GizmoMode, target: &GizmoTransform) -> Vec<(Vec3, Vec3, Axis)> {
+    let mut segments = Vec::new();
+
+    for axis in Axis::ALL {
+        let direction = target.axis(axis);
+        if direction.length_squared() <= 1e-12 {
+            // A degenerate axis projects to a point and cannot be picked; there
+            // is nothing to draw for it either.
+            continue;
+        }
+
+        let origin = target.translation;
+        let tip = origin + direction * AXIS_LENGTH;
+
+        match mode {
+            GizmoMode::Translate => {
+                segments.push((origin, tip, axis));
+                let (side, _) = perpendicular(direction);
+                let barb = side * (AXIS_LENGTH * 0.12);
+                let back = tip - direction * (AXIS_LENGTH * 0.28);
+                segments.push((tip, back + barb, axis));
+                segments.push((tip, back - barb, axis));
+            }
+            GizmoMode::Rotate => {
+                let (u, v) = perpendicular(direction);
+                for step in 0..RING_SEGMENTS {
+                    let a = std::f32::consts::TAU * step as f32 / RING_SEGMENTS as f32;
+                    let b = std::f32::consts::TAU * (step + 1) as f32 / RING_SEGMENTS as f32;
+                    let from = origin + (u * a.cos() + v * a.sin()) * AXIS_LENGTH;
+                    let to = origin + (u * b.cos() + v * b.sin()) * AXIS_LENGTH;
+                    segments.push((from, to, axis));
+                }
+            }
+            GizmoMode::Scale => {
+                segments.push((origin, tip, axis));
+                let (u, v) = perpendicular(direction);
+                let half = AXIS_LENGTH * 0.07;
+                // Eight corners, in `du, dv, dw` bit order, then the twelve edges
+                // between the pairs whose indices differ in one bit.
+                let mut corners = Vec::with_capacity(8);
+                for du in [1.0f32, -1.0] {
+                    for dv in [1.0f32, -1.0] {
+                        for dw in [1.0f32, -1.0] {
+                            corners.push(
+                                tip + u * (half * du) + v * (half * dv) + direction * (half * dw),
+                            );
+                        }
+                    }
+                }
+                for corner in 0..corners.len() {
+                    for bit in [1usize, 2, 4] {
+                        let neighbour = corner ^ bit;
+                        if neighbour > corner {
+                            segments.push((corners[corner], corners[neighbour], axis));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    segments
+}
+
+/// Two unit vectors perpendicular to `direction`, and to each other.
+fn perpendicular(direction: Vec3) -> (Vec3, Vec3) {
+    let helper = if direction.x.abs() < 0.9 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let u = direction.cross(helper).normalize_or_zero();
+    let v = direction.cross(u).normalize_or_zero();
+    (u, v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +575,54 @@ mod tests {
         let mut target = GizmoTransform::IDENTITY;
         target.rotation = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
         assert!((target.axis(Axis::X) - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-5);
+    }
+
+    /// The drawn geometry is one shape per mode, per axis, and every segment is
+    /// tagged with the axis it belongs to -- which is what colours it, and what
+    /// makes the drawn arrow the same arrow `pick_axis` tests.
+    #[test]
+    fn the_gizmo_geometry_is_one_shape_per_mode_per_axis() {
+        let target = GizmoTransform::IDENTITY;
+
+        assert_eq!(segments(GizmoMode::Translate, &target).len(), 3 * 3);
+        assert_eq!(
+            segments(GizmoMode::Rotate, &target).len(),
+            RING_SEGMENTS * 3
+        );
+        assert_eq!(segments(GizmoMode::Scale, &target).len(), 3 * 13);
+
+        for mode in [GizmoMode::Translate, GizmoMode::Rotate, GizmoMode::Scale] {
+            let mut per_axis = [0usize; 3];
+            for (from, to, axis) in segments(mode, &target) {
+                assert!(
+                    from.is_finite() && to.is_finite(),
+                    "{mode:?} has a finite end"
+                );
+                for point in [from, to] {
+                    assert!(
+                        point.length() <= AXIS_LENGTH * 1.2,
+                        "{mode:?} draws outside the gizmo: {}",
+                        point.length()
+                    );
+                }
+                per_axis[axis.index()] += 1;
+            }
+            assert!(
+                per_axis.iter().all(|count| *count > 0),
+                "{mode:?} misses an axis: {per_axis:?}"
+            );
+        }
+
+        // The rotate ring is a circle of the gizmo's radius around its own axis,
+        // which is what makes it read as a ring rather than a fan.
+        for (from, _, axis) in segments(GizmoMode::Rotate, &target) {
+            let offset = from - target.translation;
+            let radial = offset - target.axis(axis) * offset.dot(target.axis(axis));
+            assert!(
+                (radial.length() - AXIS_LENGTH).abs() < 1e-3,
+                "off the ring: {}",
+                radial.length()
+            );
+        }
     }
 }
