@@ -92,6 +92,38 @@ fn a_dropped_subscription_sees_nothing_more() {
 }
 
 #[test]
+fn a_reentrant_send_is_queued_behind_the_event_in_hand_not_rebroadcast() {
+    let mut bus = EventBus::new();
+    let (tx, rx) = channel::<Event>();
+
+    let reenter = bus.sender();
+    let _sub = bus.subscribe(move |event| {
+        let _ = tx.send(event.clone());
+        if *event == Event::FrameBegin {
+            reenter.send(Event::FrameEnd);
+        }
+    });
+
+    bus.push(Event::FrameBegin);
+
+    // The handler ran once for FrameBegin; the send did not re-enter it.
+    assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![Event::FrameBegin]);
+    // FrameEnd is behind FrameBegin in the queue, oldest first.
+    assert_eq!(bus.drain(), vec![Event::FrameBegin, Event::FrameEnd]);
+}
+
+#[test]
+fn the_frame_has_one_consumer_that_empties_the_queue() {
+    let mut bus = EventBus::new();
+    bus.push(Event::FrameBegin);
+    bus.push(Event::FrameEnd);
+
+    assert_eq!(bus.drain().len(), 2);
+    assert!(bus.is_empty());
+    assert!(bus.drain().is_empty());
+}
+
+#[test]
 fn frame_begin_and_end_are_ordinary_events() {
     let mut bus = EventBus::new();
     let (tx, rx) = channel::<Event>();
