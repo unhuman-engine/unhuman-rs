@@ -2,7 +2,7 @@
 
 use adam::{Engine, Plugin, Result};
 
-use crate::physics_system3d::Physics3D;
+use crate::world::Physics3D;
 
 /// Installs `Physics3D` as the engine's physics backend.
 ///
