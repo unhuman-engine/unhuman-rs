@@ -132,11 +132,10 @@ impl EditorApp {
             .child(viewport::frame_status(
                 self.backend.as_deref(),
                 self.editor.stats.fps,
-                self.editor.stats.frame_ms,
+                self.editor.profiler.frame().timings.loop_ms,
             ))
-            .child(format!(
-                "render {:.1} ms",
-                self.editor.profiler.frame().timings.engine_ms
+            .child(viewport::timings_status(
+                &self.editor.profiler.frame().timings,
             ))
             .child(div().flex_1())
             .child("F1: shortcuts")

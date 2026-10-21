@@ -59,6 +59,23 @@ pub fn frame_status(backend: Option<&str>, fps: f32, frame_ms: f32) -> String {
     )
 }
 
+/// The four numbers one frame has: loop, engine, readback and the UI's paint.
+///
+/// The loop period includes the engine frame and the UI; showing the period
+/// alone would read as the engine's frame, which it is not.
+pub fn timings_status(timings: &mirror::Timings) -> String {
+    let readback = timings
+        .readback_ms
+        .map(|ms| format!("{ms:.2} ms"))
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "loop {:.2} ms · engine {:.2} ms · readback {readback} · ui {:.2} ms",
+        timings.loop_ms,
+        timings.engine_ms,
+        timings.ui_ms()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +101,29 @@ mod tests {
         );
         assert_eq!(backend_label(None), "no backend");
         assert!(frame_status(None, 0.0, 0.0).starts_with("no backend"));
+    }
+
+    #[test]
+    fn status_separates_loop_engine_readback_and_paint() {
+        let timings = mirror::Timings {
+            loop_ms: 16.6,
+            engine_ms: 11.2,
+            render_ms: 8.0,
+            readback_ms: Some(3.1),
+        };
+        assert_eq!(
+            timings_status(&timings),
+            "loop 16.60 ms · engine 11.20 ms · readback 3.10 ms · ui 5.40 ms"
+        );
+
+        let missing = mirror::Timings {
+            loop_ms: 16.0,
+            engine_ms: 16.0,
+            render_ms: 16.0,
+            readback_ms: None,
+        };
+        assert!(timings_status(&missing).contains("readback -"));
+        assert!(timings_status(&missing).contains("ui 0.00 ms"));
     }
 
     #[test]
