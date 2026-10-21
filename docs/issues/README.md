@@ -14,6 +14,7 @@ does not have a file yet.
 | `logging.md` | the engine's log and the editor's console are two different things |
 | `scene-format.md` | the save format and its parser |
 | `model-loading.md` | glTF loading, and every extension it has to handle |
+| `post-processing.md` | HDR, exposure, tonemap, and the effects that need them |
 | `physics.md` | femur needs a rewrite, not a repair |
 | `assets-and-jobs.md` | the asset system and the job system, both redesigned together |
 | `client-modes.md` | independent client, dependent client, the protocol between them, and the backend |

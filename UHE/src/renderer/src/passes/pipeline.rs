@@ -150,14 +150,15 @@ pub fn ssao_upsample_layout() -> DescriptorSetLayoutDesc {
         .with(binding(3, DescriptorKind::SampledImage, fragment))
 }
 
-/// The composite pass's set: the scene colour, the ambient occlusion, and the
-/// sampler both are read with.
+/// The composite pass's set: the scene colour, the ambient occlusion, the
+/// sampler both are read with, and the exposure/tonemap parameters.
 pub fn composite_layout() -> DescriptorSetLayoutDesc {
     let fragment = StageMask::of(ShaderStage::Fragment);
     DescriptorSetLayoutDesc::new("composite")
-        .with(binding(0, DescriptorKind::SampledImage, fragment))
+        .with(binding(0, DescriptorKind::UniformBuffer, fragment))
         .with(binding(1, DescriptorKind::SampledImage, fragment))
-        .with(binding(2, DescriptorKind::Sampler, fragment))
+        .with(binding(2, DescriptorKind::SampledImage, fragment))
+        .with(binding(3, DescriptorKind::Sampler, fragment))
 }
 
 fn binding(binding: u32, kind: DescriptorKind, stages: StageMask) -> chassis::BindingDesc {

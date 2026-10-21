@@ -82,6 +82,23 @@ impl ShadowUniforms {
     }
 }
 
+/// The composite pass's exposure and display transform inputs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct CompositeUniforms {
+    pub exposure: f32,
+    pub _pad: [f32; 3],
+}
+
+impl CompositeUniforms {
+    pub fn new(exposure: f32) -> Self {
+        Self {
+            exposure,
+            _pad: [0.0; 3],
+        }
+    }
+}
+
 /// Set 2's uniform: everything that changes per draw.
 ///
 /// The bind groups are the addressing, so this carries only the model matrix, the

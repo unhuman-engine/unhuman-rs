@@ -647,8 +647,13 @@ fn the_two_depth_reads_are_declared_as_depth() {
     }
     assert_eq!(
         kind_of(&pipeline::composite_layout(), 0),
+        DescriptorKind::UniformBuffer,
+        "the composite's exposure is a uniform block, like every other set's",
+    );
+    assert_eq!(
+        kind_of(&pipeline::composite_layout(), 1),
         DescriptorKind::SampledImage,
-        "the scene colour stays a sampled image",
+        "the HDR scene colour is a sampled image",
     );
 }
 
@@ -1895,16 +1900,33 @@ fn a_pushed_hud_declares_the_text_pass() {
         ssao,
         backbuffer,
     };
-    overlay.declare(&mut graph, &targets);
     graph
         .pass(PASS_COMPOSITE)
         .color(backbuffer, [0.0, 0.0, 0.0, 1.0])
         .read_texture(scene_color);
+    overlay.declare(&mut graph, &targets);
 
     let compiled = graph.compile().expect("the overlay's frame compiles");
+    let text = compiled
+        .find(PASS_TEXT)
+        .unwrap_or_else(|| panic!("a non-empty HUD declares the text pass: {}", graph.dump()));
+    assert_eq!(
+        text.colors[0].texture, backbuffer,
+        "the HUD draws after composition, onto the presented image, not the HDR scene",
+    );
+    let composite = compiled
+        .passes
+        .iter()
+        .position(|pass| pass.name == PASS_COMPOSITE)
+        .expect("composite pass");
+    let text = compiled
+        .passes
+        .iter()
+        .position(|pass| pass.name == PASS_TEXT)
+        .expect("text pass");
     assert!(
-        compiled.find(PASS_TEXT).is_some(),
-        "a non-empty HUD declares the text pass: {}",
+        composite < text,
+        "composition runs before the HUD: {}",
         graph.dump()
     );
 }

@@ -245,9 +245,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Occlusion scales the direct-light sum only; ambient and emissive are not
-    // cavity-shaded. The flat 0.08 ambient and the `1 - exp(-x)` exposure tone
-    // map match the original's shading curve so highlights roll off instead of
-    // clipping at 1.0.
+    // cavity-shaded. Output is linear HDR: composition owns exposure and the
+    // display transform, so a highlight above 1.0 is not clipped here.
     let occlusion_amount = 1.0 - (1.0 - occlusion) * material.factors.w;
     let ambient = base * 0.08;
 
@@ -289,5 +288,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let lit = ambient + lo * occlusion_amount + emissive;
-    return vec4<f32>(vec3<f32>(1.0) - exp(-lit), alpha);
+    return vec4<f32>(lit, alpha);
 }

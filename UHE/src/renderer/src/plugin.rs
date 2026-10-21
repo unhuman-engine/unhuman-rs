@@ -230,8 +230,12 @@ fn sprite_text_overlay(
     let atlas = font::generate::generate(ttf, &font::GeneratorOptions::default())
         .map_err(|error| format!("{}: {error}", font::DEFAULT_FONT_PATH))?;
 
-    // The scene colour, which is where both 2D passes draw.
-    let overlay = SpriteTextOverlay::new(gpu.resources(), chassis::TextureFormat::Rgba8Srgb, atlas)
+    // Both 2D passes draw after composition, onto the presented image.
+    let format = gpu
+        .swapchain()
+        .map(|swapchain| swapchain.format())
+        .unwrap_or(chassis::TextureFormat::Bgra8Srgb);
+    let overlay = SpriteTextOverlay::new(gpu.resources(), format, atlas)
         .map_err(|error| error.to_string())?;
     let frame = overlay.frame();
     Ok((overlay.into_arc(), frame))

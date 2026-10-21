@@ -30,7 +30,8 @@ pub use readback::{ReadbackPass, ReadbackRing, READBACK_LAG, READBACK_RING};
 pub use shadow::ShadowPass;
 pub use ssao::{SsaoPass, SsaoUniforms};
 pub use uniforms::{
-    BindSet, DrawArena, DrawUniforms, FrameUniforms, ImageSet, PaletteSet, ShadowUniforms,
+    BindSet, CompositeUniforms, DrawArena, DrawUniforms, FrameUniforms, ImageSet, PaletteSet,
+    ShadowUniforms,
 };
 
 /// Pass names, which are also the keys the dispatch is done on.

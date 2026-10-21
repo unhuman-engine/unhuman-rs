@@ -483,12 +483,18 @@ pub fn srgb8(linear: f32) -> u8 {
     (encoded * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+/// The display transform composition applies, at the default exposure.
+fn aces(x: f32) -> f32 {
+    let (a, b, c, d, e) = (2.51, 0.03, 2.43, 0.59, 0.14);
+    ((x * (a * x + b)) / (x * (c * x + d) + e)).clamp(0.0, 1.0)
+}
+
 /// `Bgra8Srgb` order, which is what the headless composition target uses.
 pub fn clear_bgra() -> [u8; 4] {
     [
-        srgb8(CLEAR_COLOR[2]),
-        srgb8(CLEAR_COLOR[1]),
-        srgb8(CLEAR_COLOR[0]),
+        srgb8(aces(CLEAR_COLOR[2])),
+        srgb8(aces(CLEAR_COLOR[1])),
+        srgb8(aces(CLEAR_COLOR[0])),
         255,
     ]
 }
@@ -542,6 +548,18 @@ pub fn difference(a: &FrameImage, b: &FrameImage, outlier_delta: u8) -> (f32, u8
 /// Relative luminance of one BGRA sRGB texel, in 0..=255.
 pub fn luminance(pixel: [u8; 4]) -> f32 {
     0.0722 * f32::from(pixel[0]) + 0.7152 * f32::from(pixel[1]) + 0.2126 * f32::from(pixel[2])
+}
+
+/// The mean luminance of every texel in the frame.
+pub fn mean_luminance(image: &FrameImage) -> f32 {
+    let total: f32 = image
+        .bgra
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|texel| luminance(*texel))
+        .sum();
+    total / (image.width * image.height).max(1) as f32
 }
 
 /// The mean luminance of a square region, clamped at the image's edges.

@@ -36,9 +36,9 @@ use crate::material::{
 use crate::mesh::{self, GpuMesh, MeshCache, MeshKey, VertexLayoutKey};
 use crate::passes::{
     self, uniforms, CompositePass, DrawArena, EditorPass, FrameRecorder, FrameTargets,
-    GeometryPass, GridPass, GridUniforms, ImageSet, LineBatch, LinePass, LineUniforms,
-    MaterialPipelines, OverlayPasses, PaletteSet, PipelineCache, PipelineKey, PreparedDraw,
-    ReadbackPass, ReadbackRing, ShaderSet, ShaderVariant, ShadowPass, SsaoPass, SsaoUniforms,
+    GeometryPass, GridPass, GridUniforms, LineBatch, LinePass, LineUniforms, MaterialPipelines,
+    OverlayPasses, PaletteSet, PipelineCache, PipelineKey, PreparedDraw, ReadbackPass,
+    ReadbackRing, ShaderSet, ShaderVariant, ShadowPass, SsaoPass, SsaoUniforms,
 };
 
 /// Where the frame's camera comes from.
@@ -60,6 +60,10 @@ pub const SHADOW_EXTENT: f32 = 40.0;
 
 /// The clear colour, taken from the editor theme.
 pub const CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.12, 1.0];
+
+/// Linear HDR scene colour. Composition tonemaps it; nothing reads it as display
+/// values.
+pub const SCENE_COLOR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
 /// One composed frame the renderer copied back to the CPU.
 ///
@@ -124,8 +128,7 @@ impl FrameTextures {
 
         let color = resources.create_texture(TextureDesc::new_2d(
             Extent::new(width, height),
-            // sRGB, to match the model pipeline's colour output.
-            TextureFormat::Rgba8Srgb,
+            SCENE_COLOR_FORMAT,
             TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
         ))?;
         let color_view = resources.create_image_view(&color)?;
@@ -248,7 +251,7 @@ pub struct Bifrost {
     /// The physics debug view's set, separate from the gizmo's so toggling one
     /// does not disturb the other's uniforms.
     debug_sets: FrameRing<uniforms::BindSet>,
-    image_sets: FrameRing<ImageSet>,
+    composite_sets: FrameRing<uniforms::BindSet>,
     palette_sets: FrameRing<PaletteSet>,
     draw_arenas: FrameRing<DrawArena>,
     /// The submission that wrote each slot, so the next lap waits only for the
@@ -263,6 +266,7 @@ pub struct Bifrost {
     line_batch: Option<LineBatch>,
     debug_batch: Option<LineBatch>,
     show_grid: bool,
+    exposure: f32,
 
     overlay: Option<Arc<dyn OverlayPasses>>,
     frame_index: u64,
@@ -336,7 +340,7 @@ impl Bifrost {
             grid_sets: FrameRing::new(depth),
             line_sets: FrameRing::new(depth),
             debug_sets: FrameRing::new(depth),
-            image_sets: FrameRing::new(depth),
+            composite_sets: FrameRing::new(depth),
             palette_sets: FrameRing::new(depth),
             draw_arenas: FrameRing::new(depth),
             submissions: FrameRing::new(depth),
@@ -346,6 +350,7 @@ impl Bifrost {
             line_batch: None,
             debug_batch: None,
             show_grid: true,
+            exposure: 1.0,
             overlay: None,
             frame_index: 0,
             frame_slot: 0,
@@ -477,6 +482,16 @@ impl Bifrost {
 
     pub fn show_grid(&mut self, show: bool) {
         self.show_grid = show;
+    }
+
+    /// Scales linear scene light before the display transform. `1.0` is the
+    /// authored level; `0.0` renders black.
+    pub fn set_exposure(&mut self, exposure: f32) {
+        self.exposure = exposure.clamp(0.0, 64.0);
+    }
+
+    pub fn exposure(&self) -> f32 {
+        self.exposure
     }
 
     /// Registers a material description under an asset id for
@@ -1018,16 +1033,26 @@ impl Bifrost {
             .read_texture(ssao_raw)
             .read_texture(scene_depth);
 
-        // The editor's grid and gizmos, blended, after the scene. The scene depth
-        // is loaded so the grid is occluded by geometry instead of drawing over it.
+        // The editor's grid and gizmos are world-space drawing, so they are
+        // part of the scene light and are tonemapped with it. The scene depth
+        // is loaded so the grid is occluded by geometry instead of drawing
+        // over it.
         graph
             .pass(passes::PASS_EDITOR)
             .color_load(scene_color)
             .depth_load(scene_depth);
 
-        // The 2D and text slice's passes, which draw into the scene colour
-        // after the 3D scene does. Declared here, before the composition, so
-        // the composition is still the last writer of the backbuffer.
+        // The composition tonemaps the HDR scene and the occlusion into the
+        // backbuffer, whose slot the executor resolves.
+        graph
+            .pass(passes::PASS_COMPOSITE)
+            .color(backbuffer, [0.0, 0.0, 0.0, 1.0])
+            .read_texture(scene_color)
+            .read_texture(ssao);
+
+        // The 2D and text slice draws after composition: a crosshair must not
+        // dim when the exposure changes, and an sRGB backbuffer is where its
+        // authored colours already mean what they say.
         let targets = FrameTargets {
             scene_color,
             scene_depth,
@@ -1038,14 +1063,6 @@ impl Bifrost {
         if let Some(overlay) = &self.overlay {
             overlay.declare(graph, &targets);
         }
-
-        // The composition: the scene colour and the occlusion into the
-        // backbuffer, whose slot the executor resolves.
-        graph
-            .pass(passes::PASS_COMPOSITE)
-            .color(backbuffer, [0.0, 0.0, 0.0, 1.0])
-            .read_texture(scene_color)
-            .read_texture(ssao);
 
         // Copy the composed image out for the CPU, when there is no surface to
         // present it to. Declared after the composition so it reads the final
@@ -1231,7 +1248,9 @@ impl Bifrost {
     ) -> Result<Arc<FrameRecorder>, Error> {
         let slot = self.frame_slot;
         let samples = chassis::SampleCount::X1;
-        let color = TextureFormat::Rgba8Srgb;
+        // Scene geometry and the editor's grid read as linear HDR; the 2D and
+        // text overlay draws after composition straight to the backbuffer.
+        let scene_color = SCENE_COLOR_FORMAT;
         let depth = TextureFormat::Depth32Float;
         let mut recorder = FrameRecorder::new();
 
@@ -1270,24 +1289,34 @@ impl Bifrost {
             let pipelines = MaterialPipelines {
                 opaque: self.pipelines.get_or_create(
                     resources,
-                    PipelineKey::model(ShaderVariant::Model, color, depth, samples),
+                    PipelineKey::model(ShaderVariant::Model, scene_color, depth, samples),
                     &self.shaders,
                 )?,
                 opaque_double_sided: self.pipelines.get_or_create(
                     resources,
-                    PipelineKey::model(ShaderVariant::ModelDoubleSided, color, depth, samples),
+                    PipelineKey::model(
+                        ShaderVariant::ModelDoubleSided,
+                        scene_color,
+                        depth,
+                        samples,
+                    ),
                     &self.shaders,
                 )?,
                 transparent: self.pipelines.get_or_create(
                     resources,
-                    PipelineKey::model(ShaderVariant::ModelTransparent, color, depth, samples),
+                    PipelineKey::model(
+                        ShaderVariant::ModelTransparent,
+                        scene_color,
+                        depth,
+                        samples,
+                    ),
                     &self.shaders,
                 )?,
                 transparent_double_sided: self.pipelines.get_or_create(
                     resources,
                     PipelineKey::model(
                         ShaderVariant::ModelTransparentDoubleSided,
-                        color,
+                        scene_color,
                         depth,
                         samples,
                     ),
@@ -1353,7 +1382,7 @@ impl Bifrost {
             let grid = if self.show_grid {
                 let pipeline = self.pipelines.get_or_create(
                     resources,
-                    PipelineKey::grid(color, depth, samples),
+                    PipelineKey::grid(scene_color, depth, samples),
                     &self.shaders,
                 )?;
                 let uniforms = GridUniforms::new(view_projection.to_cols_array_2d());
@@ -1374,7 +1403,7 @@ impl Bifrost {
                 Some(batch) => {
                     let pipeline = self.pipelines.get_or_create(
                         resources,
-                        PipelineKey::lines(color, depth, samples),
+                        PipelineKey::lines(scene_color, depth, samples),
                         &self.shaders,
                     )?;
                     let uniforms = LineUniforms::new(
@@ -1398,7 +1427,7 @@ impl Bifrost {
                 Some(batch) => {
                     let pipeline = self.pipelines.get_or_create(
                         resources,
-                        PipelineKey::lines(color, depth, samples),
+                        PipelineKey::lines(scene_color, depth, samples),
                         &self.shaders,
                     )?;
                     let uniforms = LineUniforms::new(
@@ -1429,11 +1458,14 @@ impl Bifrost {
                 PipelineKey::fullscreen(ShaderVariant::Composite, self.swapchain_format, samples),
                 &self.shaders,
             )?;
-            let group = self.image_sets.get_mut(slot).rebuild(
+            let uniforms = uniforms::CompositeUniforms::new(self.exposure);
+            let group = self.composite_sets.get_mut(slot).rebuild(
                 resources,
                 &passes::pipeline::composite_layout(),
-                &[(0, self.textures.color_view), (1, self.textures.ssao_view)],
-                &[(2, self.textures.sampler)],
+                &uniforms,
+                &[],
+                &[(1, self.textures.color_view), (2, self.textures.ssao_view)],
+                &[(3, self.textures.sampler)],
             )?;
             recorder.composite = Some(CompositePass::new(pipeline, group));
         }
@@ -1489,7 +1521,7 @@ impl Bifrost {
         for set in self.debug_sets.iter_mut() {
             set.destroy(resources);
         }
-        for set in self.image_sets.iter_mut() {
+        for set in self.composite_sets.iter_mut() {
             set.destroy(resources);
         }
         for set in self.palette_sets.iter_mut() {

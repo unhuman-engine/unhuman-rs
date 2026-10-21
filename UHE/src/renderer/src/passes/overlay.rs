@@ -424,10 +424,10 @@ impl OverlayPasses for SpriteTextOverlay {
         // Both load the scene colour: the 3D passes wrote it, and the frame's
         // composition reads it after these.
         if state.has_sprites() {
-            graph.pass(PASS_2D).color_load(targets.scene_color);
+            graph.pass(PASS_2D).color_load(targets.backbuffer);
         }
         if state.has_text() {
-            graph.pass(PASS_TEXT).color_load(targets.scene_color);
+            graph.pass(PASS_TEXT).color_load(targets.backbuffer);
         }
     }
 
