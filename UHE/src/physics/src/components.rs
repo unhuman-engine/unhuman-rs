@@ -91,6 +91,62 @@ impl Default for CollisionFilter {
     }
 }
 
+/// Which translation and rotation axes a body may use, per axis.
+///
+/// `true` allows the axis. A body constrained to a plane locks its one
+/// translation axis and the two rotations that would tip it off the plane; the
+/// order is Rapier's, `[x, y, z]`.
+///
+/// The `.unhuman` `AllowedDOFs` list is six booleans in `[tx, ty, tz, rx, ry,
+/// rz]` order, which is [`from_array`](Self::from_array)'s order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AllowedDOFs {
+    pub translation: [bool; 3],
+    pub rotation: [bool; 3],
+}
+
+impl AllowedDOFs {
+    /// Every axis: what a body with no component gets, so adding one cannot
+    /// silently pin a body.
+    pub const ALL: Self = Self {
+        translation: [true; 3],
+        rotation: [true; 3],
+    };
+
+    pub const fn new(translation: [bool; 3], rotation: [bool; 3]) -> Self {
+        Self {
+            translation,
+            rotation,
+        }
+    }
+
+    /// From the `.unhuman` order, `[tx, ty, tz, rx, ry, rz]`.
+    pub const fn from_array(dofs: [bool; 6]) -> Self {
+        Self {
+            translation: [dofs[0], dofs[1], dofs[2]],
+            rotation: [dofs[3], dofs[4], dofs[5]],
+        }
+    }
+
+    /// To the `.unhuman` order, `[tx, ty, tz, rx, ry, rz]`.
+    pub const fn to_array(self) -> [bool; 6] {
+        [
+            self.translation[0],
+            self.translation[1],
+            self.translation[2],
+            self.rotation[0],
+            self.rotation[1],
+            self.rotation[2],
+        ]
+    }
+}
+
+impl Default for AllowedDOFs {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
 /// Continuous collision detection for fast, small bodies that would otherwise
 /// pass through a thin wall between two steps.
 ///

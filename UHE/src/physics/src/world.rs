@@ -12,19 +12,22 @@
 //!   that disagrees is an editor edit, and it is pushed into Rapier rather than
 //!   overwritten by the next step.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use adam::PhysicsBackend;
 use glam::Vec3;
-use meats::{Entity, RigidBodyKind, Scene};
+use meats::{Entity, Scene, Transform};
 use rapier3d::prelude::{
     BroadPhaseBvh, CCDSolver, ColliderSet, ImpulseJointSet, IntegrationParameters, IslandManager,
     MultibodyJointSet, NarrowPhase, PhysicsPipeline, RigidBodyHandle, RigidBodySet, SoftBodySet,
 };
 
 use crate::body::{self, Entry, ScenePose, Source};
+use crate::contacts::{self, CollisionEvent};
+use crate::convert;
+use crate::debug::{self, PhysicsDebug};
 use crate::joints::{self, JointEntry};
-use crate::shape::Refusal;
+use crate::shape::{Refusal, ShapeSlot};
 
 /// Jolt's default gravity, which the 3D world used. Box2D's `-9.8` is the 2D
 /// value, and this backend is 3D only.
@@ -53,6 +56,10 @@ pub struct Physics3D {
     ccd_solver: CCDSolver,
     entries: HashMap<Entity, Entry>,
     joints: HashMap<Entity, JointEntry>,
+    /// The pairs touching at the end of the last step, to diff enter and exit.
+    touching: HashSet<(Entity, Entity)>,
+    /// Collisions from the last step, drained by the engine into `pings`.
+    collisions: Vec<CollisionEvent>,
     generation: u64,
 }
 
@@ -76,8 +83,17 @@ impl Physics3D {
             ccd_solver: CCDSolver::new(),
             entries: HashMap::new(),
             joints: HashMap::new(),
+            touching: HashSet::new(),
+            collisions: Vec::new(),
             generation: 0,
         }
+    }
+
+    /// Takes the collisions since the last drain, oldest step first. The engine
+    /// forwards them to `pings`; a caller that never drains them drops them,
+    /// which is the point of a queue rather than a bus.
+    pub fn drain_collision_events(&mut self) -> Vec<CollisionEvent> {
+        std::mem::take(&mut self.collisions)
     }
 
     /// The body an entity currently has, if any.
@@ -87,6 +103,76 @@ impl Physics3D {
     /// component, so a scene file never records a body a reload cannot reproduce.
     pub fn handle(&self, entity: Entity) -> Option<BodyHandle> {
         Some(BodyHandle(self.entries.get(&entity)?.body?))
+    }
+
+    /// Whether an entity's body is asleep. A static body, or one that has no
+    /// body, is never reported asleep.
+    pub fn is_sleeping(&self, entity: Entity) -> bool {
+        let Some(entry) = self.entries.get(&entity) else {
+            return false;
+        };
+        if entry.source.kind == meats::RigidBodyKind::Static {
+            return false;
+        }
+        entry
+            .body
+            .is_some_and(|handle| body::is_sleeping(&self.bodies, handle))
+    }
+
+    /// The simulation's own pose for an entity, as translation and Euler degrees.
+    /// `None` when the entity has no body in the simulation.
+    pub fn pose_of(&self, entity: Entity) -> Option<(Vec3, Vec3)> {
+        let handle = self.entries.get(&entity)?.body?;
+        let pose = body::pose_of(&self.bodies, handle)?;
+        Some((pose.translation, pose.rotation))
+    }
+
+    /// The debug geometry for the current state: collider wireframes, contact
+    /// crosses and broad-phase boxes, as segments for a line pass.
+    ///
+    /// Recomputed on each call rather than cached: a debug view is off in a
+    /// shipped frame, and a cache would be state the simulation has to keep
+    /// fresh for a reader that may never ask.
+    pub fn debug_view(&self) -> PhysicsDebug {
+        let mut view = PhysicsDebug::default();
+
+        for entry in self.entries.values() {
+            let (Some(handle), ShapeSlot::Supported(shape)) = (entry.body, &entry.source.shape)
+            else {
+                continue;
+            };
+            let Some(pose) = body::pose_of(&self.bodies, handle) else {
+                continue;
+            };
+            let rotation = Transform {
+                rotation: pose.rotation,
+                ..Transform::default()
+            }
+            .rotation_quat();
+            let center = pose.translation + rotation * entry.source.offset;
+            debug::shape_lines(*shape, center, rotation, &mut view.shapes);
+        }
+
+        for pair in self.narrow_phase.contact_pairs() {
+            if pair.has_any_active_contact() {
+                let point =
+                    contacts::point_between(&self.colliders, pair.collider1, pair.collider2);
+                debug::contact_lines(point, &mut view.contacts);
+            }
+        }
+        for (c1, c2, intersecting) in self.narrow_phase.intersection_pairs() {
+            if intersecting {
+                let point = contacts::point_between(&self.colliders, c1, c2);
+                debug::contact_lines(point, &mut view.contacts);
+            }
+        }
+
+        for (_, collider) in self.colliders.iter() {
+            let (min, max) = convert::collider_aabb(collider);
+            debug::aabb_lines(min, max, &mut view.broad_phase);
+        }
+
+        view
     }
 
     fn sync_in(&mut self, scene: &Scene) {
@@ -149,15 +235,15 @@ impl Physics3D {
             let Some(entry) = self.entries.get_mut(&entity) else {
                 continue;
             };
-            // Static bodies are never moved by the simulation, and skipping them
-            // leaves a static body's pose bit-identical to what the scene asked
-            // for.
-            if entry.source.kind == RigidBodyKind::Static {
-                continue;
-            }
             let Some(handle) = entry.body else {
                 continue;
             };
+            let sleeping = body::is_sleeping(&self.bodies, handle);
+            let write = body::writes_pose(entry.source.kind, sleeping, entry.sleeping);
+            entry.sleeping = sleeping;
+            if !write {
+                continue;
+            }
             let Some(pose) = body::pose_of(&self.bodies, handle) else {
                 continue;
             };
@@ -170,13 +256,15 @@ impl Physics3D {
         self.despawn(entity);
 
         match body::insert(&mut self.bodies, &mut self.colliders, &source, pose) {
-            Ok(handle) => {
+            Ok((handle, collider)) => {
                 self.entries.insert(
                     entity,
                     Entry {
                         body: Some(handle),
+                        collider: Some(collider),
                         source,
                         written: pose,
+                        sleeping: false,
                         seen: generation,
                     },
                 );
@@ -199,8 +287,10 @@ impl Physics3D {
             entity,
             Entry {
                 body: None,
+                collider: None,
                 source,
                 written: pose,
+                sleeping: false,
                 seen,
             },
         );
@@ -266,6 +356,14 @@ impl PhysicsBackend for Physics3D {
         );
 
         self.sync_out(scene);
+
+        contacts::collect(
+            &self.narrow_phase,
+            &self.colliders,
+            &self.entries,
+            &mut self.touching,
+            &mut self.collisions,
+        );
     }
 
     fn body_count(&self) -> usize {

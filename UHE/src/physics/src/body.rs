@@ -9,10 +9,10 @@
 use glam::Vec3;
 use meats::{Collider, Entity, RigidBody, RigidBodyKind, Scene, Transform};
 use rapier3d::prelude::{
-    ColliderBuilder, ColliderSet, RigidBodyBuilder, RigidBodyHandle, RigidBodySet,
+    ColliderBuilder, ColliderHandle, ColliderSet, RigidBodyBuilder, RigidBodyHandle, RigidBodySet,
 };
 
-use crate::components::{Ccd, CollisionFilter};
+use crate::components::{AllowedDOFs, Ccd, CollisionFilter};
 use crate::convert;
 use crate::filter;
 use crate::shape::{Refusal, ShapeSlot};
@@ -40,6 +40,7 @@ pub(crate) struct Source {
     pub restitution: f32,
     pub offset: Vec3,
     pub shape: ShapeSlot,
+    pub dofs: AllowedDOFs,
     pub ccd: Ccd,
     pub filter: CollisionFilter,
 }
@@ -49,10 +50,15 @@ pub(crate) struct Entry {
     /// `None` when the entity's collider was refused; the entity stays tracked so
     /// the refusal is reported when the description changes.
     pub body: Option<RigidBodyHandle>,
+    /// The collider Rapier made, to map a contact back to the entity that owns it.
+    pub collider: Option<ColliderHandle>,
     /// What the body was built from.
     pub source: Source,
     /// The pose this backend last wrote into the scene.
     pub written: ScenePose,
+    /// Whether the body was asleep at the last write, so the sleep transition
+    /// writes once and the steps after it are skipped.
+    pub sleeping: bool,
     /// The sync pass that last saw the entity's rigid body.
     pub seen: u64,
 }
@@ -83,6 +89,9 @@ pub(crate) fn read_source(scene: &Scene, entity: Entity) -> Option<(Source, Scen
         // which is what the field is for.
         offset: collider.as_ref().map_or(Vec3::ZERO, |c| c.offset),
         shape: ShapeSlot::from_collider(collider.as_deref(), transform.scale),
+        dofs: built
+            .get::<AllowedDOFs>()
+            .map_or(AllowedDOFs::ALL, |dofs| *dofs),
         ccd: built.get::<Ccd>().map_or(Ccd::default(), |ccd| *ccd),
         filter: built
             .get::<CollisionFilter>()
@@ -97,7 +106,7 @@ pub(crate) fn insert(
     colliders: &mut ColliderSet,
     source: &Source,
     pose: ScenePose,
-) -> Result<RigidBodyHandle, Refusal> {
+) -> Result<(RigidBodyHandle, ColliderHandle), Refusal> {
     let shape = source.shape.shared()?;
 
     let body = match source.kind {
@@ -114,7 +123,19 @@ pub(crate) fn insert(
     // Fast bodies already sweep fixed colliders automatically; `enabled` widens
     // the sweep to every body, `prediction` is the cheaper soft-CCD distance.
     .ccd_enabled(source.ccd.enabled)
-    .soft_ccd_prediction(source.ccd.prediction);
+    .soft_ccd_prediction(source.ccd.prediction)
+    // An allowed axis is Rapier's "not locked one", so the component's `true`
+    // maps to `true` here with no inversion at the call site.
+    .enabled_translations(
+        source.dofs.translation[0],
+        source.dofs.translation[1],
+        source.dofs.translation[2],
+    )
+    .enabled_rotations(
+        source.dofs.rotation[0],
+        source.dofs.rotation[1],
+        source.dofs.rotation[2],
+    );
     let handle = bodies.insert(body);
 
     let mut collider = ColliderBuilder::new(shape)
@@ -128,9 +149,24 @@ pub(crate) fn insert(
         // shape; a Rapier collider mass is the same split.
         collider = collider.mass(source.mass);
     }
-    colliders.insert_with_parent(collider, handle, bodies);
+    let collider = colliders.insert_with_parent(collider, handle, bodies);
 
-    Ok(handle)
+    Ok((handle, collider))
+}
+
+/// Whether a body's pose must be written into the scene this step.
+///
+/// A static body never moves. A sleeping body is skipped, but the step it goes to
+/// sleep on is written: its pose then is the last the solver produced, and
+/// skipping the transition is the C++ bug that leaves a saved scene a step behind.
+pub(crate) fn writes_pose(kind: RigidBodyKind, sleeping: bool, was_sleeping: bool) -> bool {
+    kind != RigidBodyKind::Static && !(sleeping && was_sleeping)
+}
+
+/// Whether a body is asleep. A body that has no handle is treated as awake so a
+/// missing body cannot silently stop the sync.
+pub(crate) fn is_sleeping(bodies: &RigidBodySet, handle: RigidBodyHandle) -> bool {
+    bodies.get(handle).is_some_and(|body| body.is_sleeping())
 }
 
 /// Pushes a scene pose into a body, waking it: a user edit should not be ignored.
@@ -148,4 +184,28 @@ pub(crate) fn pose_of(bodies: &RigidBodySet, handle: RigidBodyHandle) -> Option<
         translation,
         rotation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sleeping_body_is_written_on_the_step_it_sleeps_and_then_skipped() {
+        use RigidBodyKind::{Dynamic, Static};
+
+        // Awake: written every step.
+        assert!(writes_pose(Dynamic, false, false));
+        // The sleep transition: still written, or the scene keeps the previous
+        // frame's pose and a save taken while asleep is a step stale.
+        assert!(writes_pose(Dynamic, true, false));
+        // Already asleep: skipped, which is the frame-budget win.
+        assert!(!writes_pose(Dynamic, true, true));
+        // Woken: written again.
+        assert!(writes_pose(Dynamic, false, true));
+
+        // A static body never moves.
+        assert!(!writes_pose(Static, false, false));
+        assert!(!writes_pose(Static, true, true));
+    }
 }
