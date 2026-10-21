@@ -7,12 +7,13 @@ use std::time::Duration;
 
 use adam::{Engine, FrameCtx, Plugin};
 use aimlab::{
-    ray_sphere, AimLabPlugin, Score, CAMERA_DISTANCE, HIT_POINTS, SPAWN_X, SPAWN_Y, SPAWN_Z,
+    ray_sphere, AimLabPlugin, Score, CAMERA_DISTANCE, HIT_POINTS, MAX_AMMO, RECOIL_DURATION,
+    RECOIL_MAX_DEGREES, RECOIL_PITCH_DEGREES, RELOAD_DURATION, SPAWN_X, SPAWN_Y, SPAWN_Z,
     STAGE_ENTITIES, TARGET_COUNT, TARGET_RADIUS,
 };
 use glam::Vec3;
 use meats::{Entity, Transform};
-use pings::{Event, MouseButton};
+use pings::{Event, KeyCode, MouseButton};
 
 const STEP: f32 = 1.0 / 60.0;
 const STEPS_PER_SECOND: usize = 60;
@@ -47,6 +48,16 @@ fn translation(engine: &Engine, entity: Entity) -> Vec3 {
     engine.scene.world_transform(entity).w_axis.truncate()
 }
 
+fn rotation(engine: &Engine, entity: Entity) -> Vec3 {
+    engine
+        .scene
+        .get(entity)
+        .expect("entity exists")
+        .get::<Transform>()
+        .expect("every entity has a transform")
+        .rotation
+}
+
 fn place(engine: &mut Engine, entity: Entity, position: Vec3) {
     let mut entry = engine.scene.get_mut(entity).expect("entity exists");
     entry
@@ -60,6 +71,30 @@ fn click(engine: &mut Engine) {
     engine
         .input
         .apply(&Event::MouseButtonPressed(MouseButton::Left));
+}
+
+/// One full press-then-release: the release step is what lets `shoot` see the
+/// next press as a new edge.
+fn fire(engine: &mut Engine, plugin: &mut AimLabPlugin, ctx: &mut FrameCtx) {
+    click(engine);
+    plugin.on_update(engine, ctx);
+    engine.input.begin_frame();
+    engine
+        .input
+        .apply(&Event::MouseButtonReleased(MouseButton::Left));
+    plugin.on_update(engine, ctx);
+}
+
+fn press_key(engine: &mut Engine, key: KeyCode) {
+    engine.input.begin_frame();
+    engine
+        .input
+        .apply(&Event::KeyPressed { key, repeat: false });
+}
+
+fn release_key(engine: &mut Engine, key: KeyCode) {
+    engine.input.begin_frame();
+    engine.input.apply(&Event::KeyReleased { key });
 }
 
 #[test]
@@ -288,4 +323,176 @@ fn a_ray_at_the_drawn_silhouette_edge_hits() {
     )
     .is_none());
     assert!(ray_sphere(Vec3::ZERO, Vec3::ZERO, center, TARGET_RADIUS).is_none());
+}
+
+#[test]
+fn a_shot_spends_a_round() {
+    let (mut engine, mut plugin) = built();
+    let mut ctx = context();
+
+    fire(&mut engine, &mut plugin, &mut ctx);
+
+    assert_eq!(plugin.score().shots, 1);
+    assert_eq!(plugin.ammo().rounds, MAX_AMMO - 1);
+    assert!(!plugin.ammo().reloading);
+}
+
+#[test]
+fn a_shot_kicks_the_camera_pitch_by_the_impulse() {
+    let (mut engine, mut plugin) = built();
+    let camera = engine.scene.primary_camera().expect("primary camera");
+    let before = rotation(&engine, camera);
+
+    click(&mut engine);
+    plugin.on_update(&mut engine, &mut context());
+
+    let after = rotation(&engine, camera);
+    assert!(
+        (after.x - before.x - RECOIL_PITCH_DEGREES).abs() < 1e-4,
+        "{before} -> {after}"
+    );
+    assert!((after.y - before.y).abs() < 1e-4, "the kick is pitch-only");
+}
+
+#[test]
+fn the_camera_returns_to_its_aim_after_the_recoil() {
+    let (mut engine, mut plugin) = built();
+    let camera = engine.scene.primary_camera().expect("primary camera");
+    let aim = rotation(&engine, camera);
+    let mut ctx = context();
+
+    fire(&mut engine, &mut plugin, &mut ctx);
+    assert!(rotation(&engine, camera).x > aim.x, "the shot has kicked");
+
+    let steps = (RECOIL_DURATION * STEPS_PER_SECOND as f32).ceil() as usize + 2;
+    for _ in 0..steps {
+        plugin.on_update(&mut engine, &mut ctx);
+    }
+    let settled = rotation(&engine, camera);
+    assert!(
+        (settled - aim).length() < 1e-4,
+        "aim {aim} did not return, got {settled}"
+    );
+}
+
+#[test]
+fn rapid_shots_cap_the_recoil() {
+    let (mut engine, mut plugin) = built();
+    let camera = engine.scene.primary_camera().expect("primary camera");
+    let mut ctx = context();
+
+    for _ in 0..3 {
+        fire(&mut engine, &mut plugin, &mut ctx);
+    }
+
+    let pitch = rotation(&engine, camera).x;
+    assert!(
+        pitch <= RECOIL_MAX_DEGREES + 1e-4,
+        "recoil {pitch} exceeds the cap"
+    );
+    assert!(pitch > RECOIL_PITCH_DEGREES, "repeated shots accumulate");
+}
+
+#[test]
+fn the_magazine_empties_then_auto_reloads() {
+    let (mut engine, mut plugin) = built();
+    let mut ctx = context();
+
+    for _ in 0..MAX_AMMO {
+        fire(&mut engine, &mut plugin, &mut ctx);
+    }
+    assert_eq!(plugin.score().shots, MAX_AMMO);
+    assert_eq!(plugin.ammo().rounds, 0);
+    assert!(plugin.ammo().reloading, "auto-reload at zero");
+
+    // A click while reloading is consumed and spends no shot.
+    let shots = plugin.score().shots;
+    fire(&mut engine, &mut plugin, &mut ctx);
+    assert_eq!(plugin.score().shots, shots);
+
+    let steps = (RELOAD_DURATION * STEPS_PER_SECOND as f32).ceil() as usize + 2;
+    for _ in 0..steps {
+        plugin.on_update(&mut engine, &mut ctx);
+    }
+    assert!(!plugin.ammo().reloading);
+    assert_eq!(plugin.ammo().rounds, MAX_AMMO);
+}
+
+#[test]
+fn r_reloads_and_refills_after_the_timer() {
+    let (mut engine, mut plugin) = built();
+    let mut ctx = context();
+
+    fire(&mut engine, &mut plugin, &mut ctx);
+    assert_eq!(plugin.ammo().rounds, MAX_AMMO - 1);
+
+    press_key(&mut engine, KeyCode::R);
+    plugin.on_update(&mut engine, &mut ctx);
+    assert!(plugin.ammo().reloading);
+    assert_eq!(
+        plugin.ammo().rounds,
+        MAX_AMMO - 1,
+        "rounds refill at the end"
+    );
+
+    release_key(&mut engine, KeyCode::R);
+    plugin.on_update(&mut engine, &mut ctx);
+    assert!(plugin.ammo().reloading, "the release does not cancel it");
+
+    let steps = (RELOAD_DURATION * STEPS_PER_SECOND as f32).ceil() as usize + 2;
+    for _ in 0..steps {
+        plugin.on_update(&mut engine, &mut ctx);
+    }
+    assert!(!plugin.ammo().reloading);
+    assert_eq!(plugin.ammo().rounds, MAX_AMMO);
+}
+
+#[test]
+fn r_at_full_does_not_start_a_reload() {
+    let (mut engine, mut plugin) = built();
+    let mut ctx = context();
+
+    press_key(&mut engine, KeyCode::R);
+    plugin.on_update(&mut engine, &mut ctx);
+
+    assert!(!plugin.ammo().reloading);
+    assert_eq!(plugin.ammo().rounds, MAX_AMMO);
+}
+
+#[test]
+fn the_report_carries_accuracy_ammo_and_controls() {
+    let (mut engine, mut plugin) = built();
+    let mut ctx = context();
+    let target = plugin.target_entities()[0];
+    place(&mut engine, target, Vec3::new(0.0, 0.0, SPAWN_Z));
+
+    fire(&mut engine, &mut plugin, &mut ctx);
+
+    let report = plugin.report();
+    assert_eq!(report.score.hits, 1);
+    assert_eq!(report.score.shots, 1);
+    assert_eq!(report.accuracy(), 100.0);
+    assert_eq!(report.ammo.rounds, MAX_AMMO - 1);
+    assert!(!report.ammo.reloading);
+    assert_eq!(
+        aimlab::Report::CONTROLS,
+        ["Mouse: Aim", "Left Click: Shoot", "R: Reload"]
+    );
+    assert_eq!(aimlab::Report::CROSSHAIR, aimlab::Crosshair::default());
+}
+
+#[test]
+fn the_gun_is_a_camera_child_even_without_its_mesh() {
+    let (engine, plugin) = built();
+    let gun = plugin.gun().expect("the gun seam");
+    let camera = engine.scene.primary_camera().expect("primary camera");
+
+    assert_eq!(engine.scene.parent(gun), Some(camera));
+    let entry = engine.scene.get(gun).expect("the gun entity");
+    assert!(
+        entry
+            .get::<meats::MeshRenderer>()
+            .is_none_or(|mesh| mesh.mesh.is_none()),
+        "no pistol in this tree, so nothing is drawn for the gun"
+    );
 }

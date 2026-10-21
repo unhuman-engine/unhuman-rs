@@ -5,7 +5,8 @@
 
 use glam::{Mat4, Vec3};
 use meats::{
-    AudioSource, Camera, Entity, Light, LightKind, MeshRenderer, Scene, SceneCamera, Transform,
+    Animator, AudioSource, Camera, Entity, Light, LightKind, MeshRenderer, Scene, SceneCamera,
+    Transform,
 };
 
 /// Spawns an entity with a translation and a scale.
@@ -28,6 +29,14 @@ fn set_scale(scene: &mut Scene, entity: Entity, scale: Vec3) {
     if let Some(mut entry) = scene.get_mut(entity) {
         if let Some(transform) = entry.get_mut::<Transform>() {
             transform.scale = scale;
+        }
+    }
+}
+
+pub(crate) fn set_rotation(scene: &mut Scene, entity: Entity, rotation: Vec3) {
+    if let Some(mut entry) = scene.get_mut(entity) {
+        if let Some(transform) = entry.get_mut::<Transform>() {
+            transform.rotation = rotation;
         }
     }
 }
@@ -76,6 +85,17 @@ pub(crate) fn add_mesh(scene: &mut Scene, entity: Entity, path: &str) {
         ..Default::default()
     };
     let _ = scene.insert(entity, mesh);
+}
+
+/// Marks a skinned mesh entity as playing. `bifrost` attaches the model's
+/// skeleton and chooses Idle, or the first clip, when this component appears.
+pub(crate) fn add_animator(scene: &mut Scene, entity: Entity) {
+    let animator = Animator {
+        playing: true,
+        looping: true,
+        ..Default::default()
+    };
+    let _ = scene.insert(entity, animator);
 }
 
 /// A sound on an entity by virtual path. The handle beside it is

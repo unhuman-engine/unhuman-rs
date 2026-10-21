@@ -5,12 +5,19 @@
 //! in `Engine::scene`.
 //!
 //! Five targets, a spawn box, a hit rule and the look sensitivity, plus a target
-//! lifetime, a spawn cadence and a point total.
+//! lifetime, a spawn cadence, a point total, and a seven-round magazine with an
+//! `R` reload and an auto-reload at zero.
 //!
 //! The demo's assets are the repository's: `assets/models/Sphere.glb` for the
 //! targets, `assets/models/Box.gltf` for the ground and `assets/audio/gunshot.wav`
-//! for the shot. The 12 MB `pistol_animations_blender.glb` is deliberately not
-//! copied, because no code path here names it.
+//! for the shot.
+//!
+//! The animated pistol is a camera child. `bifrost` attaches its skin and
+//! skeleton when the entity carries an `Animator`, so the idle clip plays over
+//! the same transform seam the other meshes use. A checkout without the asset
+//! leaves the transform only and changes nothing else.
+//!
+//! Displayed state goes through [`AimLabPlugin::report`]; the demo owns no HUD.
 
 mod rules;
 mod scene;
@@ -18,17 +25,22 @@ mod scene;
 use adam::{Engine, FrameCtx, Plugin, Result};
 use glam::Vec3;
 use meats::{Entity, Scene};
-use pings::MouseButton;
+use pings::{KeyCode, MouseButton};
 
 pub use rules::{
-    ray_sphere, spawn_position, Rng, Score, CAMERA_DISTANCE, CAMERA_FAR, CAMERA_FOV, CAMERA_NEAR,
-    CAMERA_POSITION, CAMERA_YAW_DEGREES, HIT_POINTS, SPAWN_INTERVAL, SPAWN_X, SPAWN_Y, SPAWN_Z,
-    STAGE_ENTITIES, TARGET_COUNT, TARGET_LIFETIME, TARGET_RADIUS,
+    ray_sphere, spawn_position, Ammo, Crosshair, Recoil, Report, Rng, Score, CAMERA_DISTANCE,
+    CAMERA_FAR, CAMERA_FOV, CAMERA_NEAR, CAMERA_POSITION, CAMERA_YAW_DEGREES, GUN_OFFSET,
+    GUN_ROTATION_DEGREES, GUN_SCALE, HIT_POINTS, MAX_AMMO, RECOIL_DURATION, RECOIL_MAX_DEGREES,
+    RECOIL_PITCH_DEGREES, RECOIL_YAW_DEGREES, RELOAD_DURATION, SPAWN_INTERVAL, SPAWN_X, SPAWN_Y,
+    SPAWN_Z, STAGE_ENTITIES, TARGET_COUNT, TARGET_LIFETIME, TARGET_RADIUS,
 };
 
 /// The target and ground meshes, as virtual paths against the workspace asset root.
 const TARGET_MESH: &str = "assets/models/Sphere.glb";
 const GROUND_MESH: &str = "assets/models/Box.gltf";
+
+/// The animated pistol, attached to the gun seam when the checkout has it.
+const GUN_MESH: &str = "assets/models/pistol_animations_blender.glb";
 
 /// The sound played on every shot.
 const SHOT_SOUND: &str = "assets/audio/gunshot.wav";
@@ -52,13 +64,17 @@ struct Target {
 /// The aim lab.
 pub struct AimLabPlugin {
     score: Score,
+    ammo: Ammo,
     targets: Vec<Target>,
     spawned: u32,
     spawn_timer: f32,
     rng: Rng,
     yaw: f32,
     pitch: f32,
+    recoil: Recoil,
     mouse_was_down: bool,
+    r_was_down: bool,
+    gun: Option<Entity>,
     built: bool,
 }
 
@@ -66,13 +82,17 @@ impl AimLabPlugin {
     pub fn new() -> Self {
         Self {
             score: Score::default(),
+            ammo: Ammo::default(),
             targets: Vec::new(),
             spawned: 0,
             spawn_timer: SPAWN_INTERVAL,
             rng: Rng::default(),
             yaw: CAMERA_YAW_DEGREES.to_radians(),
             pitch: 0.0,
+            recoil: Recoil::default(),
             mouse_was_down: false,
+            r_was_down: false,
+            gun: None,
             built: false,
         }
     }
@@ -80,6 +100,25 @@ impl AimLabPlugin {
     /// Hits, misses, shots and points, for a status bar.
     pub fn score(&self) -> Score {
         self.score
+    }
+
+    /// Rounds left and the reload clock.
+    pub fn ammo(&self) -> Ammo {
+        self.ammo
+    }
+
+    /// Everything a HUD draws: score, ammo and the controls list. The display
+    /// seam; the demo never draws.
+    pub fn report(&self) -> Report {
+        Report {
+            score: self.score,
+            ammo: self.ammo,
+        }
+    }
+
+    /// The gun entity, present even when its mesh is not.
+    pub fn gun(&self) -> Option<Entity> {
+        self.gun
     }
 
     pub fn target_count(&self) -> usize {
@@ -130,7 +169,7 @@ impl AimLabPlugin {
     }
 
     /// Mouse look: yaw and pitch in radians.
-    fn look(&mut self, eng: &mut Engine) {
+    fn look(&mut self, eng: &Engine) {
         let (dx, dy) = eng.input.cursor_delta();
         if dx == 0.0 && dy == 0.0 {
             return;
@@ -142,34 +181,58 @@ impl AimLabPlugin {
         // starting yaw, including the wall-facing 180 the camera now starts at.
         self.yaw -= dx * MOUSE_SENSITIVITY;
         self.pitch = (self.pitch + dy * MOUSE_SENSITIVITY).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    }
+
+    /// Writes base aim plus the recoil offset once per frame, so a kick never
+    /// overwrites the mouse look and a still mouse still lets the kick decay.
+    fn aim(&self, eng: &mut Engine) {
+        let pitch = (self.pitch + self.recoil.pitch.to_radians()).clamp(-PITCH_LIMIT, PITCH_LIMIT);
         scene::aim(
             &mut eng.scene,
-            self.yaw.to_degrees(),
-            self.pitch.to_degrees(),
+            self.yaw.to_degrees() + self.recoil.yaw,
+            pitch.to_degrees(),
         );
     }
 
-    /// One shot per press. The button is held rather than pressed, because a frame can
-    /// run several substeps and "pressed" stays true for all of them.
+    /// One shot per press, spent from the magazine. The button is held rather
+    /// than pressed, because a frame can run several substeps and "pressed"
+    /// stays true for all of them.
     fn shoot(&mut self, eng: &mut Engine) {
         let down = eng.input.is_mouse_held(MouseButton::Left);
         let fired = down && !self.mouse_was_down;
         self.mouse_was_down = down;
-        if !fired {
+        // An empty or reloading magazine eats the click, exactly as the C++
+        // consumes the press before it checks the ammo.
+        if !fired || !self.ammo.can_fire() {
             return;
         }
 
+        self.ammo.fire();
         self.score.shot();
+        self.recoil.kick(RECOIL_PITCH_DEGREES, RECOIL_YAW_DEGREES);
         self.play_shot(eng);
-        let Some(entity) = self.pick(&eng.scene) else {
-            return;
-        };
+        if let Some(entity) = self.pick(&eng.scene) {
+            self.score.hit();
+            let position = spawn_position(&mut self.rng);
+            scene::set_translation(&mut eng.scene, entity, position);
+            if let Some(target) = self.targets.iter_mut().find(|t| t.entity == entity) {
+                target.life = TARGET_LIFETIME;
+            }
+        }
 
-        self.score.hit();
-        let position = spawn_position(&mut self.rng);
-        scene::set_translation(&mut eng.scene, entity, position);
-        if let Some(target) = self.targets.iter_mut().find(|t| t.entity == entity) {
-            target.life = TARGET_LIFETIME;
+        // Auto-reload on the shot that empties the magazine.
+        if self.ammo.rounds == 0 {
+            self.ammo.begin_reload();
+        }
+    }
+
+    /// `R` starts a reload, one edge per press.
+    fn reload(&mut self, eng: &mut Engine) {
+        let down = eng.input.is_key_held(KeyCode::R);
+        let pressed = down && !self.r_was_down;
+        self.r_was_down = down;
+        if pressed {
+            self.ammo.begin_reload();
         }
     }
 
@@ -213,8 +276,24 @@ impl Plugin for AimLabPlugin {
         // yaw that turns -Z onto the wall has to be set here.
         scene::aim(&mut eng.scene, CAMERA_YAW_DEGREES, 0.0);
 
-        // There is no gun entity, so the clip hangs on the camera: the ear and the
-        // muzzle are the same point for a one-shot the listener takes.
+        // The gun is a camera child, so its world transform follows the look
+        // without a per-frame update of its own. The mesh is attached only when
+        // the pistol is present; the entity stays either way, so ammo and reload
+        // do not depend on the asset.
+        let gun = scene::spawn(&mut eng.scene, "Gun", GUN_OFFSET, Vec3::splat(GUN_SCALE));
+        scene::set_rotation(&mut eng.scene, gun, GUN_ROTATION_DEGREES);
+        eng.scene.set_parent(gun, Some(camera));
+        if eng.assets.vfs().resolve(GUN_MESH).is_ok() {
+            scene::add_mesh(&mut eng.scene, gun, GUN_MESH);
+            scene::add_animator(&mut eng.scene, gun);
+        } else {
+            log::info!("aimlab: {GUN_MESH} absent; the gun is a transform-only seam");
+        }
+        self.gun = Some(gun);
+
+        // There is no gun entity with a sound, so the clip hangs on the camera:
+        // the ear and the muzzle are the same point for a one-shot the listener
+        // takes.
         scene::add_audio_source(&mut eng.scene, camera, SHOT_SOUND);
 
         // Staggered by the cadence so the five do not expire in one tick.
@@ -250,6 +329,9 @@ impl Plugin for AimLabPlugin {
         }
         let dt = ctx.step_seconds();
 
+        self.ammo.tick(dt);
+        self.recoil.tick(dt);
+
         self.spawn_timer -= dt;
         if self.spawn_timer <= 0.0 {
             self.spawn_timer += SPAWN_INTERVAL;
@@ -260,6 +342,10 @@ impl Plugin for AimLabPlugin {
 
         self.expire_targets(eng, dt);
         self.look(eng);
+        self.reload(eng);
         self.shoot(eng);
+        // After the shot, so the pick uses the aim the crosshair was on and the
+        // new kick lands on top of it.
+        self.aim(eng);
     }
 }
