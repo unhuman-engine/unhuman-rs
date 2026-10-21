@@ -32,6 +32,9 @@ pub fn app_with_physics_debug(physics_debug: bool) -> App {
     };
     let mut app = app.add(MirrorPlugin::new());
 
+    // Aimlab's paths spell the `assets/` prefix, so the repository root has to
+    // be a root too; `assets` stays as the fallback for asset-relative paths.
+    app.engine_mut().assets.mount(".");
     app.engine_mut().assets.mount("assets");
     app
 }

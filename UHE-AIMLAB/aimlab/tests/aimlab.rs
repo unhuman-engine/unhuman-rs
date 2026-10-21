@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use adam::{Engine, FrameCtx, Plugin};
+use adam::{AudioBackend, Engine, FrameCtx, Listener, Plugin, VoiceId};
 use aimlab::{
     ray_sphere, AimLabPlugin, Score, CAMERA_DISTANCE, GUN_FIRE_CLIP, GUN_IDLE_CLIP,
     GUN_RELOAD_CLIP, HIT_POINTS, MAX_AMMO, RECOIL_DURATION, RECOIL_MAX_DEGREES,
@@ -31,6 +31,17 @@ fn context() -> FrameCtx {
 
 fn built() -> (Engine, AimLabPlugin) {
     let mut engine = Engine::new();
+    let mut plugin = AimLabPlugin::new();
+    plugin.build(&mut engine).unwrap();
+    (engine, plugin)
+}
+
+/// `built`, with the repository's assets mounted so paths resolve.
+fn built_with_assets() -> (Engine, AimLabPlugin) {
+    let mut engine = Engine::new();
+    engine
+        .assets
+        .mount(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
     let mut plugin = AimLabPlugin::new();
     plugin.build(&mut engine).unwrap();
     (engine, plugin)
@@ -76,6 +87,51 @@ fn gun_animator(engine: &Engine, plugin: &AimLabPlugin) -> Animator {
         .get::<Animator>()
         .expect("the gun animator");
     (*animator).clone()
+}
+
+/// An audio backend that counts `play` calls instead of opening a device.
+#[derive(Default)]
+struct CountingAudio {
+    played: usize,
+    listener: Listener,
+}
+
+impl AudioBackend for CountingAudio {
+    fn name(&self) -> &'static str {
+        "counting"
+    }
+
+    fn listener(&self) -> Listener {
+        self.listener
+    }
+
+    fn set_listener(&mut self, listener: Listener) {
+        self.listener = listener;
+    }
+
+    fn update(&mut self, _scene: &meats::Scene, _assets: &vault::Assets, _dt: f32) {}
+
+    fn play(
+        &mut self,
+        _assets: &vault::Assets,
+        _clip: vault::AssetId,
+        _gain: f32,
+    ) -> Option<VoiceId> {
+        self.played += 1;
+        Some(self.played as VoiceId)
+    }
+
+    fn stop(&mut self, _voice: VoiceId) {}
+
+    fn active_voices(&self) -> usize {
+        self.played
+    }
+
+    fn master_gain(&self) -> f32 {
+        1.0
+    }
+
+    fn set_master_gain(&mut self, _gain: f32) {}
 }
 
 fn click(engine: &mut Engine) {
@@ -228,6 +284,18 @@ fn the_camera_carries_the_shot_sound() {
         !source.playing,
         "a one-shot goes through the backend, not a held `playing` flag"
     );
+}
+
+#[test]
+fn a_shot_plays_the_gunshot() {
+    let (mut engine, mut plugin) = built_with_assets();
+    assert!(engine.audio.is_none(), "the test installs the only backend");
+    engine.audio = Some(Box::new(CountingAudio::default()));
+
+    fire(&mut engine, &mut plugin, &mut context());
+
+    let audio = engine.audio.as_ref().expect("the counting backend");
+    assert_eq!(audio.active_voices(), 1, "one shot, one voice");
 }
 
 #[test]
