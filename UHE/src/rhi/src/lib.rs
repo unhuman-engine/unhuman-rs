@@ -16,6 +16,7 @@ mod format;
 mod handle;
 mod rhi;
 pub mod settings;
+pub mod spirv;
 
 pub use backend::{
     flag_value, BackendChoice, BackendSelection, BackendSource, UnknownBackend,
@@ -23,10 +24,10 @@ pub use backend::{
 };
 pub use desc::{
     copy_row_pitch, AddressMode, BindingDesc, BlendState, BufferDesc, ColorAttachmentDesc,
-    ColorTargetState, DepthAttachmentDesc, DepthState, DescriptorKind, DescriptorSetLayoutDesc,
-    Extent, Filter, IndexFormat, LoadOp, PipelineDesc, PrimitiveState, RenderPassDesc, SamplerDesc,
-    ShaderStage, ShaderStageDesc, StageMask, TextureDesc, VertexAttribute, VertexLayout,
-    COPY_BYTES_PER_ROW_ALIGNMENT,
+    ColorTargetState, ComputePipelineDesc, DepthAttachmentDesc, DepthState, DescriptorKind,
+    DescriptorSetLayoutDesc, Extent, Filter, IndexFormat, LoadOp, PipelineDesc, PrimitiveState,
+    RenderPassDesc, SamplerDesc, ShaderStage, ShaderStageDesc, StageMask, TextureDesc,
+    VertexAttribute, VertexLayout, COPY_BYTES_PER_ROW_ALIGNMENT,
 };
 pub use format::{BufferUsage, SampleCount, TextureFormat, TextureUsage};
 pub use graph::{PassRecorder, PassScope, SlotTable};
@@ -35,6 +36,7 @@ pub use handle::{
     PipelineTag, Registry, Sampler, SamplerTag, Shader, ShaderTag, Texture, TextureTag,
 };
 pub use rhi::{
-    CommandList, Error, Extent2d, Gpu, GpuInfo, PassId, RenderGraph, Resources, Result, Swapchain,
-    SyncTier,
+    CommandList, Error, Extent2d, Gpu, GpuInfo, GpuPassTime, PassId, RenderGraph, Resources,
+    Result, Submission, Swapchain, SyncTier,
 };
+pub use spirv::EntryPoint;

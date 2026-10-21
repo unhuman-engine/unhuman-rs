@@ -313,8 +313,6 @@ the decision). `meats` also ships `Collider`, `ColliderShape`, `RigidBody`,
 
 
 // forge — WGSL, the path the renderer's own shaders take
-pub fn to_spirv_entry(source: &str, label: &str, entry_point: &str, stage: forge::Stage)
-    -> Result<Vec<u8>, forge::wgsl::WgslError>;
 pub fn to_spirv(source: &str, label: &str) -> Result<Vec<u8>, forge::wgsl::WgslError>;
 pub fn entry_points(source: &str, label: &str) -> Result<Vec<(String, forge::Stage)>, forge::wgsl::WgslError>;
 pub fn check(source: &str, label: &str) -> Result<(), forge::wgsl::WgslError>;

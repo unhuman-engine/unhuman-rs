@@ -30,16 +30,6 @@ pub use request::{Define, Diagnostic, MatrixLayout, Optimization, Severity};
 pub use slangc::{compile_once, Slangc};
 pub use stage::Stage;
 
-/// The name every shader module's entry point has.
-///
-/// One module is one entry point, and that entry point is called this: Slang
-/// renames it (`Triangle.slang` declares `vs_main`; the module's `OpEntryPoint`
-/// is `main`), and [`wgsl::to_spirv_entry`] renames it to match. A backend names
-/// it when it builds a pipeline stage, so a module that kept its source name
-/// creates no pipeline at all on Vulkan -- and reports it as a shader error,
-/// which is where the wrong name is hardest to see.
-pub const ENTRY_POINT: &str = "main";
-
 /// What can go wrong, with enough detail to act on.
 #[derive(Debug)]
 pub enum ForgeError {

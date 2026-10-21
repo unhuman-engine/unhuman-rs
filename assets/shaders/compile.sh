@@ -51,6 +51,9 @@ compile fs_main fragment Triangle.frag.spv Triangle.slang
 compile vs_main vertex Textured.vert.spv Textured.slang
 compile fs_main fragment Textured.frag.spv Textured.slang
 
+# The compute shader. One stage module, no vertex/fragment pair.
+compile cs_main compute StoreIndex.spv StoreIndex.slang
+
 # A zero-byte or truncated module fails at pipeline creation with a message that
 # points at the backend rather than the shader, so check the header here.
 for spv in "$here"/*.spv; do

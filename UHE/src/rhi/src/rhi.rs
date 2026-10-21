@@ -1,7 +1,10 @@
+use std::any::Any;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::desc::{
-    BufferDesc, DescriptorSetLayoutDesc, PipelineDesc, RenderPassDesc, SamplerDesc, TextureDesc,
+    BufferDesc, ComputePipelineDesc, DescriptorSetLayoutDesc, PipelineDesc, RenderPassDesc,
+    SamplerDesc, TextureDesc,
 };
 use crate::format::TextureFormat;
 use crate::handle::{BindGroup, Buffer, ImageView, Pipeline, Sampler, Shader, Texture};
@@ -89,6 +92,16 @@ pub struct GpuInfo {
     pub frames_in_flight: u32,
 }
 
+/// One pass's GPU time from the last frame a backend collected.
+///
+/// The name is owned because the graph rebuilds its pass names every frame;
+/// a borrowed name would either leak or dangle before the panel reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuPassTime {
+    pub name: String,
+    pub ms: f32,
+}
+
 /// The swapchain, readable without mutable access so passes can query extent.
 pub trait Swapchain {
     fn extent(&self) -> Extent2d;
@@ -118,6 +131,16 @@ pub trait CommandList {
     fn begin_rendering(&mut self, desc: &RenderPassDesc);
     fn end_rendering(&mut self);
 
+    /// Opens a compute scope.
+    ///
+    /// Separate from [`Self::begin_rendering`] because a compute pass has no
+    /// attachments: wgpu needs its own scope before a compute pipeline or bind
+    /// group can be set, while Vulkan has no scope at all. The executor opens it
+    /// for a pass whose kind is compute, so a recorder does not have to know
+    /// which backend it is recording into.
+    fn begin_compute(&mut self);
+    fn end_compute(&mut self);
+
     fn set_viewport(&mut self, extent: Extent2d);
     fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32);
 
@@ -129,7 +152,16 @@ pub trait CommandList {
     /// bound; wgpu ignores it, so a pass that binds a set first works there and
     /// fails here.
     fn bind_group(&mut self, set: u32, group: &BindGroup);
-    fn set_push_constants(&mut self, data: &[u8]);
+
+    /// Sets push constants, or reports that this backend cannot.
+    ///
+    /// wgpu has no push constants. Vulkan does, but this RHI has no declaration
+    /// for a pipeline's push-constant range, so a `vkCmdPushConstants` against
+    /// one of its layouts is invalid. Both backends therefore return
+    /// [`Error::Unsupported`]; use a small uniform buffer in a bind group
+    /// instead. The `Result` is the point: the previous signature returned
+    /// nothing, so wgpu could only panic.
+    fn set_push_constants(&mut self, data: &[u8]) -> Result<()>;
 
     fn bind_vertex_buffer(&mut self, slot: u32, buffer: &Buffer, offset: u64);
     fn bind_index_buffer(&mut self, buffer: &Buffer, offset: u64);
@@ -170,6 +202,11 @@ pub trait Resources {
     /// rebuild with identical source costs nothing.
     fn create_shader(&mut self, label: &str, spirv: &[u8]) -> Result<Shader>;
     fn create_pipeline(&mut self, desc: PipelineDesc) -> Result<Pipeline>;
+    /// A compute pipeline, from the one description both backends take.
+    ///
+    /// The shader is a single module: a compute pipeline has one stage, unlike a
+    /// graphics pipeline's vertex/fragment pair.
+    fn create_compute_pipeline(&mut self, desc: ComputePipelineDesc) -> Result<Pipeline>;
     /// A bind group: a set of resources a pipeline can read, written once and
     /// bound many times.
     ///
@@ -226,6 +263,17 @@ pub trait Resources {
     /// queue has retired it. `readback` here is not a hot path.
     fn read_buffer(&mut self, buffer: &Buffer) -> Result<Vec<u8>>;
 
+    /// The whole buffer's contents, after `submission` has completed.
+    ///
+    /// This is what makes a readback ring overlap: a frame reads the buffer it
+    /// wrote a few submissions ago, waiting only for *that* submission rather
+    /// than every submission the queue has since accepted. The default waits for
+    /// all, which is always correct but gives the ring nothing.
+    fn read_buffer_after(&mut self, buffer: &Buffer, submission: Submission) -> Result<Vec<u8>> {
+        let _ = submission;
+        self.read_buffer(buffer)
+    }
+
     fn destroy_pipeline(&mut self, pipeline: Pipeline);
     fn destroy_shader(&mut self, shader: Shader);
     fn destroy_bind_group(&mut self, group: BindGroup);
@@ -233,6 +281,30 @@ pub trait Resources {
 }
 
 pub type PassId = u32;
+
+/// One queue submission, opaque here because the token is the backend's.
+///
+/// A frontend must be able to say "wait for the frame that wrote this buffer"
+/// without naming a wgpu `SubmissionIndex` or a Vulkan timeline value. The
+/// backend that made the token is the one that reads it back.
+#[derive(Clone)]
+pub struct Submission(Arc<dyn Any + Send + Sync>);
+
+impl Submission {
+    pub fn new<T: Any + Send + Sync>(token: T) -> Self {
+        Self(Arc::new(token))
+    }
+
+    pub fn downcast_ref<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+}
+
+impl fmt::Debug for Submission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Submission")
+    }
+}
 
 /// The one owner of synchronization.
 pub trait RenderGraph {
@@ -296,6 +368,33 @@ pub trait Gpu {
     fn graph(&mut self) -> &mut dyn RenderGraph;
     fn resources(&mut self) -> &mut dyn Resources;
 
+    /// Starts collecting per-pass GPU timestamps.
+    ///
+    /// `false` means this backend or queue cannot write timestamps, so the rows
+    /// are unavailable rather than zero. Defaults to `false`: a backend that has
+    /// not implemented timing must not look like a frame of free passes.
+    fn enable_gpu_timing(&mut self) -> bool {
+        false
+    }
+
+    /// Reads the timestamps of the last submitted frame.
+    ///
+    /// The caller waits for that submission first. A backend without timing
+    /// does nothing here rather than reporting a failure.
+    fn collect_gpu_timings(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Per-pass times from the last collection, empty when timing is off.
+    fn gpu_timings(&self) -> &[GpuPassTime] {
+        &[]
+    }
+
+    /// Whole-frame GPU time from the last collection, `None` when unavailable.
+    fn gpu_frame_ms(&self) -> Option<f32> {
+        None
+    }
+
     /// Record and submit one compiled frame from a renderer frontend, in the
     /// graph's compiled order.
     ///
@@ -309,6 +408,10 @@ pub trait Gpu {
     /// `Arc`, not `&`, because a backend may record passes on worker threads and
     /// a job pool's closure is `'static`.
     ///
+    /// The token is the frame's submission, for a later
+    /// [`Resources::read_buffer_after`]: a renderer that copies the frame into a
+    /// ring buffer passes the token back when it reads that buffer.
+    ///
     /// The default refuses by name rather than recording nothing: a silent no-op
     /// frame is the failure this method exists to remove.
     fn record_frame(
@@ -316,11 +419,18 @@ pub trait Gpu {
         _frame: &crate::graph::CompiledGraph,
         _slots: &crate::graph::SlotTable,
         _recorder: std::sync::Arc<dyn crate::graph::PassRecorder>,
-    ) -> Result<()> {
+    ) -> Result<Submission> {
         Err(Error::Unsupported(
             "this gpu does not execute frontend frames".to_owned(),
         ))
     }
+
+    /// Blocks until the GPU has finished `submission`.
+    ///
+    /// The token is the one [`Gpu::record_frame`] returned. A frontend uses it
+    /// to reuse a ring slot only after the frame that last wrote it retired; a
+    /// default no-op would leave that reuse racing the GPU, so there is none.
+    fn wait_for_submission(&mut self, submission: Submission) -> Result<()>;
 
     /// Fence wait, swapchain acquire, deferred-deletion flush.
     fn frame_begin(&mut self) -> Result<()>;

@@ -17,6 +17,7 @@ pub enum TextureFormat {
     Bgra8Srgb,
     R16Float,
     Rgba16Float,
+    Rgba16Uint,
     R32Float,
     R32G32Float,
     R32G32B32Float,
@@ -64,7 +65,7 @@ impl TextureFormat {
             // `Rgb32Float` are the same names wgpu uses.
             TextureFormat::R32G32Float => 8,
             TextureFormat::R32G32B32Float => 12,
-            TextureFormat::Rgba16Float => 8,
+            TextureFormat::Rgba16Float | TextureFormat::Rgba16Uint => 8,
             TextureFormat::Rgba32Float => 16,
         })
     }

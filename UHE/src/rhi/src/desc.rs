@@ -217,7 +217,16 @@ impl StageMask {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DescriptorKind {
     UniformBuffer,
+    /// Read-only storage. What a shader may read, and what a vertex-stage
+    /// binding can use without `VERTEX_WRITABLE_STORAGE`.
     StorageBuffer,
+    /// Storage a shader writes.
+    ///
+    /// Distinct from [`Self::StorageBuffer`] because wgpu validates a binding
+    /// against the shader's declared access: a read-only layout on a writable
+    /// buffer is rejected at pipeline creation. Vulkan uses one descriptor type
+    /// for both.
+    StorageBufferReadWrite,
     /// Image and sampler declared as two bindings. Vulkan requires
     /// `SAMPLED_IMAGE` and `SAMPLER` to be separate bindings when they are
     /// separate; declaring them as one is `CombinedImageSampler`.
@@ -379,6 +388,34 @@ impl DescriptorSetLayoutDesc {
 pub struct ShaderStageDesc {
     pub stage: ShaderStage,
     pub shader: crate::handle::Shader,
+}
+
+/// A complete compute pipeline description.
+///
+/// The graphics fields are absent rather than defaulted: a compute pipeline has
+/// no vertex input, no rasterisation state and no attachments, and carrying
+/// them would invite a backend to read a field that means nothing.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ComputePipelineDesc {
+    pub label: String,
+    pub shader: crate::handle::Shader,
+    /// Descriptor set shapes, indexed by set number. Empty is legal and common.
+    pub set_layouts: Vec<DescriptorSetLayoutDesc>,
+}
+
+impl ComputePipelineDesc {
+    pub fn new(label: impl Into<String>, shader: crate::handle::Shader) -> Self {
+        Self {
+            label: label.into(),
+            shader,
+            set_layouts: Vec::new(),
+        }
+    }
+
+    pub fn with_set(mut self, set: DescriptorSetLayoutDesc) -> Self {
+        self.set_layouts.push(set);
+        self
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]

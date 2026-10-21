@@ -21,7 +21,6 @@ pub enum WgslError {
     Parse { label: String, message: String },
     Validate { label: String, message: String },
     Backend { label: String, message: String },
-    UnsupportedStage { label: String, stage: Stage },
 }
 
 impl std::fmt::Display for WgslError {
@@ -32,9 +31,6 @@ impl std::fmt::Display for WgslError {
                 write!(f, "{label}: validation: {message}")
             }
             WgslError::Backend { label, message } => write!(f, "{label}: spir-v: {message}"),
-            WgslError::UnsupportedStage { label, stage } => {
-                write!(f, "{label}: {stage:?} has no SPIR-V stage")
-            }
         }
     }
 }
@@ -60,18 +56,6 @@ fn validate(source: &str, label: &str) -> Result<naga::valid::ModuleInfo, WgslEr
         })
 }
 
-fn shader_stage(stage: Stage, label: &str) -> Result<naga::ShaderStage, WgslError> {
-    match stage {
-        Stage::Vertex => Ok(naga::ShaderStage::Vertex),
-        Stage::Fragment => Ok(naga::ShaderStage::Fragment),
-        Stage::Compute => Ok(naga::ShaderStage::Compute),
-        other => Err(WgslError::UnsupportedStage {
-            label: label.to_owned(),
-            stage: other,
-        }),
-    }
-}
-
 fn words_to_bytes(words: Vec<u32>) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(words.len() * 4);
     for word in words {
@@ -80,11 +64,12 @@ fn words_to_bytes(words: Vec<u32>) -> Vec<u8> {
     bytes
 }
 
-/// Every entry point in the source, as one SPIR-V module.
+/// Every entry point in the source, as one SPIR-V module, under the names the
+/// source declared.
 ///
-/// A single-entry shader is the case that matters and this is the wrong shape
-/// for it; [`to_spirv_entry`] is the one to reach for. This exists for a compute
-/// shader that carries several kernels.
+/// The module's own `OpEntryPoint` is authoritative: a backend reads it and
+/// names the stage from it, so Slang's `main` and a WGSL `vs_main` are both
+/// correct without either compiler imitating the other.
 pub fn to_spirv(source: &str, label: &str) -> Result<Vec<u8>, WgslError> {
     let module = naga::front::wgsl::parse_str(source).map_err(|e| WgslError::Parse {
         label: label.to_owned(),
@@ -99,59 +84,6 @@ pub fn to_spirv(source: &str, label: &str) -> Result<Vec<u8>, WgslError> {
             message: format!("{e:?}"),
         }
     })?;
-
-    Ok(words_to_bytes(words))
-}
-
-/// One entry point, which is what a shader module is.
-///
-/// The pipeline stage comes from `forge::Stage`, not from naga, so a caller does
-/// not have to depend on the SPIR-V backend to describe a shader.
-///
-/// The emitted module names its entry point [`crate::ENTRY_POINT`], not the name
-/// the source declared. Slang renames it the same way -- `Triangle.slang`
-/// declares `vs_main` and the module's `OpEntryPoint` is `main` -- and both
-/// backends' pipeline creation names it when it builds a stage. A module that
-/// kept the source name creates no pipeline on Vulkan and reports it as a shader
-/// error.
-pub fn to_spirv_entry(
-    source: &str,
-    label: &str,
-    entry_point: &str,
-    stage: Stage,
-) -> Result<Vec<u8>, WgslError> {
-    let mut module = naga::front::wgsl::parse_str(source).map_err(|e| WgslError::Parse {
-        label: label.to_owned(),
-        message: e.to_string(),
-    })?;
-    let info = validate(source, label)?;
-
-    let entry_name = match module
-        .entry_points
-        .iter_mut()
-        .find(|entry| entry.name == entry_point)
-    {
-        Some(entry) => {
-            entry.name = crate::ENTRY_POINT.to_owned();
-            crate::ENTRY_POINT
-        }
-        // Left alone, so naga reports the name the caller asked for.
-        None => entry_point,
-    };
-
-    let pipeline = naga::back::spv::PipelineOptions {
-        shader_stage: shader_stage(stage, label)?,
-        entry_point: entry_name.to_owned(),
-    };
-
-    let options = naga::back::spv::Options::default();
-    let words =
-        naga::back::spv::write_vec(&module, &info, &options, Some(&pipeline)).map_err(|e| {
-            WgslError::Backend {
-                label: label.to_owned(),
-                message: format!("{e:?}"),
-            }
-        })?;
 
     Ok(words_to_bytes(words))
 }
