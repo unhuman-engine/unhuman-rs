@@ -26,21 +26,19 @@ name because this loader cannot decompress them.
 `extensions::check` runs before decoding: a required name that is not handled is
 an error naming it, and `extensionsUsed` is classified into the load report.
 
-## P1 - the bugs to fix
+## Fixed - the bugs to fix
 
-Loading has bugs; this is where they go, one entry each, with the file that shows
-it. The ones visible from the code:
-
-- `load_material` reads extension values as raw JSON (`extension_value`), so a
-  malformed one is a runtime `None` rather than a reported error.
-- Texture coordinates: glTF's V is flipped on import (`material.rs` says so), so
-  every texture path has one flip to get right, and `KHR_texture_transform` adds
-  another.
-- The image cache in `load_texture` is per asset; whether it is keyed on the file
-  or on the decoded bytes decides whether two materials sharing an image share a
-  texture.
-- `.ktx2` is a separate path (`ktx2.rs`) from the decoded images, so a basisu
-  texture and a PNG take different routes through the same material.
+- `material_extensions.rs` reads every optional block through `json`, so a
+  present field of the wrong type is a reported error rather than a silent
+  default.
+- `uv.rs` owns the V flip and converts `KHR_texture_transform` into engine space
+  with `F * T * F`; a rotation test covers the reflected sign.
+- `load_texture`'s cache is keyed on `(image index, colour space, sampler)`, so
+  two materials sharing an image share one decode, while the same file used as
+  sRGB and linear stays two textures.
+- KTX2 and decoded PNG both produce `TextureData` through the same material
+  path; `KHR_texture_basisu` picks the KTX2 image first and falls back to the
+  texture's source.
 
 ## P2 - what a load reports
 
