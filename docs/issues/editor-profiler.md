@@ -6,21 +6,19 @@ screen, and none of it written to disk. The storage constraint is part of the
 requirement: a profiler that saves traces eats a disk, and this one has to be
 free to leave running.
 
-What exists today: the status bar shows `fps` and `frame_ms` from
-`mirror::Stats`, which is a smoothed frame interval -- the whole loop, not the
-engine's frame. There is a per-pass counter in `bifrost` (`FrameStats`) and a
-draw-call counter, and neither is displayed.
+What exists today: the status bar names the loop period, the engine frame, the
+readback and the UI paint. The panel adds the counters and, on Vulkan, the
+per-pass GPU times; wgpu reports them unavailable.
 
-## P1 - the status bar measures the wrong thing
+## Fixed - the status bar measures the wrong thing
 
 `mirror::Stats::update` smooths `dt`, the interval between ticks, so `frame_ms` is
 the loop's period and not the engine's frame. Measured this session: at a 719x439
 viewport the loop was 7.0 ms and the engine's frame was 4.0 ms of it; at
-1998x1135 the loop was 25.9 ms and the engine 15.3 ms. One number cannot be read
-as the other, and the panel has to show both.
-
-**Fixed when:** the panel separates the loop's period, the engine's frame, the
-readback, and the UI's own paint.
+1998x1135 the loop was 25.9 ms and the engine 15.3 ms. The status bar now shows
+the loop period, the engine frame, the readback (or `-` when it was not
+collected) and the UI paint separately, and `timings_status` has a test with
+four distinct values so a collapse back into one number fails.
 
 ## P1 - what the panel has to show
 

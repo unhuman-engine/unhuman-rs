@@ -23,20 +23,15 @@ accuracy, rounds, `max_ammo`, the reloading flag and its progress, plus
 the sandbox's or the engine's to build from this. Nothing here reaches into
 another crate's renderer.
 
-## The gun seam
+## Fixed - the gun seam
 
-The C++ loads a 12 MB animated pistol and plays `Idle`/`Fire`/`Reload_Complete`
-on a skeletal `Animator`. This tree does not copy the asset and cannot play it:
-`bifrost`'s clip-to-`Animator` glue is not in place, so nothing skins. The demo
-therefore builds a `Gun` entity as a camera child with the C++'s offset
-(`GUN_OFFSET`), facing fix (`GUN_ROTATION_DEGREES`) and scale (`GUN_SCALE`, 0.05)
-and attaches `assets/models/pistol_animations_blender.glb` only when it resolves.
-With the asset absent the entity is still there, invisible, and ammo and reload
-are unaffected. A HUD or a gun needs, from other crates:
-
-- the skinning path: `JOINTS_0`/`WEIGHTS_0` on the vertex layout
-  (`bifrost::mesh`) and the clip-to-`Animator` glue, before the pistol animates;
-- a HUD renderer, or an ImGui-equivalent panel, to read `Report`.
+`bifrost` skins with `JOINTS_0`/`WEIGHTS_0` and the `Animator` glue, so the demo
+attaches `assets/models/pistol_animations_blender.glb` as a camera child with
+the C++'s offset (`GUN_OFFSET`), facing fix (`GUN_ROTATION_DEGREES`) and scale
+(`GUN_SCALE`, 0.05). `Idle` is the resting clip, `Fire` runs on a shot for the
+clip's own duration, and `Reload_Complete` runs while the magazine reloads; the
+animator stays when the asset is absent, so ammo and reload tests need no file.
+Still open: a HUD renderer, or an ImGui-equivalent panel, to read `Report`.
 
 ## P2 - what a demo layer is for
 
@@ -56,8 +51,9 @@ The camera framing, target wall, hit rule, spawn cadence, seven-round magazine,
 `R` reload, auto-reload at zero, 3.5 s reload timer and accuracy maths match.
 
 - **HUD.** The C++ draws an ImGui window, crosshair and gun tweak sliders. Rust
-  exposes `Report` and draws nothing.
-- **Gun.** See the gun seam above: no mesh is copied, no animation plays.
+  exposes `Report`; the sandbox draws a crosshair, nothing else.
+- **Audio.** The shot is a one-shot through `wire` from the camera's sound
+  component; a counting backend test observes the voice.
 - **Animation.** `Fire`'s 0.5 s and `Reload_Complete`'s duration, and the recoil
   kick, come from the pistol's clips in the C++; neither is present here, so the
   reload uses the C++'s documented 3.5 s default and there is no recoil.

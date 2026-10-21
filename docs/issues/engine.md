@@ -46,13 +46,14 @@ instead of a fixed `main`. `forge::wgsl::to_spirv` keeps the names the source
 declared and `to_spirv_entry` is gone; the Slang path still emits `main`, which
 is now just the name in that module and not a convention the WGSL path copies.
 
-### P2 - a steady-state frame creates GPU objects
+### Fixed - a steady-state frame creates GPU objects
 
-`BindSet::rebuild` destroys and recreates a uniform buffer and a bind group per
-set, per frame (`passes/uniforms.rs`). `docs/WORK.md` Phase 2 is the fix: a
-frame-numbered lifetime with a deferred destruction queue.
-
-**Fixed when:** two consecutive frames with the same scene create nothing.
+`BindSet::rebuild` used to destroy and recreate a uniform buffer and a bind
+group per set, per frame (`passes/uniforms.rs`). The frame ring keeps each
+slot's objects alive until its submission is done, and a set whose layout and
+bound resources are unchanged now writes into its existing buffer and keeps the
+group. `a_moving_camera_waits_for_the_oldest_frame_and_rotates_slots` asserts
+that the lap which reuses a slot destroys nothing and creates nothing.
 
 ### P2 - the gizmo is invisible against the grid
 
