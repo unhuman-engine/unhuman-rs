@@ -138,7 +138,7 @@ impl EditorApp {
             Command::NewScene => {
                 let engine = self.engine.engine_mut();
                 self.editor
-                    .new_starter_scene(&mut engine.scene, &mut engine.assets);
+                    .new_starter_scene(&mut engine.scene, &mut engine.assets, &engine.jobs);
             }
             Command::SaveScene => {
                 // No file dialog in gpui and no path to write to yet; the engine
@@ -210,10 +210,12 @@ impl EditorApp {
             match extension.as_deref() {
                 Some("unhuman") => {
                     let engine = self.engine.engine_mut();
-                    match self
-                        .editor
-                        .open_scene(&mut engine.scene, &mut engine.assets, path)
-                    {
+                    match self.editor.open_scene(
+                        &mut engine.scene,
+                        &mut engine.assets,
+                        &engine.jobs,
+                        path,
+                    ) {
                         Ok(()) => log::info!("editor: opened scene {}", path.display()),
                         Err(error) => log::warn!("editor: scene {}: {error}", path.display()),
                     }
@@ -225,6 +227,7 @@ impl EditorApp {
                             self.editor.add_model(
                                 &mut engine.scene,
                                 &mut engine.assets,
+                                &engine.jobs,
                                 &virtual_path,
                                 &name,
                             );
@@ -241,6 +244,7 @@ impl EditorApp {
                             self.editor.add_image(
                                 &mut engine.scene,
                                 &mut engine.assets,
+                                &engine.jobs,
                                 &virtual_path,
                                 &name,
                             );
@@ -273,11 +277,21 @@ impl EditorApp {
             || lower.ends_with(".jpeg")
             || lower.ends_with(".ktx2")
         {
-            self.editor
-                .add_image(&mut engine.scene, &mut engine.assets, path, &name);
+            self.editor.add_image(
+                &mut engine.scene,
+                &mut engine.assets,
+                &engine.jobs,
+                path,
+                &name,
+            );
         } else {
-            self.editor
-                .add_model(&mut engine.scene, &mut engine.assets, path, &name);
+            self.editor.add_model(
+                &mut engine.scene,
+                &mut engine.assets,
+                &engine.jobs,
+                path,
+                &name,
+            );
         }
         cx.notify();
     }

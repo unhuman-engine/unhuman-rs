@@ -10,6 +10,7 @@ repository.workspace = true
 adam = { workspace = true }
 meats = { workspace = true }
 vault = { workspace = true }
+grind = { workspace = true }
 glam = { workspace = true }
 log = { workspace = true }
 

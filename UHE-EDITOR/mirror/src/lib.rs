@@ -216,6 +216,7 @@ impl Editor {
         &mut self,
         scene: &mut Scene,
         assets: &mut vault::Assets,
+        jobs: &grind::Jobs,
         path: &str,
         name: &str,
     ) -> Entity {
@@ -227,7 +228,7 @@ impl Editor {
                 ..Default::default()
             },
         );
-        self.resolve_dropped(scene, assets, entity, name);
+        self.resolve_dropped(scene, assets, jobs, entity, name);
         entity
     }
 
@@ -237,6 +238,7 @@ impl Editor {
         &mut self,
         scene: &mut Scene,
         assets: &mut vault::Assets,
+        jobs: &grind::Jobs,
         path: &str,
         name: &str,
     ) -> Entity {
@@ -248,7 +250,7 @@ impl Editor {
                 ..Default::default()
             },
         );
-        self.resolve_dropped(scene, assets, entity, name);
+        self.resolve_dropped(scene, assets, jobs, entity, name);
         entity
     }
 
@@ -258,10 +260,11 @@ impl Editor {
         &mut self,
         scene: &mut Scene,
         assets: &mut vault::Assets,
+        jobs: &grind::Jobs,
         entity: Entity,
         name: &str,
     ) {
-        for error in scene.resolve_assets(assets) {
+        for error in scene.resolve_assets_async(jobs, assets) {
             log::warn!("mirror: {error}");
         }
         self.selection.select(Some(entity));
@@ -429,12 +432,13 @@ impl Editor {
         &mut self,
         scene: &mut Scene,
         assets: &mut vault::Assets,
+        jobs: &grind::Jobs,
         path: &Path,
     ) -> meats::Result<()> {
         let loaded = meats::load(path)?;
         self.reset(scene);
         *scene = loaded;
-        for error in scene.resolve_assets(assets) {
+        for error in scene.resolve_assets_async(jobs, assets) {
             log::warn!("mirror: {error}");
         }
         self.history.clear();
@@ -454,10 +458,15 @@ impl Editor {
     /// Replaces the scene with [`starter_scene`] and resolves its asset paths.
     /// A fresh launch and File > New both land here, so the panels always have
     /// something to show instead of an empty hierarchy.
-    pub fn new_starter_scene(&mut self, scene: &mut Scene, assets: &mut vault::Assets) {
+    pub fn new_starter_scene(
+        &mut self,
+        scene: &mut Scene,
+        assets: &mut vault::Assets,
+        jobs: &grind::Jobs,
+    ) {
         self.new_scene(scene);
         starter_scene(scene);
-        for error in scene.resolve_assets(assets) {
+        for error in scene.resolve_assets_async(jobs, assets) {
             self.console.warn(error.to_string());
         }
         self.console.info("new scene");

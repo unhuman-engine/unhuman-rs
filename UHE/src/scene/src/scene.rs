@@ -468,7 +468,33 @@ impl Scene {
     /// what it cannot find. Idempotent: a handle that is already set is left
     /// alone, so calling it twice changes nothing and re-reports the same
     /// missing paths.
+    ///
+    /// This decodes on the caller's thread. A frame that must not stall uses
+    /// [`Scene::resolve_assets_async`].
     pub fn resolve_assets(&mut self, assets: &mut vault::Assets) -> Vec<AssetError> {
+        self.resolve_assets_with(&mut |assets, path| assets.load(path), assets)
+    }
+
+    /// Resolve every path on the job system and return with the handles
+    /// [`vault::AssetState::Pending`].
+    ///
+    /// A consumer sees the handle immediately and no payload: a mesh is skipped
+    /// by the renderer until `Assets::poll` reports it. Paths that the virtual
+    /// filesystem cannot find are still errors; a decode failure is reported by
+    /// `poll`, not here.
+    pub fn resolve_assets_async(
+        &mut self,
+        jobs: &grind::Jobs,
+        assets: &mut vault::Assets,
+    ) -> Vec<AssetError> {
+        self.resolve_assets_with(&mut |assets, path| assets.load_async(jobs, path), assets)
+    }
+
+    fn resolve_assets_with(
+        &mut self,
+        load: &mut dyn FnMut(&mut vault::Assets, &str) -> vault::Result<vault::AssetId>,
+        assets: &mut vault::Assets,
+    ) -> Vec<AssetError> {
         let mut errors = Vec::new();
         for entity in self.entities() {
             let Some(hecs) = self.hecs_of(entity) else {
@@ -477,29 +503,50 @@ impl Scene {
 
             if let Ok(mut renderer) = self.world.get::<&mut MeshRenderer>(hecs) {
                 let path = renderer.mesh_path.clone();
-                resolve(&mut renderer.mesh, &path, assets, &mut errors, entity);
+                resolve(&mut renderer.mesh, &path, assets, &mut errors, entity, load);
                 let path = renderer.material_path.clone();
-                resolve(&mut renderer.material, &path, assets, &mut errors, entity);
+                resolve(
+                    &mut renderer.material,
+                    &path,
+                    assets,
+                    &mut errors,
+                    entity,
+                    load,
+                );
             }
             if let Ok(mut sprite) = self.world.get::<&mut SpriteRenderer>(hecs) {
                 let path = sprite.texture_path.clone();
-                resolve(&mut sprite.texture, &path, assets, &mut errors, entity);
+                resolve(
+                    &mut sprite.texture,
+                    &path,
+                    assets,
+                    &mut errors,
+                    entity,
+                    load,
+                );
             }
             if let Ok(mut text) = self.world.get::<&mut Text>(hecs) {
                 let path = text.font_path.clone();
-                resolve(&mut text.font, &path, assets, &mut errors, entity);
+                resolve(&mut text.font, &path, assets, &mut errors, entity, load);
             }
             if let Ok(mut audio) = self.world.get::<&mut AudioSource>(hecs) {
                 let path = audio.clip_path.clone();
-                resolve(&mut audio.clip, &path, assets, &mut errors, entity);
+                resolve(&mut audio.clip, &path, assets, &mut errors, entity, load);
             }
             if let Ok(mut animator) = self.world.get::<&mut Animator>(hecs) {
                 let path = animator.clip_path.clone();
-                resolve(&mut animator.clip, &path, assets, &mut errors, entity);
+                resolve(&mut animator.clip, &path, assets, &mut errors, entity, load);
             }
             if let Ok(mut animation) = self.world.get::<&mut SpriteAnimation>(hecs) {
                 let path = animation.sprite_sheet_path.clone();
-                resolve(&mut animation.sheet, &path, assets, &mut errors, entity);
+                resolve(
+                    &mut animation.sheet,
+                    &path,
+                    assets,
+                    &mut errors,
+                    entity,
+                    load,
+                );
             }
         }
         errors
@@ -856,11 +903,12 @@ fn resolve(
     assets: &mut vault::Assets,
     errors: &mut Vec<AssetError>,
     entity: Entity,
+    load: &mut dyn FnMut(&mut vault::Assets, &str) -> vault::Result<vault::AssetId>,
 ) {
     if slot.is_some() || path.is_empty() {
         return;
     }
-    match assets.load(path) {
+    match load(assets, path) {
         Ok(id) => *slot = Some(id),
         Err(_) => errors.push(AssetError {
             entity,

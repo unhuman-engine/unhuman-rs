@@ -47,7 +47,8 @@ fn new_starter_scene_replaces_what_was_there() {
     scene.spawn("Leftover");
 
     let mut editor = Editor::new();
-    editor.new_starter_scene(&mut scene, &mut assets());
+    let jobs = grind::Jobs::new();
+    editor.new_starter_scene(&mut scene, &mut assets(), &jobs);
 
     let names: Vec<String> = scene
         .entities()

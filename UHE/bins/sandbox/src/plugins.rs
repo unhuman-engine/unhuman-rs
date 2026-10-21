@@ -42,9 +42,14 @@ pub fn app_with_physics_debug(physics_debug: bool) -> App {
 /// Replace the engine's scene with one loaded from disk, then resolve its asset
 /// paths against the registry the plugins will use.
 pub fn load_scene(app: &mut App, path: &Path) -> Result<(), String> {
-    let adam::Engine { scene, assets, .. } = app.engine_mut();
+    let adam::Engine {
+        scene,
+        assets,
+        jobs,
+        ..
+    } = app.engine_mut();
     *scene = meats::load(path).map_err(|error| format!("--scene {}: {error}", path.display()))?;
-    for error in scene.resolve_assets(assets) {
+    for error in scene.resolve_assets_async(jobs, assets) {
         log::warn!("sandbox: {error}");
     }
     Ok(())

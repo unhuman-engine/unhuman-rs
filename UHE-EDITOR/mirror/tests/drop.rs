@@ -21,8 +21,15 @@ fn a_model_becomes_a_mesh_entity_that_resolves() {
     let mut scene = Scene::new();
     let mut editor = Editor::new();
     let mut assets = assets();
+    let jobs = grind::Jobs::new();
 
-    let entity = editor.add_model(&mut scene, &mut assets, "models/Sphere.glb", "Sphere.glb");
+    let entity = editor.add_model(
+        &mut scene,
+        &mut assets,
+        &jobs,
+        "models/Sphere.glb",
+        "Sphere.glb",
+    );
 
     assert_eq!(scene.entities(), vec![entity]);
     // One draw sample means the mesh handle resolved and the renderer has it.
@@ -36,6 +43,7 @@ fn an_image_becomes_a_sprite_entity_holding_the_path() {
     let mut scene = Scene::new();
     let mut editor = Editor::new();
     let mut assets = assets();
+    let jobs = grind::Jobs::new();
 
     // The repository ships no image, so this asserts the wiring: a sprite
     // entity carrying the path. Resolution into a handle is `resolve_assets`,
@@ -43,6 +51,7 @@ fn an_image_becomes_a_sprite_entity_holding_the_path() {
     let entity = editor.add_image(
         &mut scene,
         &mut assets,
+        &jobs,
         "textures/missing.png",
         "missing.png",
     );

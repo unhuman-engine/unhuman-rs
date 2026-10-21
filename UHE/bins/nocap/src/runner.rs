@@ -108,7 +108,9 @@ pub fn summary(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .add(WirePlugin::new())
         .add(FemurPlugin);
 
-    // Scene and aimlab paths resolve from the repository's `assets/`.
+    // Aimlab's paths spell the `assets/` prefix, so the repository root has to
+    // be a root too; `assets` stays as the fallback for asset-relative paths.
+    app.engine_mut().assets.mount(".");
     app.engine_mut().assets.mount("assets");
 
     log::info!("nocap: plugins {}", app.plugin_names().join(", "));
@@ -121,10 +123,15 @@ pub fn summary(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(path) = &config.scene {
-        let adam::Engine { scene, assets, .. } = app.engine_mut();
+        let adam::Engine {
+            scene,
+            assets,
+            jobs,
+            ..
+        } = app.engine_mut();
         *scene =
             meats::load(path).map_err(|error| format!("--scene {}: {error}", path.display()))?;
-        for error in scene.resolve_assets(assets) {
+        for error in scene.resolve_assets_async(jobs, assets) {
             log::warn!("nocap: {error}");
         }
     }
@@ -150,9 +157,14 @@ fn load_scene(
     session: &mut crate::session::Session,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let adam::Engine { scene, assets, .. } = session.engine_mut();
+    let adam::Engine {
+        scene,
+        assets,
+        jobs,
+        ..
+    } = session.engine_mut();
     *scene = meats::load(path).map_err(|error| format!("--scene {}: {error}", path.display()))?;
-    for error in scene.resolve_assets(assets) {
+    for error in scene.resolve_assets_async(jobs, assets) {
         log::warn!("nocap: {error}");
     }
     Ok(())

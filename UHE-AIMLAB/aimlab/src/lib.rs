@@ -222,6 +222,12 @@ impl AimLabPlugin {
         self.ammo.fire();
         self.score.shot();
         self.recoil.kick(RECOIL_PITCH_DEGREES, RECOIL_YAW_DEGREES);
+        // The model resolves on a worker after `build`, so the clip's duration
+        // is not known then. Read it on the shot, when the asset is normally
+        // ready, and fall back while it still is not.
+        if let Some(gun) = self.gun {
+            self.fire_duration = fire_clip_duration(&eng.scene, &eng.assets, gun);
+        }
         self.fire_timer = self.fire_duration;
         self.play_shot(eng);
         if let Some(entity) = self.pick(&eng.scene) {
@@ -361,8 +367,13 @@ impl Plugin for AimLabPlugin {
         // A `MeshRenderer` with a path and no handle is invisible to
         // `Scene::meshes`, so the paths are resolved here, once, against the
         // registry the bin built. A missing model is a warning.
-        let Engine { scene, assets, .. } = eng;
-        for error in scene.resolve_assets(assets) {
+        let Engine {
+            scene,
+            assets,
+            jobs,
+            ..
+        } = eng;
+        for error in scene.resolve_assets_async(jobs, assets) {
             log::warn!("aimlab: {error}");
         }
         self.fire_duration = fire_clip_duration(scene, assets, gun);

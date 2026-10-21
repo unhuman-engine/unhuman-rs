@@ -1,23 +1,27 @@
 # Assets and jobs
 
 Both need redesigning, and they are one subject because the second is what the
-first is waiting for: every load in `vault` is synchronous and `grind` exists with
-no loader using it.
+first was waiting for: `vault` now has a worker path and scene resolution uses
+it, while `grind`'s policy is still being decided.
 
 What exists: `vault::Assets` is a mount registry with virtual paths and extension
 dispatch; a content cache keyed on a hash; a file watcher and a reload path; glTF
 loading for models, materials, textures and lights. `grind` is a job system with a
 task graph, used by the renderer to record passes in parallel.
 
-## P1 - every load blocks the frame that asks for it
+## Fixed - every load blocks the frame that asks for it
 
-The C++ tree loads 100% synchronously and the Rust port kept that shape. A model
-load in the editor is a stall; a scene with thirty models is a long one.
+`Assets::load_async` submits the read and decode to `grind`, and scene
+resolution has an asynchronous form: `Scene::resolve_assets_async` sets
+`Pending` handles and returns. The editor's drops, scene opening, the sandbox
+and aimlab's build all use it. Consumers already answer a pending handle with
+"nothing yet" and retry: `Bifrost::ensure_mesh` and `ensure_texture` return
+`Ok(None)` and are called again every frame, skinning attach retries until the
+model resolves, and `wire` refuses a voice until the clip's bytes exist.
 
-**Fixed when:** a load happens on a worker, the frame that asked for it draws
-without the asset, and the asset appears when it is ready. That means an asset
-handle that can be `Pending`, and every consumer deciding what to draw until it
-resolves.
+`an_async_resolve_hands_out_a_pending_handle` asserts the handle is `Pending`
+with no payload on return and becomes `Ready` after `poll`. Still synchronous:
+`meats::load` parses the scene file itself, which is a separate blocking read.
 
 ## P1 - what the asset system is for
 

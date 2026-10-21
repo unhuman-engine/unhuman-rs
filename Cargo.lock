@@ -3574,6 +3574,7 @@ name = "meats"
 version = "0.1.0"
 dependencies = [
  "glam 0.33.12",
+ "grind",
  "hecs",
  "log",
  "serde",
@@ -3646,6 +3647,7 @@ version = "0.1.0"
 dependencies = [
  "adam",
  "glam 0.33.12",
+ "grind",
  "libc",
  "log",
  "meats",

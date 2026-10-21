@@ -136,7 +136,7 @@ impl EditorApp {
         // too.
         let engine = this.engine.engine_mut();
         this.editor
-            .new_starter_scene(&mut engine.scene, &mut engine.assets);
+            .new_starter_scene(&mut engine.scene, &mut engine.assets, &engine.jobs);
 
         // A layout restored from disk can have the profiler already open.
         if this.layout.is_open(PanelId::Profiler) {
