@@ -45,7 +45,8 @@ Decided; the ones with code are implemented in `src/`.
   bit-deterministic, the backend holds no generator, and the step is
   single-threaded. It breaks on a different build or SIMD width, on a different
   `dt`, and on stepping from more than one thread. `two_identical_runs_agree_bit_for_bit`
-  is the claim; async stepping (P2) is what would break it.
+  is the claim; async stepping would break it, so the step stays on one thread
+  (P2).
 - **The math boundary.** `convert` is the only file that names a Rapier math
   type, and it has tests in both directions, including a single-axis rotation
   that an Euler-order mix-up would transpose.
@@ -54,18 +55,30 @@ Decided; the ones with code are implemented in `src/`.
   `pings`. The backend owns no bus, so a dropped queue cannot change a stepped
   frame.
 - **Sleeping, islands and the frame budget.** A sleeping body is not written, and
-  the sleep-transition is. Whether stepping itself can be parallel is still P2:
-  the barrier is determinism, not the sleeping case.
+  the sleep-transition is. Stepping itself stays on the main thread; the barrier
+  is the determinism claim (P2).
 - **Serialization.** Scene data: `Transform`, `RigidBody`, `Collider`. Authored
   physics data: `Ccd`, `CollisionFilter`, `AllowedDOFs`, `Joint`. Runtime state,
   never saved: `BodyHandle`, the touching set, the collision queue, the Rapier
   sets.
 
-## P2 - no async stepping
+## P2 - stepping stays on the main thread
 
-`grind` exists and physics steps on the main thread. Whether rapier's step can
-overlap the renderer's frame -- and what the one-frame latency does to a contact
--- is the design question.
+Decided against, with the measurement. `bench_step` (500 dynamic boxes on a
+floor at 60 Hz) costs 0.453 ms/step in the dev profile. The aimlab scene is a
+handful of bodies, far below that. Overlapping the step with the frame would
+save at most half a millisecond at a body count no scene here reaches, while
+adding a fixed step (16.7 ms) between authored input and the contact it causes,
+and breaking the single-thread determinism claim unless it were a second,
+opt-in backend.
+
+Smoothness is solved without moving the step: `PhysicsBackend::interpolate`
+blends the poses before and after the last fixed step by `Time::alpha`, and
+records the blend as `written`, so `sync_in` does not mistake it for an authored
+teleport. `tests/interpolation.rs` covers the blend, the no-feedback property,
+and an authored change still winning.
+
+**Fixed when:** the measurement exists and the queue says why the answer is no.
 
 ## Fixed - the debug view
 
