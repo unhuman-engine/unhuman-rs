@@ -14,15 +14,18 @@ use super::lines::{GridPass, LinePass};
 pub struct EditorPass {
     pub grid: Option<GridPass>,
     pub lines: Option<LinePass>,
+    /// The physics debug view; drawn before the gizmo so the editor's handles
+    /// stay on top of the simulation's wireframes.
+    pub debug: Option<LinePass>,
 }
 
 impl EditorPass {
-    pub fn new(grid: Option<GridPass>, lines: Option<LinePass>) -> Self {
-        Self { grid, lines }
+    pub fn new(grid: Option<GridPass>, lines: Option<LinePass>, debug: Option<LinePass>) -> Self {
+        Self { grid, lines, debug }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.grid.is_none() && self.lines.is_none()
+        self.grid.is_none() && self.lines.is_none() && self.debug.is_none()
     }
 
     pub fn record(
@@ -32,6 +35,9 @@ impl EditorPass {
     ) -> Result<(), chassis::Error> {
         if let Some(grid) = &self.grid {
             grid.record(scope, list)?;
+        }
+        if let Some(debug) = &self.debug {
+            debug.record(scope, list)?;
         }
         if let Some(lines) = &self.lines {
             lines.record(scope, list)?;

@@ -10,6 +10,7 @@ repository.workspace = true
 adam = { workspace = true }
 chassis = { workspace = true }
 forge = { workspace = true }
+femur = { workspace = true }
 grind = { workspace = true }
 meats = { workspace = true }
 vault = { workspace = true }

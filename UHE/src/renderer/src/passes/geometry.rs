@@ -20,6 +20,7 @@ use crate::mesh::GpuMesh;
 pub const FRAME_SET: u32 = 0;
 pub const MATERIAL_SET: u32 = 1;
 pub const DRAW_SET: u32 = 2;
+pub const PALETTE_SET: u32 = 3;
 
 /// The four pipelines one geometry pass can bind, one per [`MaterialVariant`].
 ///
@@ -65,14 +66,21 @@ impl PreparedDraw {
 pub struct GeometryPass {
     pipelines: MaterialPipelines,
     frame: BindGroup,
+    palette: BindGroup,
     draws: Vec<PreparedDraw>,
 }
 
 impl GeometryPass {
-    pub fn new(pipelines: MaterialPipelines, frame: BindGroup, draws: Vec<PreparedDraw>) -> Self {
+    pub fn new(
+        pipelines: MaterialPipelines,
+        frame: BindGroup,
+        palette: BindGroup,
+        draws: Vec<PreparedDraw>,
+    ) -> Self {
         Self {
             pipelines,
             frame,
+            palette,
             draws,
         }
     }
@@ -96,6 +104,7 @@ impl GeometryPass {
         // invisible until the same frame ran on Vulkan.
         list.bind_pipeline(&self.pipelines.get(self.draws[0].variant));
         list.bind_group(FRAME_SET, &self.frame);
+        list.bind_group(PALETTE_SET, &self.palette);
 
         // Each bind is only issued when it differs from the previous draw. The
         // draw set always changes: it is what makes this draw's model matrix

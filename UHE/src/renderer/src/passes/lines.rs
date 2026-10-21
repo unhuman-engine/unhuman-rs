@@ -15,12 +15,19 @@ pub const GRID_SET: u32 = 0;
 /// Bind group number within the line shader.
 pub const LINE_DRAW_SET: u32 = 0;
 
-/// The two matrices the grid shader needs: the view-projection and its inverse.
+/// The grid's axis colours: the same hues as the gizmo, but dark enough that a
+/// selected entity's bright X and Z handles read on top of them.
+pub const GRID_AXIS_X: [f32; 4] = [0.50, 0.15, 0.12, 1.0];
+pub const GRID_AXIS_Z: [f32; 4] = [0.12, 0.18, 0.50, 1.0];
+
+/// The two matrices the grid shader needs, and its axis colours.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GridUniforms {
     pub view_projection: [[f32; 4]; 4],
     pub inverse_view_projection: [[f32; 4]; 4],
+    pub axis_x: [f32; 4],
+    pub axis_z: [f32; 4],
 }
 
 impl GridUniforms {
@@ -30,6 +37,8 @@ impl GridUniforms {
             inverse_view_projection: glam::Mat4::from_cols_array_2d(&view_projection)
                 .inverse()
                 .to_cols_array_2d(),
+            axis_x: GRID_AXIS_X,
+            axis_z: GRID_AXIS_Z,
         }
     }
 }
@@ -139,4 +148,48 @@ pub fn pack(vertices: &[LineVertex], indices: &[u32]) -> (Vec<u8>, Vec<u8>) {
         bytemuck::cast_slice(vertices).to_vec(),
         bytemuck::cast_slice(indices).to_vec(),
     )
+}
+
+/// Turns world-space segments into the line pass's format.
+///
+/// A segment is one line-list primitive, so it is two vertices and one index
+/// pair; the alpha is opaque because the debug view's colours are RGB.
+pub fn debug_batch(segments: &[femur::DebugLine]) -> (Vec<LineVertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(segments.len() * 2);
+    let mut indices = Vec::with_capacity(segments.len() * 2);
+    for line in segments {
+        push_segment(&mut vertices, &mut indices, line);
+    }
+    (vertices, indices)
+}
+
+/// All three debug layers, in the order the physics backend groups them.
+pub fn physics_debug_batch(debug: &femur::PhysicsDebug) -> (Vec<LineVertex>, Vec<u32>) {
+    let count = debug.shapes.len() + debug.contacts.len() + debug.broad_phase.len();
+    let mut vertices = Vec::with_capacity(count * 2);
+    let mut indices = Vec::with_capacity(count * 2);
+    for line in debug
+        .shapes
+        .iter()
+        .chain(&debug.contacts)
+        .chain(&debug.broad_phase)
+    {
+        push_segment(&mut vertices, &mut indices, line);
+    }
+    (vertices, indices)
+}
+
+fn push_segment(vertices: &mut Vec<LineVertex>, indices: &mut Vec<u32>, line: &femur::DebugLine) {
+    let first = vertices.len() as u32;
+    let color = [line.color.x, line.color.y, line.color.z, 1.0];
+    vertices.push(LineVertex {
+        position: line.from.to_array(),
+        color,
+    });
+    vertices.push(LineVertex {
+        position: line.to.to_array(),
+        color,
+    });
+    indices.push(first);
+    indices.push(first + 1);
 }

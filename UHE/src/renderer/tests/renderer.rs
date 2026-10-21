@@ -17,17 +17,18 @@ use bifrost::material::{
 use bifrost::mesh::{self, GpuMesh, MeshCache, MeshKey, VertexLayoutKey};
 use bifrost::passes::geometry::{GeometryPass, MaterialPipelines, PreparedDraw};
 use bifrost::passes::pipeline::{self, PipelineCache, PipelineKey, ShaderSet, ShaderVariant};
-use bifrost::passes::DrawArena;
+use bifrost::passes::{DrawArena, READBACK_LAG, READBACK_RING};
+use bifrost::passes::{FrameTargets, OverlayPasses, SpriteTextOverlay, PASS_COMPOSITE, PASS_TEXT};
 use bifrost::{Bifrost, EditorCamera, ViewSource};
 use chassis::graph::types::{ErrorKind, PassDesc, Queue};
 use chassis::graph::{self, ImageState, RenderGraph};
 use chassis::{
-    BindGroup, BindGroupTag, Buffer, BufferDesc, BufferTag, CommandList, DescriptorKind,
-    DescriptorSetLayoutDesc, Extent2d, ImageView, ImageViewTag, Pipeline, PipelineDesc,
-    PipelineTag, Registry, Resources, Sampler, SamplerDesc, SamplerTag, Shader, ShaderTag,
-    SlotTable, Texture, TextureDesc, TextureTag,
+    BindGroup, BindGroupTag, Buffer, BufferDesc, BufferTag, CommandList, ComputePipelineDesc,
+    DescriptorKind, DescriptorSetLayoutDesc, Extent2d, Gpu, ImageView, ImageViewTag, Pipeline,
+    PipelineDesc, PipelineTag, Registry, Resources, Sampler, SamplerDesc, SamplerTag, Shader,
+    ShaderTag, SlotTable, Texture, TextureDesc, TextureTag,
 };
-use vault::AssetId;
+use vault::{AssetId, Assets};
 
 // ---- a recorded fake RHI ----
 
@@ -58,9 +59,13 @@ struct FakeResources {
     group_creates: usize,
     group_destroys: usize,
     sampler_creates: usize,
-    /// What `read_buffer` hands back: the padded bytes a copy of the readback
-    /// buffer would produce. Empty by default, which reads as "no frame".
+    /// What `read_buffer` hands back: the bytes a copy of the readback buffer
+    /// would produce. Empty by default, which reads as "no frame".
     readback: Vec<u8>,
+    /// Every buffer `read_buffer` was called with, in order.
+    read_buffers: Vec<Buffer>,
+    /// `(buffer, submission)` for every `read_buffer_after`, in order.
+    read_after: Vec<(Buffer, u64)>,
 }
 
 impl FakeResources {
@@ -117,6 +122,11 @@ impl Resources for FakeResources {
         Ok(self.pipelines.create(()))
     }
 
+    fn create_compute_pipeline(&mut self, _desc: ComputePipelineDesc) -> chassis::Result<Pipeline> {
+        self.pipeline_creates += 1;
+        Ok(self.pipelines.create(()))
+    }
+
     fn create_bind_group(
         &mut self,
         _layout: &DescriptorSetLayoutDesc,
@@ -154,8 +164,21 @@ impl Resources for FakeResources {
         Ok(())
     }
 
-    fn read_buffer(&mut self, _buffer: &Buffer) -> chassis::Result<Vec<u8>> {
+    fn read_buffer(&mut self, buffer: &Buffer) -> chassis::Result<Vec<u8>> {
+        self.read_buffers.push(*buffer);
         Ok(self.readback.clone())
+    }
+
+    fn read_buffer_after(
+        &mut self,
+        buffer: &Buffer,
+        submission: chassis::Submission,
+    ) -> chassis::Result<Vec<u8>> {
+        let frame = *submission
+            .downcast_ref::<u64>()
+            .expect("the fake's only token is the frame number");
+        self.read_after.push((*buffer, frame));
+        self.read_buffer(buffer)
     }
 
     fn destroy_pipeline(&mut self, pipeline: Pipeline) {
@@ -176,20 +199,16 @@ impl Resources for FakeResources {
     }
 }
 
-/// Eleven distinct shader handles, which is all a `ShaderSet` is.
+/// Six distinct shader handles, one per source, which is all a `ShaderSet` is.
 fn shaders(resources: &mut FakeResources) -> ShaderSet {
     ShaderSet {
-        model_vertex: resources.shader(),
-        model_fragment: resources.shader(),
-        depth_vertex: resources.shader(),
-        ssao_vertex: resources.shader(),
-        ssao_fragment: resources.shader(),
-        grid_vertex: resources.shader(),
-        grid_fragment: resources.shader(),
-        line_vertex: resources.shader(),
-        line_fragment: resources.shader(),
-        composite_vertex: resources.shader(),
-        composite_fragment: resources.shader(),
+        model: resources.shader(),
+        depth: resources.shader(),
+        ssao: resources.shader(),
+        ssao_upsample: resources.shader(),
+        grid: resources.shader(),
+        line: resources.shader(),
+        composite: resources.shader(),
     }
 }
 
@@ -384,7 +403,7 @@ fn a_pipeline_description_matches_its_key() {
     );
     assert_eq!(model.shaders.len(), 2, "vertex and fragment");
     assert_eq!(model.shaders[0].stage, ShaderStage::Vertex);
-    assert_eq!(model.set_layouts.len(), 3, "frame, material, draw");
+    assert_eq!(model.set_layouts.len(), 4, "frame, material, draw, palette");
     assert!(!model.blend.enabled);
     assert_eq!(model.primitive.cull_mode, 1, "back-face culled");
     assert_eq!(model.depth.format, Some(TextureFormat::Depth32Float));
@@ -424,7 +443,7 @@ fn a_pipeline_description_matches_its_key() {
     );
     assert_eq!(shadow.shaders.len(), 1);
     assert!(shadow.color_targets.is_empty());
-    assert_eq!(shadow.set_layouts.len(), 2, "shadow, draw");
+    assert_eq!(shadow.set_layouts.len(), 3, "shadow, draw, palette");
 
     // A full-screen pass has no vertex buffer at all.
     let ssao = pipeline::pipeline_desc(
@@ -480,6 +499,58 @@ fn the_pipeline_cache_creates_one_pipeline_per_key() {
         "destroying twice is not a destroy"
     );
     assert_eq!(cache.len(), 1);
+}
+
+/// The grid's axis lines and the gizmo's arrows are the same geometry at the
+/// origin, so their colours have to differ for the handle to be visible.
+#[test]
+fn the_grid_axes_are_a_different_colour_from_the_gizmo_axes() {
+    use bifrost::passes::lines::{GRID_AXIS_X, GRID_AXIS_Z};
+
+    // The editor's gizmo colours (`UHE-EDITOR/editor/src/gizmo.rs`), which this
+    // crate does not own.
+    let gizmo_x = [0.90, 0.20, 0.25, 1.0];
+    let gizmo_z = [0.30, 0.45, 0.95, 1.0];
+
+    let distance =
+        |a: [f32; 4], b: [f32; 4]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f32>().sqrt();
+
+    assert!(
+        distance(GRID_AXIS_X, gizmo_x) > 0.2,
+        "the grid's X line hides the gizmo's X arrow"
+    );
+    assert!(
+        distance(GRID_AXIS_Z, gizmo_z) > 0.2,
+        "the grid's Z line hides the gizmo's Z arrow"
+    );
+}
+
+/// One `DebugLine` is one line-list primitive: an index pair and its two ends,
+/// carrying the segment's RGB as opaque vertex colour.
+#[test]
+fn a_debug_view_becomes_two_vertices_and_one_index_pair_per_segment() {
+    let segment = |x: f32| femur::DebugLine {
+        from: glam::Vec3::new(x, 0.0, 0.0),
+        to: glam::Vec3::new(x, 1.0, 0.0),
+        color: glam::Vec3::new(0.2, 0.8, 1.0),
+    };
+    let debug = femur::PhysicsDebug {
+        shapes: vec![segment(0.0), segment(1.0)],
+        contacts: vec![segment(2.0)],
+        broad_phase: vec![segment(3.0)],
+    };
+
+    let (vertices, indices) = bifrost::passes::lines::physics_debug_batch(&debug);
+    let segments = debug.shapes.len() + debug.contacts.len() + debug.broad_phase.len();
+
+    assert_eq!(vertices.len(), segments * 2);
+    assert_eq!(indices.len(), segments * 2);
+    for (index, vertex) in vertices.iter().enumerate() {
+        assert_eq!(vertex.color, [0.2, 0.8, 1.0, 1.0], "vertex {index}");
+    }
+    assert_eq!(indices[..4], [0, 1, 2, 3]);
+    assert_eq!(vertices[0].position, [0.0, 0.0, 0.0]);
+    assert_eq!(vertices[1].position, [0.0, 1.0, 0.0]);
 }
 
 // ---- materials ----
@@ -841,7 +912,7 @@ fn interleaving_uses_the_defaults_for_absent_attributes() {
     // The layout's offsets are the struct's, computed rather than written down.
     let layout = mesh::vertex_layout();
     assert_eq!(layout.stride as usize, std::mem::size_of::<mesh::Vertex>());
-    assert_eq!(layout.attributes.len(), 5);
+    assert_eq!(layout.attributes.len(), 7);
     assert_eq!(
         layout.attributes[0].offset,
         std::mem::offset_of!(mesh::Vertex, position) as u32
@@ -872,23 +943,26 @@ fn every_embedded_shader_compiles_for_its_entry_points() {
     for (label, source) in shaders {
         forge::wgsl::check(source, label).unwrap_or_else(|error| panic!("{label}: {error}"));
 
-        let entries = forge::wgsl::entry_points(source, label)
+        let declared = forge::wgsl::entry_points(source, label)
             .unwrap_or_else(|error| panic!("{label}: {error}"));
         assert!(
-            !entries.is_empty(),
+            !declared.is_empty(),
             "{label} declares no entry point, so nothing would be compiled"
         );
 
-        for (entry, stage) in entries {
-            let spirv = forge::wgsl::to_spirv_entry(source, label, &entry, stage)
-                .unwrap_or_else(|error| panic!("{label}/{entry}: {error}"));
-            assert_eq!(
-                spirv.len() % 4,
-                0,
-                "{label}/{entry}: SPIR-V is a word stream"
-            );
-            assert!(!spirv.is_empty());
-        }
+        let spirv =
+            forge::wgsl::to_spirv(source, label).unwrap_or_else(|error| panic!("{label}: {error}"));
+        assert_eq!(spirv.len() % 4, 0, "{label}: SPIR-V is a word stream");
+        assert!(!spirv.is_empty());
+
+        let module = forge::Module::from_bytes(&spirv).expect("a module");
+        let parsed = chassis::spirv::entry_points(&module.words).expect("a module");
+        let declared_names: Vec<&str> = declared.iter().map(|(name, _)| name.as_str()).collect();
+        let parsed_names: Vec<&str> = parsed.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            parsed_names, declared_names,
+            "{label}: the module keeps the names the source declared"
+        );
     }
 
     // Every graphics shader the vertex/fragment pairs are built from declares
@@ -907,6 +981,22 @@ fn every_embedded_shader_compiles_for_its_entry_points() {
     }
 }
 
+/// A module with more than one stage yields one entry per `ExecutionModel`, with
+/// the name each entry point declared.
+#[test]
+fn the_parser_reads_every_stage_from_a_multi_entry_module() {
+    let spirv = forge::wgsl::to_spirv(pipeline::MODEL_WGSL, "model").expect("compiles");
+    let module = forge::Module::from_bytes(&spirv).expect("a module");
+    let entries = chassis::spirv::entry_points(&module.words).expect("a module");
+
+    assert!(entries.iter().any(|entry| {
+        entry.stage == chassis::ShaderStage::Vertex && entry.name == pipeline::VS_MAIN
+    }));
+    assert!(entries.iter().any(|entry| {
+        entry.stage == chassis::ShaderStage::Fragment && entry.name == pipeline::FS_MAIN
+    }));
+}
+
 // ---- the frame loop's one call ----
 
 /// A `Gpu` that records what a frame handed it, with no device behind it.
@@ -923,6 +1013,10 @@ struct FakeGpu {
     frames: usize,
     passes: usize,
     slots: usize,
+    /// The readback buffer each frame's slot table named, in order.
+    readback_targets: Vec<Option<Buffer>>,
+    /// The tokens `wait_for_submission` was called with, in order.
+    waited: Vec<u64>,
 }
 
 impl FakeGpu {
@@ -933,7 +1027,7 @@ impl FakeGpu {
                 name: "fake".to_owned(),
                 sync_tier: chassis::SyncTier::Legacy,
                 max_texture_size: 8192,
-                frames_in_flight: 1,
+                frames_in_flight: 3,
             },
             graph: FakeGraph,
             extent: chassis::Extent2d {
@@ -943,6 +1037,8 @@ impl FakeGpu {
             frames: 0,
             passes: 0,
             slots: 0,
+            readback_targets: Vec::new(),
+            waited: Vec::new(),
         }
     }
 }
@@ -978,10 +1074,21 @@ impl chassis::Gpu for FakeGpu {
         frame: &graph::CompiledGraph,
         slots: &graph::SlotTable,
         _recorder: Arc<dyn graph::PassRecorder>,
-    ) -> chassis::Result<()> {
+    ) -> chassis::Result<chassis::Submission> {
         self.frames += 1;
         self.passes = frame.passes.len();
         self.slots = slots.texture_count();
+        // The readback pass writes the one imported buffer, so slot 0 is it.
+        self.readback_targets.push(slots.buffer(0));
+        Ok(chassis::Submission::new(self.frames as u64))
+    }
+
+    fn wait_for_submission(&mut self, submission: chassis::Submission) -> chassis::Result<()> {
+        self.waited.push(
+            *submission
+                .downcast_ref::<u64>()
+                .expect("the fake's only token is the frame number"),
+        );
         Ok(())
     }
 
@@ -1074,6 +1181,10 @@ impl chassis::Gpu for NoFrameGpu {
 
     fn resources(&mut self) -> &mut dyn Resources {
         &mut self.resources
+    }
+
+    fn wait_for_submission(&mut self, _submission: chassis::Submission) -> chassis::Result<()> {
+        Ok(())
     }
 
     fn frame_begin(&mut self) -> chassis::Result<()> {
@@ -1220,6 +1331,8 @@ struct RecordingList {
 impl CommandList for RecordingList {
     fn begin_rendering(&mut self, _desc: &chassis::RenderPassDesc) {}
     fn end_rendering(&mut self) {}
+    fn begin_compute(&mut self) {}
+    fn end_compute(&mut self) {}
     fn set_viewport(&mut self, _extent: Extent2d) {}
     fn set_scissor(&mut self, _x: u32, _y: u32, _w: u32, _h: u32) {}
 
@@ -1236,7 +1349,11 @@ impl CommandList for RecordingList {
         }
     }
 
-    fn set_push_constants(&mut self, _data: &[u8]) {}
+    fn set_push_constants(&mut self, _data: &[u8]) -> chassis::Result<()> {
+        Err(chassis::Error::Unsupported(
+            "push constants are not declared by this RHI; use a uniform buffer".to_owned(),
+        ))
+    }
     fn bind_vertex_buffer(&mut self, _slot: u32, _buffer: &Buffer, _offset: u64) {
         self.vertex_binds += 1;
     }
@@ -1292,7 +1409,7 @@ fn geometry_binds_shared_state_once_per_run() {
         transparent: Pipeline::null(),
         transparent_double_sided: Pipeline::null(),
     };
-    let pass = GeometryPass::new(pipelines, BindGroup::null(), draws);
+    let pass = GeometryPass::new(pipelines, BindGroup::null(), BindGroup::null(), draws);
 
     let slots = SlotTable::default();
     let scope = chassis::PassScope {
@@ -1350,18 +1467,19 @@ fn a_device_resize_is_followed_once() {
     assert!(!plugin.follow_extent(&mut gpu), "and only once");
 }
 
-/// A readback frame comes back tightly packed whatever the copy's row pitch was.
+/// The render width is a multiple of 64 texels, so the readback copy's row pitch
+/// equals the packed row and no de-pad pass is needed.
 ///
-/// A copy pads its rows to `COPY_BYTES_PER_ROW_ALIGNMENT`, so a viewport whose
-/// width is not a multiple of 64 texels -- any panel dragged to an arbitrary
-/// size -- produces a buffer longer than the image in it. `FrameImage` promises
-/// `width * height * 4` packed bytes, and a caller that trusted the buffer length
-/// instead would draw a sheared frame.
+/// A copy pads its rows to `COPY_BYTES_PER_ROW_ALIGNMENT` (256 bytes, 64 texels),
+/// so an arbitrary viewport width -- any panel dragged to a size -- made the copy
+/// produce a longer buffer than the image and the whole frame was copied a second
+/// time to strip it. Rendering at the aligned width removes that copy.
 #[test]
-fn a_readback_frame_is_unpadded() {
-    // 100 texels: 400 bytes of row, 512 with the copy's padding.
+fn the_render_width_is_aligned_so_the_readback_needs_no_depad() {
+    // 100 texels: a packed row of 400 bytes, 512 with the copy's padding.
     const WIDTH: u32 = 100;
     const HEIGHT: u32 = 3;
+    const ALIGNED: u32 = 128;
 
     let mut gpu = FakeGpu::new();
     let mut renderer = renderer_for(&mut gpu);
@@ -1369,34 +1487,35 @@ fn a_readback_frame_is_unpadded() {
     let scene = meats::Scene::new();
     let camera = editor_camera();
 
-    let pitch = chassis::copy_row_pitch(WIDTH, 4) as usize;
-    let packed = WIDTH as usize * 4;
-    assert!(pitch > packed, "the case only means something when it pads");
-
-    // Every row is its own byte pattern, with the padding filled to a different
-    // one, so a row taken from the wrong offset cannot pass.
-    let mut padded = Vec::with_capacity(pitch * HEIGHT as usize);
-    for row in 0..HEIGHT as usize {
-        padded.extend(std::iter::repeat_n(row as u8 + 1, packed));
-        padded.extend(std::iter::repeat_n(0xFF, pitch - packed));
-    }
-    gpu.resources.readback = padded;
-
     chassis::Gpu::resize(
         &mut gpu,
-        chassis::Extent2d {
+        Extent2d {
             width: WIDTH,
             height: HEIGHT,
         },
     )
     .expect("the fake records any extent");
 
-    renderer
-        .render(&mut gpu, &jobs, &scene, ViewSource::Editor, Some(&camera))
-        .expect("a fake device takes the whole frame");
+    // Packed at the aligned width: every row is its own byte pattern, so a row
+    // taken from the wrong offset cannot pass.
+    let packed = ALIGNED as usize * 4;
+    let mut bytes = Vec::with_capacity(packed * HEIGHT as usize);
+    for row in 0..HEIGHT as usize {
+        bytes.extend(std::iter::repeat_n(row as u8 + 1, packed));
+    }
+    gpu.resources.readback = bytes;
+
+    // The ring reads a frame that is `READBACK_LAG` submissions old, so it takes
+    // that many frames plus one before a frame comes back.
+    for _ in 0..=READBACK_LAG {
+        renderer
+            .render(&mut gpu, &jobs, &scene, ViewSource::Editor, Some(&camera))
+            .expect("a fake device takes the whole frame");
+    }
 
     let image = renderer.frame_image().expect("a readback frame");
-    assert_eq!(image.width, WIDTH);
+    assert_eq!(image.width, ALIGNED, "the render width is a multiple of 64");
+    assert_eq!(image.width % 64, 0, "a copy of this width needs no padding");
     assert_eq!(image.height, HEIGHT);
     assert_eq!(
         image.bgra.len(),
@@ -1412,4 +1531,373 @@ fn a_readback_frame_is_unpadded() {
             "row {row} came from the wrong offset"
         );
     }
+}
+
+// ---- the readback ring ----
+
+/// The ring reads a frame from [`READBACK_LAG`] submissions ago, so no frame maps
+/// the buffer it just wrote.
+///
+/// Before the ring there was one buffer, mapped every frame immediately after the
+/// submission that wrote it, which is the wait that made the frame GPU + CPU.
+#[test]
+fn the_readback_ring_reads_an_older_submission() {
+    const WIDTH: u32 = 64;
+    const HEIGHT: u32 = 2;
+    const FRAMES: usize = READBACK_RING + 1;
+
+    let mut gpu = FakeGpu::new();
+    let mut renderer = renderer_for(&mut gpu);
+    let jobs = grind::Jobs::new();
+    let scene = meats::Scene::new();
+    let camera = editor_camera();
+
+    chassis::Gpu::resize(
+        &mut gpu,
+        Extent2d {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+    )
+    .expect("the fake records any extent");
+    gpu.resources.readback = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
+
+    for _ in 0..FRAMES {
+        renderer
+            .render(&mut gpu, &jobs, &scene, ViewSource::Editor, Some(&camera))
+            .expect("a fake device takes the whole frame");
+    }
+
+    let targets = &gpu.readback_targets;
+    let reads = &gpu.resources.read_buffers;
+    assert_eq!(targets.len(), FRAMES, "one readback slot per frame");
+    assert_eq!(
+        reads.len(),
+        FRAMES - READBACK_LAG as usize,
+        "the first frames are warm-up, with no retired slot to read"
+    );
+
+    // The read at frame `f` is the buffer written at frame `f - READBACK_LAG`.
+    for (offset, read) in reads.iter().enumerate() {
+        assert_eq!(
+            Some(*read),
+            targets[offset],
+            "read {offset} is not the frame {READBACK_LAG} submissions back"
+        );
+    }
+
+    // And no frame reads the buffer it wrote.
+    for (offset, read) in reads.iter().enumerate() {
+        let written = targets[offset + READBACK_LAG as usize];
+        assert_ne!(Some(*read), written, "a frame read its own readback buffer");
+    }
+
+    // The wait is the slot's own submission, not the newest one: that is what
+    // makes the ring an overlap rather than a rename of the old blocking read.
+    assert_eq!(gpu.resources.read_after.len(), reads.len());
+    for (offset, (buffer, submission)) in gpu.resources.read_after.iter().enumerate() {
+        assert_eq!(Some(*buffer), targets[offset]);
+        assert_eq!(
+            *submission,
+            (offset + 1) as u64,
+            "read {offset} waited on the wrong submission"
+        );
+    }
+}
+
+/// Two consecutive frames of the same static scene create nothing.
+///
+/// The frame-wide uniform sets used to destroy and recreate a buffer and a bind
+/// group every frame. They are now kept while their inputs are unchanged, so a
+/// steady frame touches no allocator.
+#[test]
+fn a_steady_frame_creates_no_bind_groups() {
+    let mut gpu = FakeGpu::new();
+    let mut renderer = renderer_for(&mut gpu);
+    let jobs = grind::Jobs::new();
+    let scene = meats::Scene::new();
+    let camera = editor_camera();
+
+    // Each of the ring's slots builds its sets on first use, so the first
+    // `frames_in_flight` frames are allocation, not churn.
+    let depth = gpu.info().frames_in_flight as usize;
+    for _ in 0..depth {
+        renderer
+            .render(&mut gpu, &jobs, &scene, ViewSource::Editor, Some(&camera))
+            .expect("a fake device takes the whole frame");
+    }
+
+    let buffers = gpu.resources.buffer_creates;
+    let groups = gpu.resources.group_creates;
+
+    // Same extent, same scene and a camera that has not moved: the ring comes
+    // back to slot zero, whose uniforms and bound resources are unchanged, so
+    // there is nothing to rebuild.
+    renderer
+        .render(&mut gpu, &jobs, &scene, ViewSource::Editor, Some(&camera))
+        .expect("a fake device takes the whole frame");
+
+    assert_eq!(
+        gpu.resources.buffer_creates, buffers,
+        "a steady frame creates no buffers"
+    );
+    assert_eq!(
+        gpu.resources.group_creates, groups,
+        "a steady frame creates no bind groups"
+    );
+}
+
+/// One triangle in a scratch glTF, so a frame has a draw to arena into.
+struct TriangleAsset {
+    root: std::path::PathBuf,
+}
+
+impl TriangleAsset {
+    fn new(tag: &str) -> Self {
+        let root =
+            std::env::temp_dir().join(format!("bifrost-frame-ring-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch directory");
+
+        let mut bin = Vec::new();
+        let positions: [[f32; 3]; 6] = [
+            [-2.0, -2.0, 0.0],
+            [2.0, -2.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [2.0, -2.0, 0.0],
+            [-2.0, -2.0, 0.0],
+            [0.0, 2.0, 0.0],
+        ];
+        for position in positions {
+            for value in position {
+                bin.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        for _ in positions {
+            for value in [0.0f32, 0.0, 1.0] {
+                bin.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        for index in [0u16, 1, 2, 3, 4, 5] {
+            bin.extend_from_slice(&index.to_le_bytes());
+        }
+        std::fs::write(root.join("tri.bin"), &bin).expect("triangle buffer");
+
+        let gltf = r#"{
+  "asset": { "version": "2.0" },
+  "scene": 0,
+  "scenes": [ { "nodes": [ 0 ] } ],
+  "nodes": [ { "name": "Tri", "mesh": 0 } ],
+  "meshes": [ {
+    "name": "Tri",
+    "primitives": [ {
+      "attributes": { "POSITION": 0, "NORMAL": 1 },
+      "indices": 2
+    } ]
+  } ],
+  "buffers": [ { "uri": "tri.bin", "byteLength": 156 } ],
+  "bufferViews": [
+    { "buffer": 0, "byteOffset": 0, "byteLength": 72, "target": 34962 },
+    { "buffer": 0, "byteOffset": 72, "byteLength": 72, "target": 34962 },
+    { "buffer": 0, "byteOffset": 144, "byteLength": 12, "target": 34963 }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0, "componentType": 5126, "count": 6, "type": "VEC3",
+      "min": [ -2.0, -2.0, 0.0 ], "max": [ 2.0, 2.0, 0.0 ]
+    },
+    { "bufferView": 1, "componentType": 5126, "count": 6, "type": "VEC3" },
+    { "bufferView": 2, "componentType": 5123, "count": 6, "type": "SCALAR" }
+  ]
+}"#;
+        std::fs::write(root.join("tri.gltf"), gltf).expect("triangle glTF");
+        Self { root }
+    }
+
+    fn load(&self) -> (Assets, AssetId) {
+        let mut assets = Assets::new(&self.root);
+        let id = assets.load("tri.gltf").expect("load triangle");
+        (assets, id)
+    }
+}
+
+impl Drop for TriangleAsset {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A moving camera touches every per-frame slot, and the frame ring waits for
+/// the oldest submission before reusing one.
+#[test]
+fn a_moving_camera_waits_for_the_oldest_frame_and_rotates_slots() {
+    let scratch = TriangleAsset::new("moving-camera");
+    let (assets, id) = scratch.load();
+
+    let mut gpu = FakeGpu::new();
+    let mut renderer = renderer_for(&mut gpu);
+    let jobs = grind::Jobs::new();
+
+    let mut scene = meats::Scene::new();
+    let mesh = scene.spawn("tri");
+    assert!(scene.insert(
+        mesh,
+        meats::MeshRenderer {
+            mesh: Some(id),
+            ..meats::MeshRenderer::default()
+        }
+    ));
+    renderer
+        .ensure_mesh(&mut gpu, &assets, id)
+        .expect("upload")
+        .expect("the triangle has a mesh");
+
+    let mut camera = editor_camera();
+    let depth = gpu.info().frames_in_flight as usize;
+
+    // Slots are fresh for the first `depth` frames; only the lap after that
+    // waits, and it must free nothing before the wait.
+    for frame in 0..depth {
+        camera.set_yaw(0.6 + frame as f32 * 0.2);
+        renderer
+            .render(&mut gpu, &jobs, &scene, ViewSource::Editor, Some(&camera))
+            .unwrap_or_else(|error| panic!("frame {frame}: {error}"));
+        assert!(
+            gpu.waited.is_empty(),
+            "frame {frame} waited for a slot that had no submission"
+        );
+        assert!(
+            gpu.resources.buffer_destroys.is_empty(),
+            "frame {frame} freed a slot while a previous frame might read it"
+        );
+        assert!(
+            gpu.resources.buffer_creates > 0,
+            "the first lap allocates each slot"
+        );
+    }
+
+    // Frame `depth` reuses slot zero, which frame zero wrote.
+    camera.set_yaw(0.6 + depth as f32 * 0.2);
+    renderer
+        .render(&mut gpu, &jobs, &scene, ViewSource::Editor, Some(&camera))
+        .expect("the lap after the ring");
+    assert_eq!(
+        gpu.waited,
+        vec![1],
+        "the reused slot waited on frame zero's token, not the newest"
+    );
+    assert!(
+        !gpu.resources.buffer_destroys.is_empty(),
+        "reusing the slot released the previous frame's sets after the wait"
+    );
+
+    // Two ringed writes per frame: the draw arena, then the palette. Slots
+    // 0..depth are distinct, then slot 0 comes back: both were ringed rather
+    // than refilled in place.
+    let writes: Vec<Buffer> = gpu
+        .resources
+        .buffer_writes
+        .iter()
+        .map(|(buffer, _, _)| *buffer)
+        .collect();
+    assert_eq!(writes.len(), (depth + 1) * 2, "arena and palette per frame");
+    let (pairs, _) = writes.as_chunks::<2>();
+    for pair in pairs {
+        assert_ne!(pair[0], pair[1], "arena and palette shared a buffer");
+    }
+    let arena: Vec<Buffer> = pairs.iter().map(|pair| pair[0]).collect();
+    let palette: Vec<Buffer> = pairs.iter().map(|pair| pair[1]).collect();
+    for pair in arena[..depth].windows(2) {
+        assert_ne!(pair[0], pair[1], "two frames shared an arena slot");
+    }
+    for pair in palette[..depth].windows(2) {
+        assert_ne!(pair[0], pair[1], "two frames shared a palette slot");
+    }
+    assert_eq!(
+        arena[depth], arena[0],
+        "the lap after the ring reused the first arena slot"
+    );
+    assert_eq!(
+        palette[depth], palette[0],
+        "the lap after the ring reused the first palette slot"
+    );
+}
+
+/// The hand-written atlas, with a zero image so the pass's upload has bytes.
+fn overlay_atlas() -> bifrost::font::Atlas {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest
+        .ancestors()
+        .map(|ancestor| ancestor.join("assets/fonts/test-atlas.json"))
+        .find(|candidate| candidate.is_file())
+        .expect("the atlas fixture sits above the crate");
+    let mut atlas = bifrost::font::Atlas::parse(
+        &std::fs::read_to_string(&path).expect("the atlas fixture is readable"),
+    )
+    .expect("the atlas fixture parses");
+    atlas.rgba8 = vec![0; atlas.width as usize * atlas.height as usize * 4];
+    atlas
+}
+
+/// A queued HUD line is laid out by `edit`, and the frame then declares the text
+/// pass that draws it: the producer path a game uses.
+#[test]
+fn a_pushed_hud_declares_the_text_pass() {
+    let mut resources = FakeResources::new();
+    let overlay = SpriteTextOverlay::new(
+        &mut resources,
+        chassis::TextureFormat::Rgba8Srgb,
+        overlay_atlas(),
+    )
+    .expect("both 2D pipelines build against a fake device");
+    assert!(overlay.is_empty(), "nothing queued yet");
+
+    overlay.frame().push_text(
+        meats::Text {
+            text: "AV".to_owned(),
+            ..meats::Text::default()
+        },
+        glam::Mat4::IDENTITY,
+    );
+    assert!(
+        !overlay.is_empty(),
+        "a queued run makes the overlay non-empty before edit"
+    );
+
+    // The frame's order: begin clears the last frame, edit lays the queue out.
+    overlay.begin();
+    overlay.edit();
+    assert!(!overlay.is_empty(), "the run survives begin/edit");
+
+    let mut graph = RenderGraph::new();
+    let scene_color =
+        graph.import_texture("scene.color", ImageState::Undefined, ImageState::ShaderRead);
+    let scene_depth = graph.import_texture(
+        "scene.depth",
+        ImageState::Undefined,
+        ImageState::DepthAttachment,
+    );
+    let shadow = graph.import_texture("shadow.map", ImageState::Undefined, ImageState::ShaderRead);
+    let ssao = graph.import_texture("ssao.ao", ImageState::Undefined, ImageState::ShaderRead);
+    let backbuffer =
+        graph.import_texture("backbuffer", ImageState::Undefined, ImageState::ShaderRead);
+    let targets = FrameTargets {
+        scene_color,
+        scene_depth,
+        shadow,
+        ssao,
+        backbuffer,
+    };
+    overlay.declare(&mut graph, &targets);
+    graph
+        .pass(PASS_COMPOSITE)
+        .color(backbuffer, [0.0, 0.0, 0.0, 1.0])
+        .read_texture(scene_color);
+
+    let compiled = graph.compile().expect("the overlay's frame compiles");
+    assert!(
+        compiled.find(PASS_TEXT).is_some(),
+        "a non-empty HUD declares the text pass: {}",
+        graph.dump()
+    );
 }

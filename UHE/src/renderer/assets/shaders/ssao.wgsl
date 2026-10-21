@@ -8,9 +8,11 @@
 // of the framebuffer, which is why the y term of every reprojection below is
 // negated.
 
+const TAU: f32 = 6.28318530718;
+
 struct Ssao {
     // Hemisphere samples, in view space, length <= 1.
-    samples: array<vec4<f32>, 64>,
+    samples: array<vec4<f32>, 32>,
     projection: mat4x4<f32>,
     inverse_projection: mat4x4<f32>,
     // radius, bias, power, unused.
@@ -43,18 +45,36 @@ fn reconstruct(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return view.xyz / view.w;
 }
 
+// Interleaved gradient noise: no trig and no texture fetch, and deterministic.
+fn rotation(pixel: vec2<f32>) -> f32 {
+    let s = fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715)));
+    return fract(52.9829189 * s) * TAU;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // A depth texture samples with an integer level, unlike a colour one.
     let depth = textureSampleLevel(depth_texture, depth_sampler, in.uv, 0);
     let origin = reconstruct(in.uv, depth);
+    // One projection of the origin, then a w=0 offset per sample: projecting
+    // `origin + offset` every iteration would re-project the origin too.
+    let origin_clip = ssao.projection * vec4<f32>(origin, 1.0);
+
+    let angle = rotation(in.clip.xy);
+    let c = cos(angle);
+    let s = sin(angle);
 
     // The occlusion fraction: how many samples land behind what the depth buffer
     // holds at their own screen position.
     var occluded = 0.0;
-    for (var i = 0u; i < 64u; i = i + 1u) {
-        let sample_view = origin + ssao.samples[i].xyz * ssao.params.x;
-        let projected = ssao.projection * vec4<f32>(sample_view, 1.0);
+    for (var i = 0u; i < 32u; i = i + 1u) {
+        let offset = ssao.samples[i].xyz;
+        let rotated = vec3<f32>(
+            (offset.x * c - offset.y * s) * ssao.params.x,
+            (offset.x * s + offset.y * c) * ssao.params.x,
+            offset.z * ssao.params.x,
+        );
+        let projected = origin_clip + ssao.projection * vec4<f32>(rotated, 0.0);
         let sample_uv = vec2<f32>(
             projected.x / projected.w * 0.5 + 0.5,
             0.5 - projected.y / projected.w * 0.5,
@@ -71,6 +91,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    let ao = pow(clamp(1.0 - occluded / 64.0, 0.0, 1.0), ssao.params.z);
+    let ao = pow(clamp(1.0 - occluded / 32.0, 0.0, 1.0), ssao.params.z);
     return vec4<f32>(ao, ao, ao, 1.0);
 }

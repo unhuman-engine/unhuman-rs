@@ -4,21 +4,22 @@
 //! a frame declares, what they read and write, the buffers each batch's contents
 //! need, and the bind groups their texture lookups resolve to.
 //!
-//! The batching state is behind a mutex because a caller edits it before `prepare`
-//! uploads, while the frame holds the same object as `Arc<dyn OverlayPasses>` to
-//! record with, and a backend may record on worker threads. Buffers are per frame
-//! because `Resources` has no update-in-place call, so `prepare` creates this
-//! frame's vertices and destroys the previous frame's.
+//! A caller queues content through [`OverlayFrame`], which has no GPU resources.
+//! The frame calls begin, edit and prepare in that order, then hands the same
+//! object to the backend as `Arc<dyn OverlayPasses>` to record with. The batching
+//! state is behind a mutex because a backend may record on worker threads.
+//! Buffers are per frame because `Resources` has no update-in-place call, so
+//! `prepare` creates this frame's vertices and destroys the previous frame's.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chassis::graph::{PassScope, RenderGraph};
 use chassis::{
-    BindGroup, Buffer, CommandList, DescriptorSetLayoutDesc, Error, ImageView, Resources, Sampler,
-    Texture,
+    BindGroup, Buffer, CommandList, DescriptorSetLayoutDesc, Error, Extent, ImageView, Resources,
+    Sampler, SamplerDesc, Texture, TextureDesc, TextureFormat, TextureUsage,
 };
-use glam::Mat4;
+use glam::{Mat4, Vec4};
 
 use crate::batch2d::{Batch2D, Globals, PipelineError, QuadPipeline, SpriteGlobals};
 use crate::font::Atlas;
@@ -28,6 +29,74 @@ use crate::text::{TextGlobals, TextRenderer};
 /// The two passes this slice draws in.
 pub const PASS_2D: &str = "bifrost.2d";
 pub const PASS_TEXT: &str = "bifrost.text";
+
+/// Content a producer queues for the next frame.
+///
+/// Kept separate from the prepared pass so a caller never touches a GPU handle:
+/// text is laid out in `edit`, once the overlay's atlas and device exist.
+#[derive(Default)]
+pub struct OverlayFrame {
+    commands: Mutex<Vec<Command>>,
+}
+
+enum Command {
+    Text {
+        component: meats::Text,
+        transform: Mat4,
+    },
+    Quad {
+        transform: Mat4,
+        color: Vec4,
+    },
+}
+
+impl OverlayFrame {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queues text at a caller transform. The overlay supplies the atlas, so the
+    /// component's `font` and `font_path` are ignored.
+    pub fn push_text(&self, component: meats::Text, transform: Mat4) {
+        self.lock().push(Command::Text {
+            component,
+            transform,
+        });
+    }
+
+    pub fn push_quad(&self, transform: Mat4, color: Vec4) {
+        self.lock().push(Command::Quad { transform, color });
+    }
+
+    /// Drops everything queued but not yet framed.
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Command>> {
+        self.commands.lock().expect("overlay queue mutex poisoned")
+    }
+
+    fn take(&self) -> Vec<Command> {
+        std::mem::take(&mut *self.lock())
+    }
+}
+
+/// Pixel coordinates, origin top-left and y down, to clip space.
+pub fn screen_projection(width: u32, height: u32) -> Mat4 {
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    Mat4::from_cols_array_2d(&[
+        [2.0 / width, 0.0, 0.0, 0.0],
+        [0.0, -2.0 / height, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [-1.0, 1.0, 0.0, 1.0],
+    ])
+}
 
 /// Everything a frame mutates: the batches, and the GPU objects built from them.
 struct State {
@@ -45,6 +114,9 @@ struct State {
     /// case, which binds the 1x1 white texel in slot 0.
     sprite_textures: HashMap<Option<Texture>, BindGroup>,
     text_textures: HashMap<Texture, BindGroup>,
+    /// Views minted for textures the overlay does not own, such as sprite assets.
+    sprite_views: HashMap<Texture, ImageView>,
+    text_views: HashMap<Texture, ImageView>,
 }
 
 impl State {
@@ -60,6 +132,8 @@ impl State {
             text_globals: None,
             sprite_textures: HashMap::new(),
             text_textures: HashMap::new(),
+            sprite_views: HashMap::new(),
+            text_views: HashMap::new(),
         }
     }
 
@@ -78,6 +152,8 @@ impl State {
         for (_, group) in self.text_textures.drain() {
             resources.destroy_bind_group(group);
         }
+        self.sprite_views.clear();
+        self.text_views.clear();
         for mut globals in [self.sprite_globals.take(), self.text_globals.take()]
             .into_iter()
             .flatten()
@@ -102,26 +178,65 @@ impl State {
 pub struct SpriteTextOverlay {
     sprite: QuadPipeline,
     text: QuadPipeline,
-    color_format: chassis::TextureFormat,
+    color_format: TextureFormat,
     state: Mutex<State>,
+    pending: Arc<OverlayFrame>,
+
+    /// The face every queued `meats::Text` is laid out with.
+    atlas: Atlas,
+    atlas_texture: Texture,
+    atlas_view: ImageView,
+    white: Texture,
+    white_view: ImageView,
+    sampler: Sampler,
 }
 
 impl SpriteTextOverlay {
-    /// Builds both pipelines. The colour format is the scene colour's: both draw
-    /// into it, not into the swapchain.
+    /// Builds both pipelines and uploads `atlas`. The colour format is the scene
+    /// colour's: both draw into it, not into the swapchain.
     pub fn new(
         resources: &mut dyn Resources,
-        color_format: chassis::TextureFormat,
+        color_format: TextureFormat,
+        atlas: Atlas,
     ) -> Result<Self, PipelineError> {
+        let sprite = QuadPipeline::sprite(resources, color_format, None)?;
+        let text = crate::text::create_text_pipeline(resources, color_format, None)?;
+
+        let atlas_texture = resources.create_texture(TextureDesc::new_2d(
+            Extent::new(atlas.width.max(1), atlas.height.max(1)),
+            TextureFormat::Rgba8Unorm,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+        ))?;
+        let expected = atlas.width as usize * atlas.height as usize * 4;
+        if atlas.rgba8.len() == expected {
+            resources.upload_texture(&atlas_texture, &atlas.rgba8, atlas.width, atlas.height)?;
+        }
+        let atlas_view = resources.create_image_view(&atlas_texture)?;
+
+        let white = resources.create_texture(TextureDesc::new_2d(
+            Extent::new(1, 1),
+            TextureFormat::Rgba8Unorm,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+        ))?;
+        resources.upload_texture(&white, &[255, 255, 255, 255], 1, 1)?;
+        let white_view = resources.create_image_view(&white)?;
+
         Ok(Self {
-            sprite: QuadPipeline::sprite(resources, color_format, None)?,
-            text: crate::text::create_text_pipeline(resources, color_format, None)?,
+            sprite,
+            text,
             color_format,
             state: Mutex::new(State::new(0)),
+            pending: Arc::new(OverlayFrame::new()),
+            atlas,
+            atlas_texture,
+            atlas_view,
+            white,
+            white_view,
+            sampler: resources.create_sampler(&SamplerDesc::clamped())?,
         })
     }
 
-    pub fn color_format(&self) -> chassis::TextureFormat {
+    pub fn color_format(&self) -> TextureFormat {
         self.color_format
     }
 
@@ -131,6 +246,12 @@ impl SpriteTextOverlay {
 
     pub fn text_texture_layout(&self) -> &DescriptorSetLayoutDesc {
         self.text.texture_layout()
+    }
+
+    /// The producer handle, which outlives the prepared pass and owns no GPU
+    /// resource.
+    pub fn frame(&self) -> Arc<OverlayFrame> {
+        Arc::clone(&self.pending)
     }
 
     /// The shared handle `Bifrost::set_overlay` takes.
@@ -149,46 +270,41 @@ impl SpriteTextOverlay {
         state.texts.begin();
     }
 
-    /// Push quads and text runs. One closure so the lock is taken once.
-    pub fn edit(&self, edit: impl FnOnce(&mut Batch2D, &mut TextRenderer)) {
-        let mut state = self.state();
-        let State { batch, texts, .. } = &mut *state;
-        edit(batch, texts);
+    /// Lays the queued content out against this overlay's atlas.
+    pub fn edit(&self) {
+        let commands = self.pending.take();
+        if commands.is_empty() {
+            return;
+        }
+
+        let mut guard = self.state();
+        let state = &mut *guard;
+        for command in commands {
+            match command {
+                Command::Text {
+                    component,
+                    transform,
+                } => state
+                    .texts
+                    .push(&component, &self.atlas, self.atlas_texture, transform),
+                Command::Quad { transform, color } => state.batch.push_quad(transform, color),
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        let state = self.state();
-        !state.has_sprites() && !state.has_text()
+        self.pending.is_empty() && {
+            let state = self.state();
+            !state.has_sprites() && !state.has_text()
+        }
     }
 
     /// Uploads this frame's batches and builds their bind groups.
-    ///
-    /// `textures` resolves a batch's texture to the view that will be bound; the
-    /// caller owns the asset-to-view half because it owns the asset registry.
-    /// `atlas_texture` is the view of the font atlas, and `white` is the view an
-    /// untextured quad binds.
-    // The atlas view, the white view, the sampler and the per-batch textures are
-    // all part of one binding set; bundling them would not make the call clearer.
-    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &self,
         resources: &mut dyn Resources,
         view_projection: Mat4,
-        atlas: &Atlas,
-        atlas_texture: Texture,
-        white: ImageView,
-        sampler: Sampler,
-        textures: &[(Texture, ImageView)],
     ) -> Result<(), Error> {
-        // An untextured quad binds this, so a null handle would reach the driver
-        // as a null image view. Refused here, where the caller can be named.
-        if white.is_null() {
-            return Err(Error::InvalidDescriptor(
-                "an untextured 2D quad needs a 1x1 white view; the caller passed a null one"
-                    .to_owned(),
-            ));
-        }
-
         // One `DerefMut` and then plain field projections: `state.batch` is read
         // while `state.sprite_textures` is written, and two projections through
         // a guard are not guaranteed to split.
@@ -210,19 +326,21 @@ impl SpriteTextOverlay {
                     continue;
                 }
                 let view = match batch.texture {
-                    Some(texture) => resolve(textures, texture).ok_or_else(|| {
-                        Error::InvalidDescriptor(format!(
-                            "the 2D batch binds {texture:?}, which the caller did not resolve \
-                             to a view"
-                        ))
-                    })?,
-                    None => white,
+                    None => self.white_view,
+                    Some(texture) => match state.sprite_views.get(&texture) {
+                        Some(view) => *view,
+                        None => {
+                            let view = resources.create_image_view(&texture)?;
+                            state.sprite_views.insert(texture, view);
+                            view
+                        }
+                    },
                 };
                 let group = resources.create_bind_group(
                     self.sprite.texture_layout(),
                     &[],
                     &[(0, view)],
-                    &[(1, sampler)],
+                    &[(1, self.sampler)],
                 )?;
                 state.sprite_textures.insert(batch.texture, group);
             }
@@ -230,25 +348,34 @@ impl SpriteTextOverlay {
 
         if state.has_text() {
             let mut globals = self.text.globals();
-            globals.upload(resources, &TextGlobals::new(view_projection, atlas))?;
+            globals.upload(resources, &TextGlobals::new(view_projection, &self.atlas))?;
             state.text_globals = Some(globals);
 
             let (vertices, indices) = crate::text::create_buffers(resources, &state.texts)?;
             state.text_vertices = Some(vertices);
             state.text_indices = Some(indices);
 
-            let atlas_view = resolve(textures, atlas_texture).ok_or_else(|| {
-                Error::InvalidDescriptor("the font atlas has no bound view".to_owned())
-            })?;
             for run in state.texts.runs() {
                 if state.text_textures.contains_key(&run.texture) {
                     continue;
                 }
+                let view = if run.texture == self.atlas_texture {
+                    self.atlas_view
+                } else {
+                    match state.text_views.get(&run.texture) {
+                        Some(view) => *view,
+                        None => {
+                            let view = resources.create_image_view(&run.texture)?;
+                            state.text_views.insert(run.texture, view);
+                            view
+                        }
+                    }
+                };
                 let group = resources.create_bind_group(
                     self.text.texture_layout(),
                     &[],
-                    &[(0, atlas_view)],
-                    &[(1, sampler)],
+                    &[(0, view)],
+                    &[(1, self.sampler)],
                 )?;
                 state.text_textures.insert(run.texture, group);
             }
@@ -258,15 +385,16 @@ impl SpriteTextOverlay {
     }
 
     /// Drops every GPU resource this overlay owns.
-    pub fn destroy(&mut self, resources: &mut dyn Resources) {
+    pub fn destroy(&self, resources: &mut dyn Resources) {
         let mut guard = self.state();
         guard.destroy_groups(resources);
         resources.destroy_pipeline(self.sprite.pipeline());
-        resources.destroy_shader(self.sprite.vertex_shader());
-        resources.destroy_shader(self.sprite.fragment_shader());
+        resources.destroy_shader(self.sprite.shader());
         resources.destroy_pipeline(self.text.pipeline());
-        resources.destroy_shader(self.text.vertex_shader());
-        resources.destroy_shader(self.text.fragment_shader());
+        resources.destroy_shader(self.text.shader());
+        resources.destroy_texture(self.atlas_texture);
+        resources.destroy_texture(self.white);
+        resources.destroy_sampler(self.sampler);
     }
 
     pub fn sprite_pipeline(&self) -> &QuadPipeline {
@@ -279,6 +407,18 @@ impl SpriteTextOverlay {
 }
 
 impl OverlayPasses for SpriteTextOverlay {
+    fn begin(&self) {
+        SpriteTextOverlay::begin(self);
+    }
+
+    fn edit(&self) {
+        SpriteTextOverlay::edit(self);
+    }
+
+    fn prepare(&self, resources: &mut dyn Resources, view_projection: Mat4) -> Result<(), Error> {
+        SpriteTextOverlay::prepare(self, resources, view_projection)
+    }
+
     fn declare(&self, graph: &mut RenderGraph, targets: &FrameTargets) {
         let state = self.state();
         // Both load the scene colour: the 3D passes wrote it, and the frame's
@@ -363,11 +503,8 @@ impl OverlayPasses for SpriteTextOverlay {
             ))),
         }
     }
-}
 
-fn resolve(textures: &[(Texture, ImageView)], texture: Texture) -> Option<ImageView> {
-    textures
-        .iter()
-        .find(|(candidate, _)| *candidate == texture)
-        .map(|(_, view)| *view)
+    fn destroy(&self, resources: &mut dyn Resources) {
+        SpriteTextOverlay::destroy(self, resources);
+    }
 }

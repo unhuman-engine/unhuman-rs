@@ -2,9 +2,12 @@
 //!
 //! Samples lie in the unit hemisphere about +Z, scaled so later ones cluster near
 //! the origin, which stops a large radius from reading as a uniform grey wash. The
-//! kernel is generated once at pass creation and never changes.
+//! kernel is generated once at pass creation and never changes; each pixel rotates
+//! it about +Z so the reduced sample count reads as noise rather than bands.
 //!
-//! The graph refuses a pass that reads and writes one resource
+//! Occlusion is rendered at half resolution and upsampled with a depth test, so
+//! the quarter of the pixels that dominate the cost disappear without a full-rate
+//! blur. The graph refuses a pass that reads and writes one resource
 //! (`ErrorKind::PassStateConflict`, `compiler.rs:154-171`), so an AO pass cannot
 //! modulate the colour target it just read. The occlusion texture is multiplied in
 //! during composition instead, which also avoids a second full-resolution colour
@@ -13,8 +16,9 @@
 use bytemuck::{Pod, Zeroable};
 use chassis::{BindGroup, CommandList, PassScope, Pipeline};
 
-/// Samples per pixel.
-pub const KERNEL_SIZE: usize = 64;
+/// Samples per pixel. Halved from the full-rate kernel because the rotation and
+/// the depth-aware upsample carry the noise the extra samples used to hide.
+pub const KERNEL_SIZE: usize = 32;
 
 /// Bind group number within the SSAO shader.
 pub const SSAO_SET: u32 = 0;

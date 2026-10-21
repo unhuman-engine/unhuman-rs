@@ -17,15 +17,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chassis::graph::{
-    BufferId, CompiledGraph, ImageState, PassRecorder, PassType, RenderGraph, SlotTable,
+    BufferId, CompiledGraph, ImageState, PassRecorder, PassType, RenderGraph, SlotTable, TextureId,
 };
 use chassis::{
-    BindGroup, Buffer, BufferDesc, BufferUsage, Error, Extent, Extent2d, Gpu, ImageView, Resources,
-    Sampler, SamplerDesc, Texture, TextureDesc, TextureFormat, TextureUsage,
+    BindGroup, BufferDesc, BufferUsage, Error, Extent, Extent2d, Gpu, GpuPassTime, ImageView,
+    Resources, Sampler, SamplerDesc, Submission, Texture, TextureDesc, TextureFormat, TextureUsage,
 };
 use glam::{Mat4, Vec3};
 
+use crate::animation::{animator_from_model, select_clip, Animator, LoopMode};
 use crate::camera::{CameraInput, EditorCamera};
+use crate::frame_ring::{frame_depth, FrameRing};
 use crate::light::{self, LightBuffer, LightData};
 use crate::material::{
     self, CachedTexture, Material, MaterialBinding, MaterialCache, MaterialKey, MaterialTextures,
@@ -35,8 +37,8 @@ use crate::mesh::{self, GpuMesh, MeshCache, MeshKey, VertexLayoutKey};
 use crate::passes::{
     self, uniforms, CompositePass, DrawArena, EditorPass, FrameRecorder, FrameTargets,
     GeometryPass, GridPass, GridUniforms, ImageSet, LineBatch, LinePass, LineUniforms,
-    MaterialPipelines, OverlayPasses, PipelineCache, PipelineKey, PreparedDraw, ReadbackPass,
-    ShaderSet, ShaderVariant, ShadowPass, SsaoPass, SsaoUniforms,
+    MaterialPipelines, OverlayPasses, PaletteSet, PipelineCache, PipelineKey, PreparedDraw,
+    ReadbackPass, ReadbackRing, ShaderSet, ShaderVariant, ShadowPass, SsaoPass, SsaoUniforms,
 };
 
 /// Where the frame's camera comes from.
@@ -82,6 +84,9 @@ struct FrameTextures {
     shadow_view: ImageView,
     ssao: Texture,
     ssao_view: ImageView,
+    /// Half-resolution occlusion, before the depth-aware upsample.
+    ssao_raw: Texture,
+    ssao_raw_view: ImageView,
     /// The composition target when there is no swapchain to present to.
     offscreen: Texture,
     /// Clamped linear: a render target's edge should clamp, not wrap.
@@ -101,6 +106,8 @@ impl FrameTextures {
             shadow_view: ImageView::null(),
             ssao: Texture::null(),
             ssao_view: ImageView::null(),
+            ssao_raw: Texture::null(),
+            ssao_raw_view: ImageView::null(),
             offscreen: Texture::null(),
             sampler: Sampler::null(),
         }
@@ -146,6 +153,13 @@ impl FrameTextures {
         ))?;
         let ssao_view = resources.create_image_view(&ssao)?;
 
+        let ssao_raw = resources.create_texture(TextureDesc::new_2d(
+            Extent::new(width.div_ceil(2), height.div_ceil(2)),
+            TextureFormat::R8Unorm,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
+        ))?;
+        let ssao_raw_view = resources.create_image_view(&ssao_raw)?;
+
         // `TRANSFER_SRC` only matters headless: the readback pass copies this
         // image into a buffer for the CPU, and the graph's barrier for that
         // copy needs the usage declared.
@@ -166,6 +180,8 @@ impl FrameTextures {
             shadow_view,
             ssao,
             ssao_view,
+            ssao_raw,
+            ssao_raw_view,
             offscreen,
             sampler,
         })
@@ -176,14 +192,28 @@ impl FrameTextures {
         resources.destroy_texture(self.depth);
         resources.destroy_texture(self.shadow);
         resources.destroy_texture(self.ssao);
+        resources.destroy_texture(self.ssao_raw);
         resources.destroy_texture(self.offscreen);
         resources.destroy_sampler(self.sampler);
     }
 }
 
+/// One skinned entity: its runtime animator and the palette copied from it each
+/// frame, already in the draw's model space.
+struct SkinnedDraw {
+    animator: Animator,
+    matrices: Vec<[[f32; 4]; 4]>,
+}
+
 /// The renderer frontend. Owned by `BifrostPlugin`, never by `Engine`.
 pub struct Bifrost {
+    /// The device's extent, which is what a resize is detected against.
     extent: Extent2d,
+    /// The extent the frame's targets are created at: `extent` with the width
+    /// rounded up to a multiple of 64 texels, so the readback copy's row pitch
+    /// equals the packed row and no de-pad pass is needed. Equals `extent` at
+    /// every width the copy would not pad.
+    render_extent: Extent2d,
     swapchain_format: TextureFormat,
     /// Whether there is a swapchain to present to. Without one the composition
     /// renders to `textures.offscreen` instead of the backbuffer.
@@ -202,31 +232,58 @@ pub struct Bifrost {
     graph: RenderGraph,
     targets: Option<FrameTargets>,
 
-    frame_set: uniforms::BindSet,
-    shadow_set: uniforms::BindSet,
-    ssao_set: uniforms::BindSet,
+    /// The ring's per-frame data. Each slot's contents were last used `depth`
+    /// frames ago; `render` waits that far before rebuilding them.
+    frame_sets: FrameRing<uniforms::BindSet>,
+    shadow_sets: FrameRing<uniforms::BindSet>,
+    ssao_sets: FrameRing<uniforms::BindSet>,
+    ssao_upsample_sets: FrameRing<uniforms::BindSet>,
     /// The grid's set and the gizmo lines' set: two, because each holds its own
     /// matrices and a pass that bound one buffer for both would draw one of them
     /// through the other's matrix.
-    grid_set: uniforms::BindSet,
-    line_set: uniforms::BindSet,
-    image_set: ImageSet,
-    draw_arena: DrawArena,
+    grid_sets: FrameRing<uniforms::BindSet>,
+    line_sets: FrameRing<uniforms::BindSet>,
+    /// The physics debug view's set, separate from the gizmo's so toggling one
+    /// does not disturb the other's uniforms.
+    debug_sets: FrameRing<uniforms::BindSet>,
+    image_sets: FrameRing<ImageSet>,
+    palette_sets: FrameRing<PaletteSet>,
+    draw_arenas: FrameRing<DrawArena>,
+    /// The submission that wrote each slot, so the next lap waits only for the
+    /// frame that is about to be overwritten.
+    submissions: FrameRing<Option<Submission>>,
 
     mesh_layout: VertexLayoutKey,
+    /// The animators this frame draws, keyed by the entity that owns the mesh.
+    skinned: HashMap<meats::Entity, SkinnedDraw>,
+    /// All attached palettes packed for this frame's draws.
+    frame_palette: Vec<[[f32; 4]; 4]>,
     line_batch: Option<LineBatch>,
+    debug_batch: Option<LineBatch>,
     show_grid: bool,
 
     overlay: Option<Arc<dyn OverlayPasses>>,
     frame_index: u64,
-    /// The buffer the composed frame is copied into and read back from. `None`
+    /// The ring slot this frame uses, chosen (and waited for) before anything
+    /// reads or writes per-frame data.
+    frame_slot: usize,
+    /// The buffers the composed frame is copied into and read back from, as a
+    /// ring so a frame reads its predecessor's frame and not its own. `None`
     /// with a surface -- there is nothing to read back -- or when the device
     /// cannot make a readable buffer.
-    readback: Option<Buffer>,
+    readback: Option<ReadbackRing>,
     /// The last frame read back, or `None` before the first one.
     frame_image: Option<FrameImage>,
     /// Readback failures are logged once, not once per frame.
     readback_warned: bool,
+    /// Whether the frame waits the submission and collects GPU timestamps.
+    gpu_timing: bool,
+    /// The last frame's per-pass times, owned so the panel reads stable names.
+    gpu_passes: Vec<GpuPassTime>,
+    /// The last frame's whole-frame GPU time.
+    gpu_frame_ms: Option<f32>,
+    /// A timing failure is logged once, not once per frame.
+    gpu_timing_warned: bool,
 }
 
 impl Bifrost {
@@ -242,18 +299,22 @@ impl Bifrost {
         // back separately -- puts them at odds with the passes' viewport,
         // headless, where the executor uses the device's own extent.
         let extent = gpu.extent();
+        let render_extent = render_extent_for(extent);
         let swapchain_format = gpu
             .swapchain()
             .map(|swapchain| swapchain.format())
             .unwrap_or(TextureFormat::Bgra8Srgb);
         let has_surface = gpu.swapchain().is_some();
+        let depth = frame_depth(gpu.info().frames_in_flight);
 
         let resources = gpu.resources();
         let shaders = ShaderSet::load(resources)?;
-        let textures = FrameTextures::create(resources, extent, SHADOW_MAP_SIZE, swapchain_format)?;
+        let textures =
+            FrameTextures::create(resources, render_extent, SHADOW_MAP_SIZE, swapchain_format)?;
 
         let mut bifrost = Self {
             extent,
+            render_extent,
             swapchain_format,
             has_surface,
             textures,
@@ -266,27 +327,39 @@ impl Bifrost {
             lights: LightBuffer::new(),
             graph: RenderGraph::new(),
             targets: None,
-            frame_set: uniforms::BindSet::new(),
-            shadow_set: uniforms::BindSet::new(),
-            ssao_set: uniforms::BindSet::new(),
-            grid_set: uniforms::BindSet::new(),
-            line_set: uniforms::BindSet::new(),
-            image_set: ImageSet::new(),
-            draw_arena: DrawArena::new(),
+            frame_sets: FrameRing::new(depth),
+            shadow_sets: FrameRing::new(depth),
+            ssao_sets: FrameRing::new(depth),
+            ssao_upsample_sets: FrameRing::new(depth),
+            grid_sets: FrameRing::new(depth),
+            line_sets: FrameRing::new(depth),
+            debug_sets: FrameRing::new(depth),
+            image_sets: FrameRing::new(depth),
+            palette_sets: FrameRing::new(depth),
+            draw_arenas: FrameRing::new(depth),
+            submissions: FrameRing::new(depth),
             mesh_layout: VertexLayoutKey::of(&mesh::vertex_layout()),
+            skinned: HashMap::new(),
+            frame_palette: Vec::new(),
             line_batch: None,
+            debug_batch: None,
             show_grid: true,
             overlay: None,
             frame_index: 0,
+            frame_slot: 0,
             readback: None,
             frame_image: None,
             readback_warned: false,
+            gpu_timing: false,
+            gpu_passes: Vec::new(),
+            gpu_frame_ms: None,
+            gpu_timing_warned: false,
         };
 
         // The 1x1 textures a material with no map of a kind samples, made once.
         bifrost.textures_by_asset.white(gpu.resources())?;
         bifrost.textures_by_asset.neutral_normal(gpu.resources())?;
-        bifrost.recreate_readback(gpu.resources(), extent);
+        bifrost.recreate_readback(gpu.resources(), render_extent);
 
         Ok(bifrost)
     }
@@ -308,32 +381,55 @@ impl Bifrost {
         self.frame_image.as_ref()
     }
 
-    /// Recreates the readback buffer for `extent`, or drops it when there is a
+    /// Starts collecting per-pass GPU times on the next frame.
+    ///
+    /// Returns `false` when the backend cannot write timestamps; the frame then
+    /// keeps rendering without the wait a collection costs.
+    pub fn enable_gpu_timing(&mut self, gpu: &mut dyn Gpu) -> bool {
+        self.gpu_timing = gpu.enable_gpu_timing();
+        if !self.gpu_timing {
+            self.gpu_passes.clear();
+            self.gpu_frame_ms = None;
+        }
+        self.gpu_timing
+    }
+
+    /// Sets the timing state a caller already negotiated with the device.
+    pub fn set_gpu_timing(&mut self, enabled: bool) {
+        self.gpu_timing = enabled;
+        if !enabled {
+            self.gpu_passes.clear();
+            self.gpu_frame_ms = None;
+        }
+    }
+
+    /// The last frame's per-pass GPU times, empty when timing is off.
+    pub fn gpu_passes(&self) -> &[GpuPassTime] {
+        &self.gpu_passes
+    }
+
+    /// The last frame's whole-frame GPU time, `None` when unavailable.
+    pub fn gpu_frame_ms(&self) -> Option<f32> {
+        self.gpu_frame_ms
+    }
+
+    /// Rebuilds the readback ring for `extent`, or drops it when there is a
     /// surface to present to instead.
     fn recreate_readback(&mut self, resources: &mut dyn Resources, extent: Extent2d) {
         if let Some(old) = self.readback.take() {
-            resources.destroy_buffer(old);
+            old.destroy(resources);
         }
         self.frame_image = None;
         if self.has_surface {
             return;
         }
 
-        // `MAP_READ` is what wgpu needs to map it; Vulkan ignores the flag and
-        // makes the buffer host-visible because it is a transfer destination.
-        // `TRANSFER_DST` is both.
-        //
-        // Sized by the copy's *row pitch*, not by `width * 4`: the copy pads every
-        // row to the alignment, and a width that is not a multiple of 64 texels
-        // gets a longer buffer than the image it carries. `capture_readback`
-        // strips the padding.
-        let pitch = chassis::copy_row_pitch(extent.width.max(1), 4);
-        let size = u64::from(pitch) * u64::from(extent.height.max(1));
-        match resources.create_buffer(
-            BufferDesc::new(size, BufferUsage::TRANSFER_DST | BufferUsage::MAP_READ),
-            None,
-        ) {
-            Ok(buffer) => self.readback = Some(buffer),
+        // Packed, not pitch-sized: `extent` is the render extent, whose width is
+        // a multiple of 64 texels, so the copy's row pitch already equals
+        // `width * 4` and there is no padding to strip.
+        let size = u64::from(extent.width.max(1)) * u64::from(extent.height.max(1)) * 4;
+        match ReadbackRing::new(resources, size) {
+            Ok(ring) => self.readback = Some(ring),
             Err(error) => {
                 // Once, not once per frame: no readable buffer is a property of
                 // the device, and repeating it buries the first line.
@@ -385,6 +481,93 @@ impl Bifrost {
     /// `MeshSample::material` to resolve.
     pub fn set_material(&mut self, id: vault::AssetId, material: Material) {
         self.material_assets.insert(id, material);
+    }
+
+    /// Attaches the model's first skin and clips to `entity`.
+    ///
+    /// `clip` selects by name; when it misses, Idle is preferred and the first
+    /// clip is the fallback. False when the model has no skeleton or animation.
+    pub fn attach_skinned(
+        &mut self,
+        _gpu: &mut dyn Gpu,
+        assets: &vault::Assets,
+        entity: meats::Entity,
+        mesh: vault::AssetId,
+        clip: Option<&str>,
+    ) -> Result<bool, Error> {
+        let (Some(meshes), Some(model)) = (assets.meshes(mesh), assets.model(mesh)) else {
+            return Ok(false);
+        };
+        let Some(mut animator) = animator_from_model(meshes, model) else {
+            return Ok(false);
+        };
+        let Some(index) = select_clip(animator.clips(), clip) else {
+            return Ok(false);
+        };
+        animator.play_animation(index as i32);
+        animator.seek(0.0);
+        let matrices = palette_of(&animator);
+        self.skinned
+            .insert(entity, SkinnedDraw { animator, matrices });
+        Ok(true)
+    }
+
+    /// Whether this entity already has a runtime animator.
+    pub fn is_skinned(&self, entity: meats::Entity) -> bool {
+        self.skinned.contains_key(&entity)
+    }
+
+    /// The palette the last attach or advance produced for `entity`.
+    pub fn skinned_palette(&self, entity: meats::Entity) -> Option<&[[[f32; 4]; 4]]> {
+        self.skinned
+            .get(&entity)
+            .map(|draw| draw.matrices.as_slice())
+    }
+
+    /// Copies playback state from the scene component into the runtime animator.
+    pub fn set_skinned_playback(
+        &mut self,
+        entity: meats::Entity,
+        playing: bool,
+        speed: f32,
+        looping: bool,
+    ) {
+        let Some(draw) = self.skinned.get_mut(&entity) else {
+            return;
+        };
+        if playing {
+            draw.animator.play();
+        } else {
+            draw.animator.pause();
+        }
+        draw.animator.set_time_scale(speed);
+        draw.animator.set_loop_mode(if looping {
+            LoopMode::Loop
+        } else {
+            LoopMode::None
+        });
+    }
+
+    /// Jumps one entity's clip and rebuilds its palette, for scrubbing and tests.
+    pub fn seek_skinned(&mut self, entity: meats::Entity, time: f32) -> bool {
+        let Some(draw) = self.skinned.get_mut(&entity) else {
+            return false;
+        };
+        draw.animator.seek(time);
+        draw.matrices = palette_of(&draw.animator);
+        true
+    }
+
+    /// Advances every attached animator and repacks its palette.
+    ///
+    /// An entity destroyed since the last frame is dropped: its palette has no
+    /// draw to belong to and would otherwise grow the frame buffer forever.
+    pub fn advance_skinned(&mut self, scene: &meats::Scene, dt: f32) {
+        self.skinned.retain(|entity, _| scene.contains(*entity));
+        for draw in self.skinned.values_mut() {
+            draw.animator.update_animation(dt);
+            draw.matrices = palette_of(&draw.animator);
+        }
     }
 
     /// Uploads a mesh if it is not resident. `None` when the asset has no
@@ -454,30 +637,17 @@ impl Bifrost {
         vertices: &[passes::LineVertex],
         indices: &[u32],
     ) -> Result<(), Error> {
-        let resources = gpu.resources();
-        if let Some(batch) = self.line_batch.take() {
-            resources.destroy_buffer(batch.vertex);
-            resources.destroy_buffer(batch.index);
-        }
-        if vertices.is_empty() || indices.is_empty() {
-            return Ok(());
-        }
+        upload_lines(gpu.resources(), &mut self.line_batch, vertices, indices)
+    }
 
-        let (vertex_bytes, index_bytes) = passes::lines::pack(vertices, indices);
-        let vertex = resources.create_buffer(
-            BufferDesc::new(vertex_bytes.len() as u64, BufferUsage::VERTEX),
-            Some(&vertex_bytes),
-        )?;
-        let index = resources.create_buffer(
-            BufferDesc::new(index_bytes.len() as u64, BufferUsage::INDEX),
-            Some(&index_bytes),
-        )?;
-        self.line_batch = Some(LineBatch {
-            vertex,
-            index,
-            index_count: indices.len() as u32,
-        });
-        Ok(())
+    /// Replaces the physics debug batch. An empty batch clears the view.
+    pub fn set_debug_lines(
+        &mut self,
+        gpu: &mut dyn Gpu,
+        vertices: &[passes::LineVertex],
+        indices: &[u32],
+    ) -> Result<(), Error> {
+        upload_lines(gpu.resources(), &mut self.debug_batch, vertices, indices)
     }
 
     /// Advances an editor camera by one frame's input.
@@ -511,14 +681,31 @@ impl Bifrost {
             // frame to skip.
             return Ok(());
         }
+
+        // Before any per-frame GPU data is touched, retire the frame that last
+        // wrote this slot. Slot `f % depth` was used by frame `f - depth`, so
+        // this is the oldest submission and bounds the frames in flight.
+        let slot = (self.frame_index % self.submissions.depth() as u64) as usize;
+        self.submissions.wait(gpu, slot)?;
+        self.frame_slot = slot;
+
         if extent != self.extent {
+            // Resizing destroys textures every in-flight frame may still read,
+            // so this is the one place that waits for the whole ring.
+            self.submissions.wait_all(gpu)?;
+            let render_extent = render_extent_for(extent);
             let resources = gpu.resources();
-            let textures =
-                FrameTextures::create(resources, extent, SHADOW_MAP_SIZE, self.swapchain_format)?;
+            let textures = FrameTextures::create(
+                resources,
+                render_extent,
+                SHADOW_MAP_SIZE,
+                self.swapchain_format,
+            )?;
             let old = std::mem::replace(&mut self.textures, textures);
             old.destroy(resources);
-            self.recreate_readback(resources, extent);
+            self.recreate_readback(resources, render_extent);
             self.extent = extent;
+            self.render_extent = render_extent;
         }
         if let Some(format) = gpu.swapchain().map(|swapchain| swapchain.format()) {
             self.swapchain_format = format;
@@ -528,8 +715,18 @@ impl Bifrost {
         let light_data = light::extract(scene);
         let shadow_matrix = shadow_view_projection(&light_data, camera_position);
 
-        // declare the frame
-        let (targets, readback_slot) = self.declare_frame();
+        // A frame starts by draining what a producer queued since the last one,
+        // so `declare_frame` sees the passes this frame will actually draw.
+        if let Some(overlay) = &self.overlay {
+            overlay.begin();
+            overlay.edit();
+        }
+
+        // declare the frame. The ring slot this frame writes is chosen before the
+        // graph names it, because the readback pass's target has to be in the
+        // frame's slot table.
+        let readback_target = self.readback.as_ref().and_then(ReadbackRing::target);
+        let (targets, ssao_raw, readback_slot) = self.declare_frame(readback_target.is_some());
         self.targets = Some(targets);
 
         let compiled = self
@@ -540,20 +737,33 @@ impl Bifrost {
         // prepare what the recorders read
         let resources = gpu.resources();
 
+        // The overlay's content is laid out in pixels, so it gets its own
+        // screen projection instead of the scene camera's.
+        if let Some(overlay) = &self.overlay {
+            overlay.prepare(
+                resources,
+                passes::overlay::screen_projection(
+                    self.render_extent.width,
+                    self.render_extent.height,
+                ),
+            )?;
+        }
+
         let mut slots = SlotTable::default();
         slots.set_texture(targets.scene_color, self.textures.color);
         slots.set_texture(targets.scene_depth, self.textures.depth);
         slots.set_texture(targets.shadow, self.textures.shadow);
         slots.set_texture(targets.ssao, self.textures.ssao);
+        slots.set_texture(ssao_raw, self.textures.ssao_raw);
         // With a surface, the executor resolves the backbuffer slot from the
         // acquired swapchain image. Headless, nothing can, so bind the offscreen
         // target here.
         if !self.has_surface {
             slots.set_texture(targets.backbuffer, self.textures.offscreen);
         }
-        // The readback pass writes this buffer; the graph named it, the slot
-        // table turns the name into the handle.
-        if let (Some(buffer), Some(slot)) = (self.readback, readback_slot) {
+        // The readback pass writes this frame's ring buffer; the graph named it,
+        // the slot table turns the name into the handle.
+        if let (Some(buffer), Some(slot)) = (readback_target, readback_slot) {
             slots.set_buffer(slot, buffer);
         }
 
@@ -565,7 +775,7 @@ impl Bifrost {
             light_count,
             true,
         );
-        let frame_group = self.frame_set.rebuild(
+        let frame_group = self.frame_sets.get_mut(slot).rebuild(
             resources,
             &passes::pipeline::frame_layout(),
             &frame_uniforms,
@@ -575,72 +785,126 @@ impl Bifrost {
         )?;
 
         let draws = self.prepare_draws(resources, scene, camera_position)?;
+        let palette_group = self.palette_sets.get_mut(slot).rebuild(
+            resources,
+            &passes::pipeline::palette_layout(),
+            &self.frame_palette,
+        )?;
         let recorder = self.build_recorders(
             resources,
             &compiled,
             shadow_matrix,
             view_projection,
             &frame_group,
+            &palette_group,
             draws,
         )?;
 
-        // run the frame
-        self.frame_index += 1;
         // One trait object: the backend owns the command lists and may record the
         // passes on worker threads.
         let recorder: Arc<dyn PassRecorder> = recorder;
-        gpu.record_frame(&compiled, &slots, recorder)?;
+        let submission = gpu.record_frame(&compiled, &slots, recorder)?;
 
-        // `record_frame` submitted and waited, so the copy into the readback
-        // buffer has retired and it is safe to map.
+        if self.gpu_timing {
+            // Timestamps are readable only after the frame that wrote them has
+            // retired, so profiling trades this wait for the per-pass split.
+            let collected = gpu
+                .wait_for_submission(submission.clone())
+                .and_then(|()| gpu.collect_gpu_timings());
+            match collected {
+                Ok(()) => {
+                    self.gpu_passes.clear();
+                    self.gpu_passes.extend_from_slice(gpu.gpu_timings());
+                    self.gpu_frame_ms = gpu.gpu_frame_ms();
+                }
+                Err(error) => {
+                    self.gpu_passes.clear();
+                    self.gpu_frame_ms = None;
+                    if !self.gpu_timing_warned {
+                        log::warn!("bifrost: GPU timings unavailable ({error})");
+                        self.gpu_timing_warned = true;
+                    }
+                }
+            }
+        }
+
+        // The ring now owns this slot until the wait at the next lap. The
+        // readback ring gets its own clone for its older, scoped read.
+        self.submissions.record(slot, submission.clone());
+        self.frame_index += 1;
+        if let Some(ring) = self.readback.as_mut() {
+            ring.record_submission(submission);
+        }
+
+        // The frame just submitted wrote `readback_target`; this reads the ring
+        // slot `READBACK_LAG` submissions behind it, so the map does not wait on
+        // this frame's own copy.
         self.capture_readback(gpu);
 
         Ok(())
     }
 
-    /// Reads this frame's composition back into `frame_image`.
+    /// Reads the ring slot written [`passes::READBACK_LAG`] submissions ago into
+    /// `frame_image`.
     ///
-    /// Does nothing without a readback buffer: a surface already has the frame.
+    /// Does nothing without a ring: a surface already has the frame. During the
+    /// ring's first `READBACK_LAG` frames there is no retired slot to read, so
+    /// the frame stays on the GPU until the ring has filled.
     fn capture_readback(&mut self, gpu: &mut dyn Gpu) {
-        let Some(buffer) = self.readback else {
+        let Some(ring) = self.readback.as_mut() else {
             return;
         };
-        let extent = self.extent;
-        let pitch = chassis::copy_row_pitch(extent.width, 4) as usize;
-        let packed = extent.width as usize * 4;
-        let height = extent.height as usize;
+        let extent = self.render_extent;
+        let packed = extent.width as usize * extent.height as usize * 4;
 
-        match gpu.resources().read_buffer(&buffer) {
-            Ok(bgra) if bgra.len() >= pitch * height => {
-                self.frame_image = Some(FrameImage {
-                    width: extent.width,
-                    height: extent.height,
-                    bgra: strip_copy_padding(&bgra, pitch, packed, height),
-                });
-            }
-            Ok(bgra) => {
-                if !self.readback_warned {
-                    log::warn!(
-                        "bifrost: readback returned {} bytes for a {}x{} frame",
-                        bgra.len(),
-                        extent.width,
-                        extent.height
-                    );
-                    self.readback_warned = true;
+        if let Some((buffer, frame)) = ring.readable() {
+            // Wait only for the submission that wrote this slot, not for the one
+            // just issued: that is the whole overlap.
+            let read = match ring.submission(frame) {
+                Some(submission) => gpu.resources().read_buffer_after(&buffer, submission),
+                None => gpu.resources().read_buffer(&buffer),
+            };
+            match read {
+                Ok(bgra) if bgra.len() >= packed => {
+                    // Packed, because the render width is a multiple of 64
+                    // texels: the copy's pitch equals the packed row.
+                    self.frame_image = Some(FrameImage {
+                        width: extent.width,
+                        height: extent.height,
+                        bgra: bgra[..packed].to_vec(),
+                    });
                 }
-            }
-            Err(error) => {
-                if !self.readback_warned {
-                    log::warn!("bifrost: readback failed ({error}); the frame stays on the GPU");
-                    self.readback_warned = true;
+                Ok(bgra) => {
+                    if !self.readback_warned {
+                        log::warn!(
+                            "bifrost: readback returned {} bytes for a {}x{} frame",
+                            bgra.len(),
+                            extent.width,
+                            extent.height
+                        );
+                        self.readback_warned = true;
+                    }
+                }
+                Err(error) => {
+                    if !self.readback_warned {
+                        log::warn!(
+                            "bifrost: readback failed ({error}); the frame stays on the GPU"
+                        );
+                        self.readback_warned = true;
+                    }
                 }
             }
         }
+
+        // One step per frame that used a target, whether or not it was readable.
+        ring.advance();
     }
 
     /// Declares this frame's resources and passes.
-    fn declare_frame(&mut self) -> (FrameTargets, Option<BufferId>) {
-        let readback_enabled = self.readback.is_some();
+    ///
+    /// `readback` is whether this frame has a ring slot to copy into, which the
+    /// readback pass is declared against.
+    fn declare_frame(&mut self, readback: bool) -> (FrameTargets, TextureId, Option<BufferId>) {
         let graph = &mut self.graph;
         graph.reset();
 
@@ -657,6 +921,8 @@ impl Bifrost {
         let shadow =
             graph.import_texture("shadow.map", ImageState::Undefined, ImageState::ShaderRead);
         let ssao = graph.import_texture("ssao.ao", ImageState::Undefined, ImageState::ShaderRead);
+        let ssao_raw =
+            graph.import_texture("ssao.raw", ImageState::Undefined, ImageState::ShaderRead);
         // Present only when there is a swapchain. Headless, the composition ends
         // at a colour state, so the backend sees no backbuffer slot to acquire
         // and draws to the offscreen target instead.
@@ -684,10 +950,16 @@ impl Bifrost {
             .depth(scene_depth, 1.0)
             .read_texture(shadow);
 
-        // Ambient occlusion, from the depth the opaque pass wrote.
+        // Ambient occlusion at half rate, from the depth the opaque pass wrote,
+        // then a depth-aware upsample into the texture composition reads.
         graph
             .pass(passes::PASS_SSAO)
+            .color(ssao_raw, [1.0, 1.0, 1.0, 1.0])
+            .read_texture(scene_depth);
+        graph
+            .pass(passes::PASS_SSAO_UPSAMPLE)
             .color(ssao, [1.0, 1.0, 1.0, 1.0])
+            .read_texture(ssao_raw)
             .read_texture(scene_depth);
 
         // The editor's grid and gizmos, blended, after the scene. The scene depth
@@ -723,7 +995,7 @@ impl Bifrost {
         // present it to. Declared after the composition so it reads the final
         // image, and as a transfer pass so the graph emits the image-to-buffer
         // barrier that `vkCmdCopyImageToBuffer` needs.
-        let readback = readback_enabled.then(|| {
+        let readback = readback.then(|| {
             let buffer = graph.import_buffer("readback");
             graph
                 .pass(passes::PASS_READBACK)
@@ -733,7 +1005,7 @@ impl Bifrost {
             buffer
         });
 
-        (targets, readback)
+        (targets, ssao_raw, readback)
     }
 
     /// Turns the scene's meshes into draws, and uploads their uniforms.
@@ -743,6 +1015,7 @@ impl Bifrost {
         scene: &meats::Scene,
         camera_position: Vec3,
     ) -> Result<Vec<PreparedDraw>, Error> {
+        let slot = self.frame_slot;
         struct Pending {
             mesh: GpuMesh,
             material: Option<MaterialBinding>,
@@ -753,6 +1026,7 @@ impl Bifrost {
 
         let mut blocks: Vec<Vec<u8>> = Vec::new();
         let mut pending: Vec<Pending> = Vec::new();
+        let mut palette: Vec<[[f32; 4]; 4]> = Vec::new();
 
         for sample in scene.meshes() {
             let Some(mesh) = self
@@ -774,11 +1048,20 @@ impl Bifrost {
 
             let material_binding = self.material_binding(resources, &material, variant)?;
 
+            let (palette_first, palette_count) = match self.skinned.get(&sample.entity) {
+                Some(draw) => {
+                    let first = palette.len() as u32;
+                    palette.extend_from_slice(&draw.matrices);
+                    (first, draw.matrices.len() as u32)
+                }
+                None => (0, 0),
+            };
             let uniforms = uniforms::DrawUniforms::new(
                 sample.transform.to_cols_array_2d(),
                 sample.tint.to_array(),
                 entity_id(sample.entity),
-            );
+            )
+            .with_palette(palette_first, palette_count);
             let block = blocks.len();
             blocks.push(bytemuck::bytes_of(&uniforms).to_vec());
 
@@ -791,8 +1074,12 @@ impl Bifrost {
             });
         }
 
-        self.draw_arena
-            .begin(resources, &passes::pipeline::draw_layout(), &blocks)?;
+        self.draw_arenas.get_mut(slot).begin(
+            resources,
+            &passes::pipeline::draw_layout(),
+            &blocks,
+        )?;
+        self.frame_palette = palette;
 
         // The material slot is a stable per-material id, which makes it usable
         // as a sort key; the mesh is keyed by its vertex handle.
@@ -824,7 +1111,7 @@ impl Bifrost {
             .filter_map(|draw| {
                 Some(PreparedDraw {
                     mesh: draw.mesh,
-                    uniforms: self.draw_arena.group(draw.block)?,
+                    uniforms: self.draw_arenas.get(slot).group(draw.block)?,
                     material: draw.material.map(|binding| binding.group),
                     variant: draw.variant,
                 })
@@ -875,6 +1162,7 @@ impl Bifrost {
     }
 
     /// Builds every pass's recorder for this frame.
+    #[allow(clippy::too_many_arguments)]
     fn build_recorders(
         &mut self,
         resources: &mut dyn Resources,
@@ -882,8 +1170,10 @@ impl Bifrost {
         shadow_matrix: Mat4,
         view_projection: Mat4,
         frame_group: &BindGroup,
+        palette_group: &BindGroup,
         draws: Vec<PreparedDraw>,
     ) -> Result<Arc<FrameRecorder>, Error> {
+        let slot = self.frame_slot;
         let samples = chassis::SampleCount::X1;
         let color = TextureFormat::Rgba8Srgb;
         let depth = TextureFormat::Depth32Float;
@@ -896,7 +1186,7 @@ impl Bifrost {
                 &self.shaders,
             )?;
             let uniforms = uniforms::ShadowUniforms::new(shadow_matrix.to_cols_array_2d());
-            let group = self.shadow_set.rebuild(
+            let group = self.shadow_sets.get_mut(slot).rebuild(
                 resources,
                 &passes::pipeline::shadow_layout(),
                 &uniforms,
@@ -912,7 +1202,12 @@ impl Bifrost {
                 .copied()
                 .filter(|draw| !draw.transparent())
                 .collect();
-            recorder.shadow = Some(ShadowPass::new(pipeline, group, shadow_draws));
+            recorder.shadow = Some(ShadowPass::new(
+                pipeline,
+                group,
+                *palette_group,
+                shadow_draws,
+            ));
         }
 
         if compiled.find(passes::PASS_OPAQUE).is_some() {
@@ -943,7 +1238,12 @@ impl Bifrost {
                     &self.shaders,
                 )?,
             };
-            recorder.geometry = Some(GeometryPass::new(pipelines, *frame_group, draws));
+            recorder.geometry = Some(GeometryPass::new(
+                pipelines,
+                *frame_group,
+                *palette_group,
+                draws,
+            ));
         }
 
         if compiled.find(passes::PASS_SSAO).is_some() {
@@ -960,7 +1260,7 @@ impl Bifrost {
                 passes::ssao::DEFAULT_BIAS,
                 passes::ssao::DEFAULT_POWER,
             );
-            let group = self.ssao_set.rebuild(
+            let group = self.ssao_sets.get_mut(slot).rebuild(
                 resources,
                 &passes::pipeline::ssao_layout(),
                 &uniforms,
@@ -969,6 +1269,28 @@ impl Bifrost {
                 &[(2, self.textures.sampler)],
             )?;
             recorder.ssao = Some(SsaoPass::new(pipeline, group));
+
+            let upsample = self.pipelines.get_or_create(
+                resources,
+                PipelineKey::fullscreen(
+                    ShaderVariant::SsaoUpsample,
+                    TextureFormat::R8Unorm,
+                    samples,
+                ),
+                &self.shaders,
+            )?;
+            let upsample_group = self.ssao_upsample_sets.get_mut(slot).rebuild(
+                resources,
+                &passes::pipeline::ssao_upsample_layout(),
+                &uniforms,
+                &[],
+                &[
+                    (1, self.textures.depth_view),
+                    (3, self.textures.ssao_raw_view),
+                ],
+                &[(2, self.textures.sampler)],
+            )?;
+            recorder.ssao_upsample = Some(SsaoPass::new(upsample, upsample_group));
         }
 
         if compiled.find(passes::PASS_EDITOR).is_some() {
@@ -979,7 +1301,7 @@ impl Bifrost {
                     &self.shaders,
                 )?;
                 let uniforms = GridUniforms::new(view_projection.to_cols_array_2d());
-                let group = self.grid_set.rebuild(
+                let group = self.grid_sets.get_mut(slot).rebuild(
                     resources,
                     &passes::pipeline::grid_layout(),
                     &uniforms,
@@ -1003,7 +1325,7 @@ impl Bifrost {
                         view_projection.to_cols_array_2d(),
                         Mat4::IDENTITY.to_cols_array_2d(),
                     );
-                    let group = self.line_set.rebuild(
+                    let group = self.line_sets.get_mut(slot).rebuild(
                         resources,
                         &passes::pipeline::line_layout(),
                         &uniforms,
@@ -1016,8 +1338,32 @@ impl Bifrost {
                 None => None,
             };
 
-            if grid.is_some() || lines.is_some() {
-                recorder.editor = Some(EditorPass::new(grid, lines));
+            let debug = match self.debug_batch {
+                Some(batch) => {
+                    let pipeline = self.pipelines.get_or_create(
+                        resources,
+                        PipelineKey::lines(color, depth, samples),
+                        &self.shaders,
+                    )?;
+                    let uniforms = LineUniforms::new(
+                        view_projection.to_cols_array_2d(),
+                        Mat4::IDENTITY.to_cols_array_2d(),
+                    );
+                    let group = self.debug_sets.get_mut(slot).rebuild(
+                        resources,
+                        &passes::pipeline::line_layout(),
+                        &uniforms,
+                        &[],
+                        &[],
+                        &[],
+                    )?;
+                    Some(LinePass::new(pipeline, group, batch))
+                }
+                None => None,
+            };
+
+            if grid.is_some() || lines.is_some() || debug.is_some() {
+                recorder.editor = Some(EditorPass::new(grid, lines, debug));
             }
         }
 
@@ -1027,7 +1373,7 @@ impl Bifrost {
                 PipelineKey::fullscreen(ShaderVariant::Composite, self.swapchain_format, samples),
                 &self.shaders,
             )?;
-            let group = self.image_set.rebuild(
+            let group = self.image_sets.get_mut(slot).rebuild(
                 resources,
                 &passes::pipeline::composite_layout(),
                 &[(0, self.textures.color_view), (1, self.textures.ssao_view)],
@@ -1037,7 +1383,8 @@ impl Bifrost {
         }
 
         if compiled.find(passes::PASS_READBACK).is_some() {
-            if let Some(target) = self.readback {
+            // The same pure lookup the slot table used: no advance between them.
+            if let Some(target) = self.readback.as_ref().and_then(ReadbackRing::target) {
                 recorder.readback = Some(ReadbackPass {
                     source: self.textures.offscreen,
                     target,
@@ -1051,25 +1398,60 @@ impl Bifrost {
 
     /// Drops every GPU resource this renderer owns.
     pub fn destroy(&mut self, gpu: &mut dyn Gpu) {
+        // Freeing a resource the GPU may still read is invalid usage on both
+        // backends, so the ring's newest submissions are retired first.
+        if let Err(error) = self.submissions.wait_all(gpu) {
+            log::warn!("bifrost: destroying with submissions still in flight: {error}");
+        }
         let resources = gpu.resources();
+        if let Some(overlay) = &self.overlay {
+            overlay.destroy(resources);
+        }
         self.meshes.clear(resources);
         self.materials.clear(resources);
         self.textures_by_asset.clear(resources);
         self.pipelines.clear(resources);
         self.lights.destroy(resources);
-        self.frame_set.destroy(resources);
-        self.shadow_set.destroy(resources);
-        self.ssao_set.destroy(resources);
-        self.grid_set.destroy(resources);
-        self.line_set.destroy(resources);
-        self.image_set.destroy(resources);
-        self.draw_arena.destroy(resources);
+        for set in self.frame_sets.iter_mut() {
+            set.destroy(resources);
+        }
+        for set in self.shadow_sets.iter_mut() {
+            set.destroy(resources);
+        }
+        for set in self.ssao_sets.iter_mut() {
+            set.destroy(resources);
+        }
+        for set in self.ssao_upsample_sets.iter_mut() {
+            set.destroy(resources);
+        }
+        for set in self.grid_sets.iter_mut() {
+            set.destroy(resources);
+        }
+        for set in self.line_sets.iter_mut() {
+            set.destroy(resources);
+        }
+        for set in self.debug_sets.iter_mut() {
+            set.destroy(resources);
+        }
+        for set in self.image_sets.iter_mut() {
+            set.destroy(resources);
+        }
+        for set in self.palette_sets.iter_mut() {
+            set.destroy(resources);
+        }
+        for arena in self.draw_arenas.iter_mut() {
+            arena.destroy(resources);
+        }
         if let Some(batch) = self.line_batch.take() {
             resources.destroy_buffer(batch.vertex);
             resources.destroy_buffer(batch.index);
         }
-        if let Some(buffer) = self.readback.take() {
-            resources.destroy_buffer(buffer);
+        if let Some(batch) = self.debug_batch.take() {
+            resources.destroy_buffer(batch.vertex);
+            resources.destroy_buffer(batch.index);
+        }
+        if let Some(ring) = self.readback.take() {
+            ring.destroy(resources);
         }
         self.shaders.destroy(resources);
         let textures = std::mem::replace(&mut self.textures, FrameTextures::null());
@@ -1077,18 +1459,58 @@ impl Bifrost {
     }
 }
 
-/// Copies the rows of a padded readback into a tightly packed image.
-///
-/// A copy's rows are padded to [`chassis::COPY_BYTES_PER_ROW_ALIGNMENT`] and
-/// [`FrameImage`] promises a packed buffer -- `width * height * 4` bytes, which
-/// is what a caller turns into an image -- so the padding comes off here, once,
-/// rather than in every consumer.
-fn strip_copy_padding(bytes: &[u8], pitch: usize, packed: usize, height: usize) -> Vec<u8> {
-    let mut image = Vec::with_capacity(packed * height);
-    for row in bytes.chunks_exact(pitch).take(height) {
-        image.extend_from_slice(&row[..packed]);
+/// Replaces one line batch's buffers, releasing the previous pair first.
+fn upload_lines(
+    resources: &mut dyn Resources,
+    batch: &mut Option<LineBatch>,
+    vertices: &[passes::LineVertex],
+    indices: &[u32],
+) -> Result<(), Error> {
+    if let Some(old) = batch.take() {
+        resources.destroy_buffer(old.vertex);
+        resources.destroy_buffer(old.index);
     }
-    image
+    if vertices.is_empty() || indices.is_empty() {
+        return Ok(());
+    }
+
+    let (vertex_bytes, index_bytes) = passes::lines::pack(vertices, indices);
+    let vertex = resources.create_buffer(
+        BufferDesc::new(vertex_bytes.len() as u64, BufferUsage::VERTEX),
+        Some(&vertex_bytes),
+    )?;
+    let index = resources.create_buffer(
+        BufferDesc::new(index_bytes.len() as u64, BufferUsage::INDEX),
+        Some(&index_bytes),
+    )?;
+    *batch = Some(LineBatch {
+        vertex,
+        index,
+        index_count: indices.len() as u32,
+    });
+    Ok(())
+}
+
+/// Packs an animator's current bone matrices for the GPU.
+fn palette_of(animator: &Animator) -> Vec<[[f32; 4]; 4]> {
+    animator
+        .final_bone_matrices()
+        .iter()
+        .map(|matrix| matrix.to_cols_array_2d())
+        .collect()
+}
+
+/// The extent the frame's targets are created at.
+///
+/// The width is rounded up to a multiple of 64 texels -- the copy alignment of
+/// [`chassis::COPY_BYTES_PER_ROW_ALIGNMENT`] in four-byte texels -- so the
+/// readback copy's row pitch equals `width * 4` and there is no padding to
+/// strip. The height is unchanged: rows, not columns, are padded.
+fn render_extent_for(extent: Extent2d) -> Extent2d {
+    Extent2d {
+        width: chassis::copy_row_pitch(extent.width.max(1), 4) / 4,
+        height: extent.height.max(1),
+    }
 }
 
 /// The view-projection and the camera's world position for this frame.

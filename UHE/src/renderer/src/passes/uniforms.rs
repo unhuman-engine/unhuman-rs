@@ -1,19 +1,19 @@
 //! The uniform blocks the shaders read, and the buffers they live in.
 //!
-//! Push constants are not usable through this RHI: `PipelineDesc` has no
-//! push-constant range, the Vulkan pipeline declares `push_constant_ranges(&[])`
-//! so any `vkCmdPushConstants` is a validation error, and wgpu's
-//! `CommandList::set_push_constants` is `unimplemented!()`, which panics rather
-//! than pushing anything. The renderer never calls it, so the same values travel
-//! as uniform buffers bound through a descriptor set.
+//! Push constants are not usable through this RHI: neither `PipelineDesc` nor
+//! `ComputePipelineDesc` declares a push-constant range, so Vulkan has nothing
+//! to address, and wgpu has no push constants at all. `set_push_constants`
+//! reports `Unsupported` on both. The same values travel as uniform buffers
+//! bound through a descriptor set.
 //!
 //! Per-draw uniforms live in one arena: [`DrawArena`] keeps a single buffer and
 //! one bind group per offset across frames, refilled through
 //! [`chassis::Resources::write_buffer`]. Re-creating the buffer and its sets every
 //! frame -- the only option while the RHI had no in-place write -- cost one
 //! allocation and one group per draw, which was the per-draw CPU cost. The
-//! frame-wide sets ([`BindSet`], [`ImageSet`]) are still rebuilt each frame;
-//! there are a handful of them, not one per draw.
+//! frame-wide sets ([`BindSet`], [`ImageSet`]) are rebuilt only when their inputs
+//! change: a steady frame with identical uniforms and the same bound resources
+//! allocates nothing.
 
 use bytemuck::{Pod, Zeroable};
 use chassis::{
@@ -92,7 +92,8 @@ pub struct DrawUniforms {
     pub model: [[f32; 4]; 4],
     /// The entity's tint.
     pub tint: [f32; 4],
-    /// `x` = entity id, `y` = use vertex colour, `z`/`w` unused.
+    /// `x` = entity id, `y` = use vertex colour, `z` = first palette matrix,
+    /// `w` = palette matrix count (0 for an unskinned draw).
     pub params: [f32; 4],
 }
 
@@ -104,16 +105,42 @@ impl DrawUniforms {
             params: [entity_id as f32, 0.0, 0.0, 0.0],
         }
     }
+
+    /// Points the shader at a contiguous range of the frame's palette.
+    pub fn with_palette(mut self, first: u32, count: u32) -> Self {
+        self.params[2] = first as f32;
+        self.params[3] = count as f32;
+        self
+    }
+}
+
+/// The inputs a [`BindSet`] was last built from. Identical inputs mean the
+/// existing buffer and group still describe the set, so nothing is rebuilt.
+///
+/// The uniform bytes are compared, not the values that produced them: two
+/// cameras at the same position produce identical matrices and the same set.
+#[derive(Clone, PartialEq)]
+struct BindSetKey {
+    layout: DescriptorSetLayoutDesc,
+    bytes: Vec<u8>,
+    /// The caller's extra buffers by binding number; the set's own uniform is
+    /// binding 0 and is not part of the inputs.
+    buffers: Vec<(u32, Buffer, u64)>,
+    images: Vec<(u32, ImageView)>,
+    samplers: Vec<(u32, Sampler)>,
 }
 
 /// One descriptor set whose contents are uploaded as a unit: a uniform block, plus
 /// whatever else its layout binds.
 ///
-/// Rebuilt rather than written into, for the reason in this module's header; the
-/// previous buffer and group are released before the new ones are made.
+/// The buffer and group are kept while their inputs are unchanged; a new set is
+/// made only when the uniform bytes or a bound resource differ, and then the
+/// previous pair is released first.
 pub struct BindSet {
     buffer: Option<Buffer>,
     group: Option<BindGroup>,
+    /// The inputs the live buffer and group were built from.
+    key: Option<BindSetKey>,
 }
 
 impl BindSet {
@@ -121,11 +148,15 @@ impl BindSet {
         Self {
             buffer: None,
             group: None,
+            key: None,
         }
     }
 
     /// Uploads the block and binds it together with `buffers`, `images` and
     /// `samplers`, addressed by binding number.
+    ///
+    /// A rebuild with the same inputs as the last one returns the existing group
+    /// and creates nothing.
     pub fn rebuild<T: Pod>(
         &mut self,
         resources: &mut dyn Resources,
@@ -135,9 +166,20 @@ impl BindSet {
         images: &[(u32, ImageView)],
         samplers: &[(u32, Sampler)],
     ) -> Result<BindGroup, chassis::Error> {
+        let bytes = bytemuck::bytes_of(value);
+        let key = BindSetKey {
+            layout: layout.clone(),
+            bytes: bytes.to_vec(),
+            buffers: buffers.to_vec(),
+            images: images.to_vec(),
+            samplers: samplers.to_vec(),
+        };
+        if self.key.as_ref() == Some(&key) {
+            return Ok(self.group.expect("a cached key has a live group"));
+        }
+
         self.destroy(resources);
 
-        let bytes = bytemuck::bytes_of(value);
         let buffer = resources.create_buffer(
             BufferDesc::new(bytes.len() as u64, BufferUsage::UNIFORM),
             Some(bytes),
@@ -145,12 +187,14 @@ impl BindSet {
 
         // The set's own uniform is binding 0, which is what every layout here
         // declares.
-        let mut entries = vec![(0u32, buffer, 0u64)];
+        let mut entries = Vec::with_capacity(buffers.len() + 1);
+        entries.push((0u32, buffer, 0u64));
         entries.extend_from_slice(buffers);
 
         let group = resources.create_bind_group(layout, &entries, images, samplers)?;
         self.buffer = Some(buffer);
         self.group = Some(group);
+        self.key = Some(key);
         Ok(group)
     }
 
@@ -165,6 +209,7 @@ impl BindSet {
         if let Some(buffer) = self.buffer.take() {
             resources.destroy_buffer(buffer);
         }
+        self.key = None;
     }
 }
 
@@ -182,13 +227,28 @@ impl Default for BindSet {
 /// cannot accept.
 pub struct ImageSet {
     group: Option<BindGroup>,
+    /// The layout and resources the live group was built from.
+    key: Option<ImageSetKey>,
+}
+
+/// The inputs an [`ImageSet`] was last built from.
+#[derive(Clone, PartialEq)]
+struct ImageSetKey {
+    layout: DescriptorSetLayoutDesc,
+    images: Vec<(u32, ImageView)>,
+    samplers: Vec<(u32, Sampler)>,
 }
 
 impl ImageSet {
     pub fn new() -> Self {
-        Self { group: None }
+        Self {
+            group: None,
+            key: None,
+        }
     }
 
+    /// A rebuild with the same layout and resources returns the existing group
+    /// and creates nothing.
     pub fn rebuild(
         &mut self,
         resources: &mut dyn Resources,
@@ -196,9 +256,19 @@ impl ImageSet {
         images: &[(u32, ImageView)],
         samplers: &[(u32, Sampler)],
     ) -> Result<BindGroup, chassis::Error> {
+        let key = ImageSetKey {
+            layout: layout.clone(),
+            images: images.to_vec(),
+            samplers: samplers.to_vec(),
+        };
+        if self.key.as_ref() == Some(&key) {
+            return Ok(self.group.expect("a cached key has a live group"));
+        }
+
         self.destroy(resources);
         let group = resources.create_bind_group(layout, &[], images, samplers)?;
         self.group = Some(group);
+        self.key = Some(key);
         Ok(group)
     }
 
@@ -210,10 +280,99 @@ impl ImageSet {
         if let Some(group) = self.group.take() {
             resources.destroy_bind_group(group);
         }
+        self.key = None;
     }
 }
 
 impl Default for ImageSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The frame's skin matrices, bound as one storage buffer.
+///
+/// A frame with no skinned draws still binds one identity: the pipeline layout
+/// has the set, and a zero-sized buffer is not a descriptor a backend accepts.
+pub struct PaletteSet {
+    buffer: Option<Buffer>,
+    capacity: u64,
+    group: Option<BindGroup>,
+    layout: Option<DescriptorSetLayoutDesc>,
+}
+
+impl PaletteSet {
+    pub fn new() -> Self {
+        Self {
+            buffer: None,
+            capacity: 0,
+            group: None,
+            layout: None,
+        }
+    }
+
+    /// Uploads this frame's palette and returns its group.
+    pub fn rebuild(
+        &mut self,
+        resources: &mut dyn Resources,
+        layout: &DescriptorSetLayoutDesc,
+        matrices: &[[[f32; 4]; 4]],
+    ) -> Result<BindGroup, chassis::Error> {
+        let identity: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let count = matrices.len().max(1);
+        let needed = count as u64 * std::mem::size_of::<[[f32; 4]; 4]>() as u64;
+
+        let layout_changed = self.layout.as_ref() != Some(layout);
+        let grown = self.buffer.is_none() || self.capacity < needed;
+        if layout_changed || grown {
+            if let Some(group) = self.group.take() {
+                resources.destroy_bind_group(group);
+            }
+            if let Some(buffer) = self.buffer.take() {
+                resources.destroy_buffer(buffer);
+            }
+            let buffer = resources.create_buffer(
+                BufferDesc::new(needed, BufferUsage::STORAGE | BufferUsage::TRANSFER_DST),
+                None,
+            )?;
+            self.buffer = Some(buffer);
+            self.capacity = needed;
+            self.layout = Some(layout.clone());
+        }
+
+        let buffer = self.buffer.expect("created above when absent");
+        if matrices.is_empty() {
+            resources.write_buffer(&buffer, 0, bytemuck::bytes_of(&identity))?;
+        } else {
+            resources.write_buffer(&buffer, 0, bytemuck::cast_slice(matrices))?;
+        }
+
+        if let Some(group) = self.group {
+            return Ok(group);
+        }
+        let group = resources.create_bind_group(layout, &[(0, buffer, 0)], &[], &[])?;
+        self.group = Some(group);
+        Ok(group)
+    }
+
+    pub fn destroy(&mut self, resources: &mut dyn Resources) {
+        if let Some(group) = self.group.take() {
+            resources.destroy_bind_group(group);
+        }
+        if let Some(buffer) = self.buffer.take() {
+            resources.destroy_buffer(buffer);
+        }
+        self.capacity = 0;
+        self.layout = None;
+    }
+}
+
+impl Default for PaletteSet {
     fn default() -> Self {
         Self::new()
     }

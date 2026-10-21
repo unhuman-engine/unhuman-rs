@@ -19,6 +19,8 @@ use crate::mesh::{self, VertexLayoutKey};
 pub const FRAME_SET: u32 = 0;
 pub const MATERIAL_SET: u32 = 1;
 pub const DRAW_SET: u32 = 2;
+/// The model pipeline's skin palette, after the per-draw set.
+pub const PALETTE_SET: u32 = 3;
 
 /// The shader sources, embedded rather than resolved at run time.
 ///
@@ -27,6 +29,7 @@ pub const DRAW_SET: u32 = 2;
 pub const MODEL_WGSL: &str = include_str!("../../assets/shaders/model.wgsl");
 pub const DEPTH_WGSL: &str = include_str!("../../assets/shaders/depth.wgsl");
 pub const SSAO_WGSL: &str = include_str!("../../assets/shaders/ssao.wgsl");
+pub const SSAO_UPSAMPLE_WGSL: &str = include_str!("../../assets/shaders/ssao_upsample.wgsl");
 pub const GRID_WGSL: &str = include_str!("../../assets/shaders/grid.wgsl");
 pub const LINE_WGSL: &str = include_str!("../../assets/shaders/line.wgsl");
 pub const COMPOSITE_WGSL: &str = include_str!("../../assets/shaders/composite.wgsl");
@@ -90,6 +93,15 @@ pub fn draw_layout() -> DescriptorSetLayoutDesc {
     ))
 }
 
+/// The skin palette: every bone matrix the frame's skinned draws can index.
+pub fn palette_layout() -> DescriptorSetLayoutDesc {
+    DescriptorSetLayoutDesc::new("palette").with(binding(
+        0,
+        DescriptorKind::StorageBuffer,
+        StageMask::of(ShaderStage::Vertex),
+    ))
+}
+
 /// The prepass's set: the light-space view-projection. Vertex stage only; the
 /// depth pipeline has no fragment stage at all.
 pub fn shadow_layout() -> DescriptorSetLayoutDesc {
@@ -127,6 +139,17 @@ pub fn ssao_layout() -> DescriptorSetLayoutDesc {
         .with(binding(2, DescriptorKind::Sampler, fragment))
 }
 
+/// The upsample pass's set: the same kernel and depth as SSAO, plus the
+/// half-resolution occlusion it reads.
+pub fn ssao_upsample_layout() -> DescriptorSetLayoutDesc {
+    let fragment = StageMask::of(ShaderStage::Fragment);
+    DescriptorSetLayoutDesc::new("ssao_upsample")
+        .with(binding(0, DescriptorKind::UniformBuffer, fragment))
+        .with(binding(1, DescriptorKind::SampledDepth, fragment))
+        .with(binding(2, DescriptorKind::Sampler, fragment))
+        .with(binding(3, DescriptorKind::SampledImage, fragment))
+}
+
 /// The composite pass's set: the scene colour, the ambient occlusion, and the
 /// sampler both are read with.
 pub fn composite_layout() -> DescriptorSetLayoutDesc {
@@ -143,102 +166,28 @@ fn binding(binding: u32, kind: DescriptorKind, stages: StageMask) -> chassis::Bi
 
 /// The shader modules every pipeline is built from.
 ///
-/// Two modules per pipeline: Vulkan has no linked stage, so a pair is two modules
-/// with two entry points compiled from one source.
+/// One module per source: the module carries every entry point the source
+/// declares, and a pipeline stage names the one it needs from that module.
 pub struct ShaderSet {
-    pub model_vertex: Shader,
-    pub model_fragment: Shader,
-    pub depth_vertex: Shader,
-    pub ssao_vertex: Shader,
-    pub ssao_fragment: Shader,
-    pub grid_vertex: Shader,
-    pub grid_fragment: Shader,
-    pub line_vertex: Shader,
-    pub line_fragment: Shader,
-    pub composite_vertex: Shader,
-    pub composite_fragment: Shader,
+    pub model: Shader,
+    pub depth: Shader,
+    pub ssao: Shader,
+    pub ssao_upsample: Shader,
+    pub grid: Shader,
+    pub line: Shader,
+    pub composite: Shader,
 }
 
 impl ShaderSet {
     pub fn load(resources: &mut dyn Resources) -> Result<Self, chassis::Error> {
         Ok(Self {
-            model_vertex: module(
-                resources,
-                "model.vs",
-                MODEL_WGSL,
-                VS_MAIN,
-                ShaderStage::Vertex,
-            )?,
-            model_fragment: module(
-                resources,
-                "model.fs",
-                MODEL_WGSL,
-                FS_MAIN,
-                ShaderStage::Fragment,
-            )?,
-            depth_vertex: module(
-                resources,
-                "depth.vs",
-                DEPTH_WGSL,
-                VS_MAIN,
-                ShaderStage::Vertex,
-            )?,
-            ssao_vertex: module(
-                resources,
-                "ssao.vs",
-                SSAO_WGSL,
-                VS_MAIN,
-                ShaderStage::Vertex,
-            )?,
-            ssao_fragment: module(
-                resources,
-                "ssao.fs",
-                SSAO_WGSL,
-                FS_MAIN,
-                ShaderStage::Fragment,
-            )?,
-            grid_vertex: module(
-                resources,
-                "grid.vs",
-                GRID_WGSL,
-                VS_MAIN,
-                ShaderStage::Vertex,
-            )?,
-            grid_fragment: module(
-                resources,
-                "grid.fs",
-                GRID_WGSL,
-                FS_MAIN,
-                ShaderStage::Fragment,
-            )?,
-            line_vertex: module(
-                resources,
-                "line.vs",
-                LINE_WGSL,
-                VS_MAIN,
-                ShaderStage::Vertex,
-            )?,
-            line_fragment: module(
-                resources,
-                "line.fs",
-                LINE_WGSL,
-                FS_MAIN,
-                ShaderStage::Fragment,
-            )?,
-            composite_vertex: module(
-                resources,
-                "composite.vs",
-                COMPOSITE_WGSL,
-                VS_MAIN,
-                ShaderStage::Vertex,
-            )?,
-            composite_fragment: module(
-                resources,
-                "composite.fs",
-                COMPOSITE_WGSL,
-                FS_MAIN,
-                ShaderStage::Fragment,
-            )?,
+            model: module(resources, "model", MODEL_WGSL)?,
+            depth: module(resources, "depth", DEPTH_WGSL)?,
+            ssao: module(resources, "ssao", SSAO_WGSL)?,
+            ssao_upsample: module(resources, "ssao_upsample", SSAO_UPSAMPLE_WGSL)?,
+            grid: module(resources, "grid", GRID_WGSL)?,
+            line: module(resources, "line", LINE_WGSL)?,
+            composite: module(resources, "composite", COMPOSITE_WGSL)?,
         })
     }
 
@@ -248,19 +197,15 @@ impl ShaderSet {
         }
     }
 
-    fn all(&self) -> [Shader; 11] {
+    fn all(&self) -> [Shader; 7] {
         [
-            self.model_vertex,
-            self.model_fragment,
-            self.depth_vertex,
-            self.ssao_vertex,
-            self.ssao_fragment,
-            self.grid_vertex,
-            self.grid_fragment,
-            self.line_vertex,
-            self.line_fragment,
-            self.composite_vertex,
-            self.composite_fragment,
+            self.model,
+            self.depth,
+            self.ssao,
+            self.ssao_upsample,
+            self.grid,
+            self.line,
+            self.composite,
         ]
     }
 
@@ -269,12 +214,13 @@ impl ShaderSet {
             ShaderVariant::Model
             | ShaderVariant::ModelDoubleSided
             | ShaderVariant::ModelTransparent
-            | ShaderVariant::ModelTransparentDoubleSided => self.model_vertex,
-            ShaderVariant::Shadow => self.depth_vertex,
-            ShaderVariant::Ssao => self.ssao_vertex,
-            ShaderVariant::Grid => self.grid_vertex,
-            ShaderVariant::Line => self.line_vertex,
-            ShaderVariant::Composite => self.composite_vertex,
+            | ShaderVariant::ModelTransparentDoubleSided => self.model,
+            ShaderVariant::Shadow => self.depth,
+            ShaderVariant::Ssao => self.ssao,
+            ShaderVariant::SsaoUpsample => self.ssao_upsample,
+            ShaderVariant::Grid => self.grid,
+            ShaderVariant::Line => self.line,
+            ShaderVariant::Composite => self.composite,
         }
     }
 
@@ -283,38 +229,27 @@ impl ShaderSet {
             ShaderVariant::Model
             | ShaderVariant::ModelDoubleSided
             | ShaderVariant::ModelTransparent
-            | ShaderVariant::ModelTransparentDoubleSided => Some(self.model_fragment),
+            | ShaderVariant::ModelTransparentDoubleSided => Some(self.model),
             // A depth-only pipeline has no fragment stage: the prepass is the same
             // draw with no colour target, and Vulkan allows a pipeline with only a
             // vertex stage.
             ShaderVariant::Shadow => None,
-            ShaderVariant::Ssao => Some(self.ssao_fragment),
-            ShaderVariant::Grid => Some(self.grid_fragment),
-            ShaderVariant::Line => Some(self.line_fragment),
-            ShaderVariant::Composite => Some(self.composite_fragment),
+            ShaderVariant::Ssao => Some(self.ssao),
+            ShaderVariant::SsaoUpsample => Some(self.ssao_upsample),
+            ShaderVariant::Grid => Some(self.grid),
+            ShaderVariant::Line => Some(self.line),
+            ShaderVariant::Composite => Some(self.composite),
         }
     }
 }
 
-/// Compiles one entry point of one embedded source to SPIR-V.
+/// Compiles one embedded source to SPIR-V, keeping every entry point it declares.
 fn module(
     resources: &mut dyn Resources,
     label: &str,
     source: &str,
-    entry_point: &str,
-    stage: ShaderStage,
 ) -> Result<Shader, chassis::Error> {
-    let forge_stage = match stage {
-        ShaderStage::Vertex => forge::Stage::Vertex,
-        ShaderStage::Fragment => forge::Stage::Fragment,
-        other => {
-            return Err(chassis::Error::Unsupported(format!(
-                "{label}: {other:?} is not a stage this renderer compiles"
-            )))
-        }
-    };
-
-    let spirv = forge::wgsl::to_spirv_entry(source, label, entry_point, forge_stage)
+    let spirv = forge::wgsl::to_spirv(source, label)
         .map_err(|error| chassis::Error::InvalidDescriptor(error.to_string()))?;
     resources.create_shader(label, &spirv)
 }
@@ -328,6 +263,7 @@ pub enum ShaderVariant {
     ModelTransparentDoubleSided,
     Shadow,
     Ssao,
+    SsaoUpsample,
     Grid,
     Line,
     Composite,
@@ -351,6 +287,7 @@ impl ShaderVariant {
                 | ShaderVariant::Grid
                 | ShaderVariant::Line
                 | ShaderVariant::Ssao
+                | ShaderVariant::SsaoUpsample
                 | ShaderVariant::Composite
         )
     }
@@ -397,9 +334,9 @@ impl PipelineKey {
     /// The depth-only prepass: no colour target, so the vertex stage is the
     /// whole pipeline.
     ///
-    /// It draws with `depth.wgsl`, which reads position alone, so the layout
-    /// declares position alone; declaring the attributes the model shader reads
-    /// would fetch them and warn that nothing consumes them.
+    /// It draws with `depth.wgsl`, which reads position and the skin attributes
+    /// alone; declaring normal, UV, tangent or colour would fetch them for
+    /// nothing.
     pub fn shadow(depth: TextureFormat, samples: SampleCount) -> Self {
         Self {
             variant: ShaderVariant::Shadow,
@@ -500,15 +437,21 @@ pub fn pipeline_desc(key: &PipelineKey, shaders: &ShaderSet) -> PipelineDesc {
         | ShaderVariant::ModelDoubleSided
         | ShaderVariant::ModelTransparent
         | ShaderVariant::ModelTransparentDoubleSided => {
-            vec![frame_layout(), material_layout(), draw_layout()]
+            vec![
+                frame_layout(),
+                material_layout(),
+                draw_layout(),
+                palette_layout(),
+            ]
         }
         // The prepass writes shadow depth alone: it needs the light's matrix in
         // set 0 and the model matrix in set 1, and nothing else. Declaring a
         // read of the shadow map here would be a pass that reads the resource it
         // writes, which the graph refuses.
-        ShaderVariant::Shadow => vec![shadow_layout(), draw_layout()],
+        ShaderVariant::Shadow => vec![shadow_layout(), draw_layout(), palette_layout()],
         ShaderVariant::Line => vec![line_layout()],
         ShaderVariant::Ssao => vec![ssao_layout()],
+        ShaderVariant::SsaoUpsample => vec![ssao_upsample_layout()],
         ShaderVariant::Composite => vec![composite_layout()],
         // The grid's matrices are a uniform block, because this RHI cannot declare
         // push constants.
@@ -522,9 +465,10 @@ pub fn pipeline_desc(key: &PipelineKey, shaders: &ShaderSet) -> PipelineDesc {
         | ShaderVariant::ModelTransparentDoubleSided => mesh::vertex_layout(),
         ShaderVariant::Shadow => mesh::depth_vertex_layout(),
         ShaderVariant::Line => line_vertex_layout(),
-        ShaderVariant::Ssao | ShaderVariant::Grid | ShaderVariant::Composite => {
-            VertexLayout::default()
-        }
+        ShaderVariant::Ssao
+        | ShaderVariant::SsaoUpsample
+        | ShaderVariant::Grid
+        | ShaderVariant::Composite => VertexLayout::default(),
     };
 
     PipelineDesc {

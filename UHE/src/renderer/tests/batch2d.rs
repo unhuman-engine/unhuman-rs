@@ -21,16 +21,13 @@ fn the_2d_shaders_validate() {
         .expect("sprite.wgsl validates");
     forge::wgsl::check(TEXT_WGSL, "text.wgsl").expect("text.wgsl validates");
 
-    for entry in ["vs_main", "fs_main"] {
-        let stage = if entry.starts_with("vs") {
-            forge::Stage::Vertex
-        } else {
-            forge::Stage::Fragment
-        };
-        forge::wgsl::to_spirv_entry(bifrost::batch2d::SPRITE_WGSL, "sprite.wgsl", entry, stage)
-            .expect("sprite.wgsl compiles");
-        forge::wgsl::to_spirv_entry(TEXT_WGSL, "text.wgsl", entry, stage)
-            .expect("text.wgsl compiles");
+    for (label, source) in [
+        ("sprite.wgsl", bifrost::batch2d::SPRITE_WGSL),
+        ("text.wgsl", TEXT_WGSL),
+    ] {
+        let spirv = forge::wgsl::to_spirv(source, label).expect("the source compiles");
+        assert_eq!(spirv.len() % 4, 0, "{label}: SPIR-V is a word stream");
+        assert!(!spirv.is_empty(), "{label}: compiled nothing");
     }
 }
 

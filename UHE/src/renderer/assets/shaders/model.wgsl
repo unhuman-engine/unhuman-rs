@@ -40,7 +40,8 @@ struct MaterialParams {
 struct Draw {
     model: mat4x4<f32>,
     tint: vec4<f32>,
-    // x = entity id, y = use vertex colour, z/w unused.
+    // x = entity id, y = use vertex colour,
+    // z = first palette matrix, w = palette matrix count.
     params: vec4<f32>,
 };
 
@@ -58,6 +59,7 @@ struct Draw {
 @group(1) @binding(6) var emissive_texture: texture_2d<f32>;
 
 @group(2) @binding(0) var<uniform> draw: Draw;
+@group(3) @binding(0) var<storage, read> palette: array<mat4x4<f32>>;
 
 const PI: f32 = 3.14159265359;
 
@@ -67,6 +69,10 @@ struct VertexInput {
     @location(2) uv: vec2<f32>,
     // xyz tangent, w handedness.
     @location(3) tangent: vec4<f32>,
+    // Four indices into the frame's palette.
+    @location(4) joints: vec4<u32>,
+    // Weights parallel to `joints`; a zero sum leaves the vertex in bind pose.
+    @location(5) weights: vec4<f32>,
     // COLOR_0, at location 6.
     @location(6) color: vec4<f32>,
 };
@@ -81,16 +87,37 @@ struct VertexOutput {
     @location(5) color: vec4<f32>,
 };
 
+fn skin_matrix(in: VertexInput) -> mat4x4<f32> {
+    let first = u32(draw.params.z);
+    let count = u32(draw.params.w);
+    if (count == 0u || dot(in.weights, vec4<f32>(1.0)) <= 0.0) {
+        return mat4x4<f32>(
+            vec4<f32>(1.0, 0.0, 0.0, 0.0),
+            vec4<f32>(0.0, 1.0, 0.0, 0.0),
+            vec4<f32>(0.0, 0.0, 1.0, 0.0),
+            vec4<f32>(0.0, 0.0, 0.0, 1.0),
+        );
+    }
+    let j = in.joints;
+    return in.weights.x * palette[first + j.x]
+        + in.weights.y * palette[first + j.y]
+        + in.weights.z * palette[first + j.z]
+        + in.weights.w * palette[first + j.w];
+}
+
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    let world = draw.model * vec4<f32>(in.position, 1.0);
+    let skin = skin_matrix(in);
+    let local = skin * vec4<f32>(in.position, 1.0);
+    let world = draw.model * local;
     out.world_position = world.xyz;
 
     // The model matrix is a TRS with no shear, so transforming by the matrix is
-    // correct and an inverse-transpose is not needed.
-    let normal = normalize((draw.model * vec4<f32>(in.normal, 0.0)).xyz);
-    let tangent = normalize((draw.model * vec4<f32>(in.tangent.xyz, 0.0)).xyz);
+    // correct and an inverse-transpose is not needed. The skin matrix is applied
+    // to the local normal first, in the same space as the position.
+    let normal = normalize((draw.model * (skin * vec4<f32>(in.normal, 0.0))).xyz);
+    let tangent = normalize((draw.model * (skin * vec4<f32>(in.tangent.xyz, 0.0))).xyz);
     out.normal = normal;
     out.tangent = tangent;
     out.bitangent = cross(normal, tangent) * in.tangent.w;

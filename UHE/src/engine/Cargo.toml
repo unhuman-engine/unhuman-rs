@@ -8,3 +8,10 @@ publish = false
 chassis = { workspace = true }
 stormbreaker = { workspace = true }
 stormglass = { workspace = true }
+
+[dev-dependencies]
+bifrost = { workspace = true }
+glam = { workspace = true }
+grind = { workspace = true }
+meats = { workspace = true }
+vault = { workspace = true }

@@ -16,6 +16,8 @@
 struct Grid {
     view_projection: mat4x4<f32>,
     inverse_view_projection: mat4x4<f32>,
+    axis_x: vec4<f32>,
+    axis_z: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> grid: Grid;
@@ -79,12 +81,13 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
 
     var color = vec4<f32>(0.4, 0.4, 0.4, 1.0 - min(line, 1.0));
 
-    // The primary axes: z blue, x red.
+    // The primary axes. Their colours come from the uniform so they can stay
+    // dimmer than the gizmo's handles, which sit on the same two lines.
     if (frag_pos.x > -0.5 * minimum_x && frag_pos.x < 0.5 * minimum_x) {
-        color = vec4<f32>(0.1, 0.1, 0.8, color.a);
+        color = vec4<f32>(grid.axis_x.rgb, color.a);
     }
     if (frag_pos.z > -0.5 * minimum_z && frag_pos.z < 0.5 * minimum_z) {
-        color = vec4<f32>(0.8, 0.1, 0.1, color.a);
+        color = vec4<f32>(grid.axis_z.rgb, color.a);
     }
 
     // Fade with distance, cubically so the horizon does not alias into noise.

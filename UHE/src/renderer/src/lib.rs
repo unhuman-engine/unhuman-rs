@@ -14,6 +14,7 @@ pub mod animation;
 pub mod batch2d;
 pub mod camera;
 pub mod font;
+mod frame_ring;
 pub mod ik;
 pub mod light;
 pub mod material;

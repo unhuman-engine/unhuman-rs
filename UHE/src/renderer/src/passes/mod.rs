@@ -18,17 +18,20 @@ use std::sync::Arc;
 
 use chassis::graph::{PassRecorder, PassScope, TextureId};
 use chassis::{CommandList, Error};
+use glam::Mat4;
 
 pub use composite::CompositePass;
 pub use editor::EditorPass;
 pub use geometry::{GeometryPass, MaterialPipelines, PreparedDraw};
 pub use lines::{GridPass, GridUniforms, LineBatch, LinePass, LineUniforms, LineVertex};
-pub use overlay::{SpriteTextOverlay, PASS_2D, PASS_TEXT};
+pub use overlay::{OverlayFrame, SpriteTextOverlay, PASS_2D, PASS_TEXT};
 pub use pipeline::{PipelineCache, PipelineKey, ShaderSet, ShaderVariant};
-pub use readback::ReadbackPass;
+pub use readback::{ReadbackPass, ReadbackRing, READBACK_LAG, READBACK_RING};
 pub use shadow::ShadowPass;
 pub use ssao::{SsaoPass, SsaoUniforms};
-pub use uniforms::{BindSet, DrawArena, DrawUniforms, FrameUniforms, ImageSet, ShadowUniforms};
+pub use uniforms::{
+    BindSet, DrawArena, DrawUniforms, FrameUniforms, ImageSet, PaletteSet, ShadowUniforms,
+};
 
 /// Pass names, which are also the keys the dispatch is done on.
 pub const PASS_SHADOW: &str = "shadow";
@@ -37,6 +40,9 @@ pub const PASS_OPAQUE: &str = "opaque";
 /// wrote rather than clearing them.
 pub const PASS_TRANSPARENT: &str = "transparent";
 pub const PASS_SSAO: &str = "ssao";
+/// Depth-aware upsample of the half-resolution occlusion into the full-rate
+/// texture composition reads.
+pub const PASS_SSAO_UPSAMPLE: &str = "ssao_upsample";
 /// The grid and the gizmos, in one pass.
 pub const PASS_EDITOR: &str = "editor";
 pub const PASS_COMPOSITE: &str = "composite";
@@ -62,6 +68,18 @@ pub struct FrameTargets {
 /// `declare` is called while the frame's graph is open, `record` for each pass
 /// name it declared.
 pub trait OverlayPasses: Send + Sync {
+    /// Starts a frame, clearing what the previous one queued.
+    fn begin(&self) {}
+    /// Moves the producer's queued content into this frame's batches.
+    fn edit(&self) {}
+    /// Uploads the batches, after `edit` and before recording.
+    fn prepare(
+        &self,
+        _resources: &mut dyn chassis::Resources,
+        _view_projection: Mat4,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
     fn declare(&self, graph: &mut chassis::graph::RenderGraph, targets: &FrameTargets);
     fn record(
         &self,
@@ -69,6 +87,8 @@ pub trait OverlayPasses: Send + Sync {
         scope: &PassScope<'_>,
         list: &mut dyn CommandList,
     ) -> Result<(), Error>;
+    /// Drops the overlay's own GPU resources.
+    fn destroy(&self, _resources: &mut dyn chassis::Resources) {}
 }
 
 /// Every recorder of one frame, already prepared.
@@ -81,6 +101,7 @@ pub struct FrameRecorder {
     pub geometry: Option<GeometryPass>,
     pub transparent: Option<GeometryPass>,
     pub ssao: Option<SsaoPass>,
+    pub ssao_upsample: Option<SsaoPass>,
     pub editor: Option<EditorPass>,
     pub composite: Option<CompositePass>,
     pub readback: Option<ReadbackPass>,
@@ -94,6 +115,7 @@ impl FrameRecorder {
             geometry: None,
             transparent: None,
             ssao: None,
+            ssao_upsample: None,
             editor: None,
             composite: None,
             readback: None,
@@ -132,6 +154,10 @@ impl PassRecorder for FrameRecorder {
             PASS_SSAO => match &self.ssao {
                 Some(pass) => pass.record(scope, list),
                 None => Err(missing(PASS_SSAO)),
+            },
+            PASS_SSAO_UPSAMPLE => match &self.ssao_upsample {
+                Some(pass) => pass.record(scope, list),
+                None => Err(missing(PASS_SSAO_UPSAMPLE)),
             },
             PASS_EDITOR => match &self.editor {
                 Some(pass) => pass.record(scope, list),

@@ -14,14 +14,10 @@ use chassis::{
 };
 use vault::AssetId;
 
-/// One vertex, interleaved. Position, normal, UV, tangent and colour.
+/// One vertex, interleaved. Position, normal, UV, tangent, skin and colour.
 ///
-/// `JOINTS_0`/`WEIGHTS_0` are not here yet because nothing skins: the palette
-/// comes from `bifrost::animation`, whose clip-to-`Animator` glue from a loaded
-/// model is not in place, so an attribute nothing reads would be stride paid for
-/// by every vertex in every mesh. Adding the two is a change to this struct, the
-/// layout below and the shader; `MeshKey` keys on the layout, so the mesh cache
-/// re-uploads by itself when it happens.
+/// The palette is applied only for a draw whose `DrawUniforms` names one, so a
+/// static mesh pays the attributes' bytes but not a second pipeline.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct Vertex {
@@ -33,6 +29,10 @@ pub struct Vertex {
     /// `COLOR_0`, white when the mesh has none. The shader multiplies it into the
     /// base colour unconditionally, so an absent `COLOR_0` needs no flag.
     pub color: [f32; 4],
+    /// Four bone indices into the frame's palette.
+    pub joints: [u16; 4],
+    /// Parallel to `joints`; a zero sum leaves the vertex unskinned.
+    pub weights: [f32; 4],
 }
 
 /// Attribute locations, which the shader's `@location` bindings must match.
@@ -40,6 +40,8 @@ pub const LOCATION_POSITION: u32 = 0;
 pub const LOCATION_NORMAL: u32 = 1;
 pub const LOCATION_UV: u32 = 2;
 pub const LOCATION_TANGENT: u32 = 3;
+pub const LOCATION_JOINTS: u32 = 4;
+pub const LOCATION_WEIGHTS: u32 = 5;
 pub const LOCATION_COLOR: u32 = 6;
 
 /// The one vertex layout every mesh is uploaded with.
@@ -67,6 +69,16 @@ pub fn vertex_layout() -> VertexLayout {
                 format: TextureFormat::Rgba32Float,
                 offset: std::mem::offset_of!(Vertex, tangent) as u32,
             },
+            VertexAttribute {
+                location: LOCATION_JOINTS,
+                format: TextureFormat::Rgba16Uint,
+                offset: std::mem::offset_of!(Vertex, joints) as u32,
+            },
+            VertexAttribute {
+                location: LOCATION_WEIGHTS,
+                format: TextureFormat::Rgba32Float,
+                offset: std::mem::offset_of!(Vertex, weights) as u32,
+            },
             // Location 6, matching the shader's colour attribute.
             VertexAttribute {
                 location: LOCATION_COLOR,
@@ -77,20 +89,30 @@ pub fn vertex_layout() -> VertexLayout {
     }
 }
 
-/// The layout the depth prepass draws with: position alone.
+/// The layout the depth prepass draws with: position and the skin attributes.
 ///
-/// The prepass shares the mesh's vertex buffer, so the stride and the position
-/// offset are the full vertex's, but the other attributes are not declared:
-/// `depth.wgsl` reads position and nothing else, and a declared attribute the
-/// shader never consumes is still fetched and warned about.
+/// The prepass shares the mesh's vertex buffer. It reads no normal, UV, tangent
+/// or colour, so those are omitted rather than fetched and discarded.
 pub fn depth_vertex_layout() -> VertexLayout {
     VertexLayout {
         stride: std::mem::size_of::<Vertex>() as u32,
-        attributes: vec![VertexAttribute {
-            location: LOCATION_POSITION,
-            format: TextureFormat::R32G32B32Float,
-            offset: std::mem::offset_of!(Vertex, position) as u32,
-        }],
+        attributes: vec![
+            VertexAttribute {
+                location: LOCATION_POSITION,
+                format: TextureFormat::R32G32B32Float,
+                offset: std::mem::offset_of!(Vertex, position) as u32,
+            },
+            VertexAttribute {
+                location: LOCATION_JOINTS,
+                format: TextureFormat::Rgba16Uint,
+                offset: std::mem::offset_of!(Vertex, joints) as u32,
+            },
+            VertexAttribute {
+                location: LOCATION_WEIGHTS,
+                format: TextureFormat::Rgba32Float,
+                offset: std::mem::offset_of!(Vertex, weights) as u32,
+            },
+        ],
     }
 }
 
@@ -160,6 +182,8 @@ pub fn interleave(data: &vault::MeshData) -> Vec<Vertex> {
             // White: a zero default would tint every mesh black and a
             // gamma-decoded one would tint every mesh wrongly.
             color: data.colors.get(i).copied().unwrap_or([1.0; 4]),
+            joints: data.joints.get(i).copied().unwrap_or([0; 4]),
+            weights: data.weights.get(i).copied().unwrap_or([0.0; 4]),
         })
         .collect()
 }

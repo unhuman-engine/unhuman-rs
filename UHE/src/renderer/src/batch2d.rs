@@ -373,15 +373,13 @@ impl From<chassis::Error> for PipelineError {
 /// bind groups must be built from, so the two cannot disagree.
 pub struct QuadPipeline {
     pipeline: Pipeline,
-    vertex_shader: chassis::Shader,
-    fragment_shader: chassis::Shader,
+    shader: chassis::Shader,
     texture_layout: DescriptorSetLayoutDesc,
     globals_layout: DescriptorSetLayoutDesc,
 }
 
 impl QuadPipeline {
-    /// `source` is a WGSL file with `vs_main` and `fs_main`, one
-    /// `create_shader` per entry point as both backends require.
+    /// `source` is a WGSL file with `vs_main` and `fs_main` in one module.
     pub fn build(
         resources: &mut dyn Resources,
         label: &str,
@@ -390,13 +388,8 @@ impl QuadPipeline {
         color_format: TextureFormat,
         depth_format: Option<TextureFormat>,
     ) -> Result<Self, PipelineError> {
-        let vertex_spirv =
-            forge::wgsl::to_spirv_entry(source, label, "vs_main", forge::Stage::Vertex)?;
-        let fragment_spirv =
-            forge::wgsl::to_spirv_entry(source, label, "fs_main", forge::Stage::Fragment)?;
-
-        let vertex_shader = resources.create_shader(&format!("{label}.vert"), &vertex_spirv)?;
-        let fragment_shader = resources.create_shader(&format!("{label}.frag"), &fragment_spirv)?;
+        let spirv = forge::wgsl::to_spirv(source, label)?;
+        let shader = resources.create_shader(label, &spirv)?;
 
         let texture_layout = texture_layout(&format!("{label}.texture"));
         let globals_layout = globals_layout(&format!("{label}.globals"));
@@ -405,11 +398,11 @@ impl QuadPipeline {
             shaders: vec![
                 ShaderStageDesc {
                     stage: ShaderStage::Vertex,
-                    shader: vertex_shader,
+                    shader,
                 },
                 ShaderStageDesc {
                     stage: ShaderStage::Fragment,
-                    shader: fragment_shader,
+                    shader,
                 },
             ],
             set_layouts: vec![texture_layout.clone(), globals_layout.clone()],
@@ -439,8 +432,7 @@ impl QuadPipeline {
 
         Ok(QuadPipeline {
             pipeline,
-            vertex_shader,
-            fragment_shader,
+            shader,
             texture_layout,
             globals_layout,
         })
@@ -465,12 +457,8 @@ impl QuadPipeline {
         self.pipeline
     }
 
-    pub fn vertex_shader(&self) -> chassis::Shader {
-        self.vertex_shader
-    }
-
-    pub fn fragment_shader(&self) -> chassis::Shader {
-        self.fragment_shader
+    pub fn shader(&self) -> chassis::Shader {
+        self.shader
     }
 
     pub fn texture_layout(&self) -> &DescriptorSetLayoutDesc {

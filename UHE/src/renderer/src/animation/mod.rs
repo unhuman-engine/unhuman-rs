@@ -7,6 +7,7 @@
 
 pub mod clip;
 pub mod compression;
+pub mod convert;
 pub mod sampler;
 pub mod state_machine;
 
@@ -15,6 +16,7 @@ pub use clip::{
     Skeleton, Skin, VectorTrack,
 };
 pub use compression::{compress_clip, measure_clip, CompressSettings, CompressionStats};
+pub use convert::{animator_from_model, select_clip};
 pub use sampler::{
     blend_poses, build_child_lists, global_transforms, rest_pose, sample_clip, sample_pose,
     sample_position, sample_rotation, sample_scale, skin_matrices,

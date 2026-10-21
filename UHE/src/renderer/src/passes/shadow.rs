@@ -14,19 +14,28 @@ use super::geometry::PreparedDraw;
 /// Bind group numbers within the depth pipeline's shader.
 pub const SHADOW_SET: u32 = 0;
 pub const DRAW_SET: u32 = 1;
+/// The skin palette, the same buffer the model pass binds at set 3.
+pub const PALETTE_SET: u32 = 2;
 
 pub struct ShadowPass {
     pipeline: Pipeline,
     /// Set 0: the light-space view-projection the depth is measured against.
     frame: BindGroup,
+    palette: BindGroup,
     draws: Vec<PreparedDraw>,
 }
 
 impl ShadowPass {
-    pub fn new(pipeline: Pipeline, frame: BindGroup, draws: Vec<PreparedDraw>) -> Self {
+    pub fn new(
+        pipeline: Pipeline,
+        frame: BindGroup,
+        palette: BindGroup,
+        draws: Vec<PreparedDraw>,
+    ) -> Self {
         Self {
             pipeline,
             frame,
+            palette,
             draws,
         }
     }
@@ -46,6 +55,7 @@ impl ShadowPass {
 
         list.bind_pipeline(&self.pipeline);
         list.bind_group(SHADOW_SET, &self.frame);
+        list.bind_group(PALETTE_SET, &self.palette);
 
         for draw in &self.draws {
             list.bind_group(DRAW_SET, &draw.uniforms);

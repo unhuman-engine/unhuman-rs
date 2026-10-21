@@ -12,9 +12,11 @@
 use std::sync::Arc;
 
 use adam::{Engine, FrameCtx, Plugin};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 
 use crate::camera::{CameraInput, EditorCamera};
-use crate::passes::OverlayPasses;
+use crate::font;
+use crate::passes::{OverlayFrame, OverlayPasses, SpriteTextOverlay};
 use crate::renderer::{Bifrost, ViewSource};
 
 pub struct BifrostPlugin {
@@ -22,10 +24,19 @@ pub struct BifrostPlugin {
     camera: EditorCamera,
     input: CameraInput,
     overlay: Option<Arc<dyn OverlayPasses>>,
+    /// Whether `build` should install the standard sprite/text overlay.
+    hud_requested: bool,
+    /// The producer half of that overlay: content queued here reaches the next
+    /// frame without handing the caller a GPU pass.
+    hud: Option<Arc<OverlayFrame>>,
     /// World-space lines the frame draws: the editor's gizmo.
     lines: Option<(Vec<crate::passes::LineVertex>, Vec<u32>)>,
     /// Whether `lines` was set since it was last uploaded.
     lines_pending: bool,
+    /// The physics debug view, drawn as a separate batch so the gizmo's depth
+    /// bias does not pull the simulation's wireframes forward too.
+    debug_lines: Option<(Vec<crate::passes::LineVertex>, Vec<u32>)>,
+    debug_pending: bool,
     /// Frames that failed to record, so a backend that refuses every frame does
     /// not log one error per frame for the life of the process.
     frame_failures: u32,
@@ -49,8 +60,12 @@ impl BifrostPlugin {
             camera,
             input: CameraInput::default(),
             overlay: None,
+            hud_requested: false,
+            hud: None,
             lines: None,
             lines_pending: false,
+            debug_lines: None,
+            debug_pending: false,
             frame_failures: 0,
         }
     }
@@ -59,6 +74,41 @@ impl BifrostPlugin {
     pub fn with_overlay(mut self, overlay: Arc<dyn OverlayPasses>) -> Self {
         self.overlay = Some(overlay);
         self
+    }
+
+    /// Builds the standard sprite/text overlay in `build`, loading the engine's
+    /// face through `vault`. `hud` then queues lines for the next frame.
+    pub fn with_hud(mut self) -> Self {
+        self.hud_requested = true;
+        self
+    }
+
+    /// The HUD producer, if `with_hud` was asked for and the font loaded.
+    pub fn hud(&self) -> Option<&OverlayFrame> {
+        self.hud.as_deref()
+    }
+
+    /// Queues one line of screen-space text at `position` pixels from the
+    /// top-left, `size` pixels per line.
+    pub fn push_hud(&self, text: impl Into<String>, position: Vec2, size: f32, color: Vec4) {
+        let Some(hud) = &self.hud else {
+            return;
+        };
+        let component = meats::Text {
+            text: text.into(),
+            color,
+            ..meats::Text::default()
+        };
+        let transform = Mat4::from_translation(position.extend(0.0))
+            * Mat4::from_scale(Vec3::splat(size.max(1.0)));
+        hud.push_text(component, transform);
+    }
+
+    /// Drops every queued HUD line; a producer calls this before pushing a frame's.
+    pub fn clear_hud(&self) {
+        if let Some(hud) = &self.hud {
+            hud.clear();
+        }
     }
 
     /// The orbit camera. A caller with input owns the one copy of it and writes
@@ -85,6 +135,13 @@ impl BifrostPlugin {
         self.renderer.as_mut()
     }
 
+    /// Matches the renderer's timing state to what the device granted.
+    pub fn set_gpu_timing(&mut self, enabled: bool) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_gpu_timing(enabled);
+        }
+    }
+
     /// The last frame the renderer read back to the CPU, or `None` before the
     /// first frame or with a surface.
     pub fn frame_image(&self) -> Option<&crate::renderer::FrameImage> {
@@ -99,6 +156,36 @@ impl BifrostPlugin {
     pub fn set_lines(&mut self, vertices: Vec<crate::passes::LineVertex>, indices: Vec<u32>) {
         self.lines = Some((vertices, indices));
         self.lines_pending = true;
+    }
+
+    /// Sets the physics debug view from `femur`'s world-space segments.
+    ///
+    /// Each layer is a field of `PhysicsDebug`, so a caller toggles one by
+    /// clearing it (or by calling [`Self::set_debug_segments`] with a filtered
+    /// list) without rebuilding the others.
+    pub fn set_physics_debug(&mut self, debug: femur::PhysicsDebug) {
+        let (vertices, indices) = crate::passes::lines::physics_debug_batch(&debug);
+        self.set_debug_segments_raw(vertices, indices);
+    }
+
+    /// Sets an arbitrary list of world-space segments, in the same format.
+    pub fn set_debug_segments(&mut self, segments: &[femur::DebugLine]) {
+        let (vertices, indices) = crate::passes::lines::debug_batch(segments);
+        self.set_debug_segments_raw(vertices, indices);
+    }
+
+    /// Removes the physics debug view. The next frame draws nothing.
+    pub fn clear_physics_debug(&mut self) {
+        self.set_debug_segments_raw(Vec::new(), Vec::new());
+    }
+
+    fn set_debug_segments_raw(
+        &mut self,
+        vertices: Vec<crate::passes::LineVertex>,
+        indices: Vec<u32>,
+    ) {
+        self.debug_lines = Some((vertices, indices));
+        self.debug_pending = true;
     }
 
     /// Resizes the camera to the device's extent, if they differ.
@@ -126,6 +213,30 @@ impl Default for BifrostPlugin {
     }
 }
 
+/// Builds the standard overlay from the engine's face, plus its producer handle.
+///
+/// The face is resolved through `vault` so it travels with the asset root; a
+/// generator options default covers Latin-1, which is every HUD string.
+fn sprite_text_overlay(
+    gpu: &mut dyn chassis::Gpu,
+    assets: &mut vault::Assets,
+) -> Result<(Arc<dyn OverlayPasses>, Arc<OverlayFrame>), String> {
+    let id = assets
+        .load(font::DEFAULT_FONT_PATH)
+        .map_err(|error| format!("{}: {error}", font::DEFAULT_FONT_PATH))?;
+    let ttf = assets
+        .bytes(id)
+        .ok_or_else(|| format!("{} has no bytes", font::DEFAULT_FONT_PATH))?;
+    let atlas = font::generate::generate(ttf, &font::GeneratorOptions::default())
+        .map_err(|error| format!("{}: {error}", font::DEFAULT_FONT_PATH))?;
+
+    // The scene colour, which is where both 2D passes draw.
+    let overlay = SpriteTextOverlay::new(gpu.resources(), chassis::TextureFormat::Rgba8Srgb, atlas)
+        .map_err(|error| error.to_string())?;
+    let frame = overlay.frame();
+    Ok((overlay.into_arc(), frame))
+}
+
 impl Plugin for BifrostPlugin {
     fn name(&self) -> &'static str {
         "bifrost"
@@ -138,7 +249,16 @@ impl Plugin for BifrostPlugin {
         };
 
         let mut renderer = Bifrost::new(gpu.as_mut(), &mut eng.assets)?;
-        if let Some(overlay) = self.overlay.take() {
+        if self.hud_requested {
+            match sprite_text_overlay(gpu.as_mut(), &mut eng.assets) {
+                Ok((overlay, frame)) => {
+                    renderer.set_overlay(overlay);
+                    self.hud = Some(frame);
+                }
+                // No face is a missing HUD, not a missing frame.
+                Err(error) => log::warn!("bifrost: HUD disabled: {error}"),
+            }
+        } else if let Some(overlay) = self.overlay.take() {
             renderer.set_overlay(overlay);
         }
 
@@ -146,7 +266,7 @@ impl Plugin for BifrostPlugin {
         Ok(())
     }
 
-    fn on_frame(&mut self, eng: &mut Engine, _ctx: &mut FrameCtx) {
+    fn on_frame(&mut self, eng: &mut Engine, ctx: &mut FrameCtx) {
         let Some(gpu) = eng.gpu.as_mut() else {
             return;
         };
@@ -176,13 +296,53 @@ impl Plugin for BifrostPlugin {
             }
         }
 
+        if self.debug_pending {
+            self.debug_pending = false;
+            let lines = self.debug_lines.clone();
+            if let Some((vertices, indices)) = lines {
+                if let Err(error) = renderer.set_debug_lines(gpu.as_mut(), &vertices, &indices) {
+                    log::warn!("bifrost: physics debug lines: {error}");
+                }
+            }
+        }
+
         // Upload anything the frame will want: a hit after the first frame is a
-        // hash lookup.
+        // hash lookup. An entity whose mesh carries a skeleton gets its runtime
+        // animator here, so a producer only has to add `meats::Animator`.
         for sample in eng.scene.meshes() {
             if let Err(error) = renderer.ensure_mesh(gpu.as_mut(), &eng.assets, sample.mesh) {
                 log::warn!("bifrost: mesh {:?} failed to upload: {error}", sample.mesh);
+                continue;
             }
+            let Some(state) = sample.animator else {
+                continue;
+            };
+            if !renderer.is_skinned(sample.entity) {
+                let hint = eng
+                    .scene
+                    .get(sample.entity)
+                    .and_then(|entry| entry.get::<meats::Animator>().map(|a| a.clip_path.clone()))
+                    .unwrap_or_default();
+                match renderer.attach_skinned(
+                    gpu.as_mut(),
+                    &eng.assets,
+                    sample.entity,
+                    sample.mesh,
+                    (!hint.is_empty()).then_some(hint.as_str()),
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => log::debug!(
+                        "bifrost: {:?} has no skeleton or clip to animate",
+                        sample.mesh
+                    ),
+                    Err(error) => {
+                        log::warn!("bifrost: {:?} skinning setup failed: {error}", sample.mesh)
+                    }
+                }
+            }
+            renderer.set_skinned_playback(sample.entity, state.playing, state.speed, state.looping);
         }
+        renderer.advance_skinned(&eng.scene, ctx.step_seconds());
     }
 
     fn on_render(&mut self, eng: &mut Engine, _ctx: &mut FrameCtx) {
@@ -222,5 +382,6 @@ impl Plugin for BifrostPlugin {
             renderer.destroy(gpu.as_mut());
         }
         self.renderer = None;
+        self.hud = None;
     }
 }
