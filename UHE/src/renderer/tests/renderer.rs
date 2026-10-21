@@ -17,6 +17,7 @@ use bifrost::material::{
 use bifrost::mesh::{self, GpuMesh, MeshCache, MeshKey, VertexLayoutKey};
 use bifrost::passes::geometry::{GeometryPass, MaterialPipelines, PreparedDraw};
 use bifrost::passes::pipeline::{self, PipelineCache, PipelineKey, ShaderSet, ShaderVariant};
+use bifrost::passes::uniforms::{BindSet, DrawUniforms};
 use bifrost::passes::{DrawArena, READBACK_LAG, READBACK_RING};
 use bifrost::passes::{FrameTargets, OverlayPasses, SpriteTextOverlay, PASS_COMPOSITE, PASS_TEXT};
 use bifrost::{Bifrost, EditorCamera, ViewSource};
@@ -1776,7 +1777,30 @@ fn a_moving_camera_waits_for_the_oldest_frame_and_rotates_slots() {
         );
     }
 
+    // Two ringed writes per frame: the draw arena, then the palette. Slots
+    // 0..depth are distinct, so the lap after the ring reuses slot zero.
+    let lap_writes: Vec<Buffer> = gpu
+        .resources
+        .buffer_writes
+        .iter()
+        .map(|(buffer, _, _)| *buffer)
+        .collect();
+    assert_eq!(lap_writes.len(), depth * 2, "arena and palette per frame");
+    let (pairs, _) = lap_writes.as_chunks::<2>();
+    for pair in pairs {
+        assert_ne!(pair[0], pair[1], "arena and palette shared a buffer");
+    }
+    let arena: Vec<Buffer> = pairs.iter().map(|pair| pair[0]).collect();
+    let palette: Vec<Buffer> = pairs.iter().map(|pair| pair[1]).collect();
+    for pair in arena.windows(2) {
+        assert_ne!(pair[0], pair[1], "two frames shared an arena slot");
+    }
+    for pair in palette.windows(2) {
+        assert_ne!(pair[0], pair[1], "two frames shared a palette slot");
+    }
+
     // Frame `depth` reuses slot zero, which frame zero wrote.
+    let creates = gpu.resources.buffer_creates;
     camera.set_yaw(0.6 + depth as f32 * 0.2);
     renderer
         .render(&mut gpu, &jobs, &scene, ViewSource::Editor, Some(&camera))
@@ -1787,39 +1811,22 @@ fn a_moving_camera_waits_for_the_oldest_frame_and_rotates_slots() {
         "the reused slot waited on frame zero's token, not the newest"
     );
     assert!(
-        !gpu.resources.buffer_destroys.is_empty(),
-        "reusing the slot released the previous frame's sets after the wait"
+        gpu.resources.buffer_destroys.is_empty(),
+        "reusing the slot destroyed a buffer another frame may still read"
+    );
+    assert_eq!(
+        gpu.resources.buffer_creates, creates,
+        "a steady frame created a buffer"
     );
 
-    // Two ringed writes per frame: the draw arena, then the palette. Slots
-    // 0..depth are distinct, then slot 0 comes back: both were ringed rather
-    // than refilled in place.
-    let writes: Vec<Buffer> = gpu
-        .resources
-        .buffer_writes
+    let reused: Vec<Buffer> = gpu.resources.buffer_writes[lap_writes.len()..]
         .iter()
         .map(|(buffer, _, _)| *buffer)
         .collect();
-    assert_eq!(writes.len(), (depth + 1) * 2, "arena and palette per frame");
-    let (pairs, _) = writes.as_chunks::<2>();
-    for pair in pairs {
-        assert_ne!(pair[0], pair[1], "arena and palette shared a buffer");
-    }
-    let arena: Vec<Buffer> = pairs.iter().map(|pair| pair[0]).collect();
-    let palette: Vec<Buffer> = pairs.iter().map(|pair| pair[1]).collect();
-    for pair in arena[..depth].windows(2) {
-        assert_ne!(pair[0], pair[1], "two frames shared an arena slot");
-    }
-    for pair in palette[..depth].windows(2) {
-        assert_ne!(pair[0], pair[1], "two frames shared a palette slot");
-    }
-    assert_eq!(
-        arena[depth], arena[0],
-        "the lap after the ring reused the first arena slot"
-    );
-    assert_eq!(
-        palette[depth], palette[0],
-        "the lap after the ring reused the first palette slot"
+    assert!(reused.contains(&arena[0]), "the first arena slot came back");
+    assert!(
+        reused.contains(&palette[0]),
+        "the first palette slot came back"
     );
 }
 
@@ -1899,5 +1906,31 @@ fn a_pushed_hud_declares_the_text_pass() {
         compiled.find(PASS_TEXT).is_some(),
         "a non-empty HUD declares the text pass: {}",
         graph.dump()
+    );
+}
+
+#[test]
+fn a_uniform_block_is_overwritten_not_recreated() {
+    let mut fake = FakeResources::new();
+    let layout = pipeline::draw_layout();
+    let mut set = BindSet::new();
+
+    let first = DrawUniforms::new([[1.0; 4]; 4], [1.0; 4], 7);
+    set.rebuild(&mut fake, &layout, &first, &[], &[], &[])
+        .expect("the first upload");
+
+    let creates = fake.buffer_creates;
+    let groups = fake.group_creates;
+    let second = DrawUniforms::new([[2.0; 4]; 4], [1.0; 4], 7);
+    set.rebuild(&mut fake, &layout, &second, &[], &[], &[])
+        .expect("the second upload");
+
+    assert_eq!(fake.buffer_creates, creates, "the buffer is reused");
+    assert_eq!(fake.group_creates, groups, "the group is reused");
+    assert_eq!(fake.buffer_writes.len(), 1, "the new bytes were written");
+    assert_eq!(
+        fake.buffer_writes[0].2,
+        std::mem::size_of::<DrawUniforms>(),
+        "the whole block was overwritten"
     );
 }

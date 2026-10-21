@@ -139,6 +139,7 @@ struct BindSetKey {
 pub struct BindSet {
     buffer: Option<Buffer>,
     group: Option<BindGroup>,
+    capacity: u64,
     /// The inputs the live buffer and group were built from.
     key: Option<BindSetKey>,
 }
@@ -148,6 +149,7 @@ impl BindSet {
         Self {
             buffer: None,
             group: None,
+            capacity: 0,
             key: None,
         }
     }
@@ -178,12 +180,34 @@ impl BindSet {
             return Ok(self.group.expect("a cached key has a live group"));
         }
 
+        // A camera move changes the uniform bytes every frame. When the layout
+        // and the bound resources are the same, overwrite the uniform block and
+        // keep the group, which is what makes a steady frame allocate nothing.
+        let reusable = self.group.is_some()
+            && self.capacity >= bytes.len() as u64
+            && self.key.as_ref().is_some_and(|old| {
+                old.layout == key.layout
+                    && old.buffers == key.buffers
+                    && old.images == key.images
+                    && old.samplers == key.samplers
+            });
+        if reusable {
+            let buffer = self.buffer.expect("a reusable key has a live buffer");
+            resources.write_buffer(&buffer, 0, bytes)?;
+            self.key = Some(key);
+            return Ok(self.group.expect("reusable checked the group"));
+        }
+
         self.destroy(resources);
 
         let buffer = resources.create_buffer(
-            BufferDesc::new(bytes.len() as u64, BufferUsage::UNIFORM),
+            BufferDesc::new(
+                bytes.len() as u64,
+                BufferUsage::UNIFORM | BufferUsage::TRANSFER_DST,
+            ),
             Some(bytes),
         )?;
+        self.capacity = bytes.len() as u64;
 
         // The set's own uniform is binding 0, which is what every layout here
         // declares.
@@ -209,6 +233,7 @@ impl BindSet {
         if let Some(buffer) = self.buffer.take() {
             resources.destroy_buffer(buffer);
         }
+        self.capacity = 0;
         self.key = None;
     }
 }
