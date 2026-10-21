@@ -12,3 +12,6 @@ meats = { workspace = true }
 vault = { workspace = true }
 glam = { workspace = true }
 log = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

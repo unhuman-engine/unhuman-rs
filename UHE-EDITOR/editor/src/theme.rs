@@ -9,8 +9,7 @@ use mirror::theme::{Palette, Rgba, Theme};
 
 /// Every color one frame of the editor draws with.
 ///
-/// Only what the panels draw: the console colors and the title bar stay in
-/// `mirror`'s palette for a console and a titled window this binary has none of.
+/// Only what the panels draw: the palette is `mirror`'s, mapped once per frame.
 #[derive(Clone, Copy, Debug)]
 pub struct EditorTheme {
     pub bg: Hsla,
@@ -25,6 +24,9 @@ pub struct EditorTheme {
     pub row_hover: Hsla,
     pub toolbar: Hsla,
     pub status: Hsla,
+    pub console_info: Hsla,
+    pub console_warn: Hsla,
+    pub console_error: Hsla,
 }
 
 impl EditorTheme {
@@ -47,6 +49,9 @@ impl EditorTheme {
             row_hover: hsla(mix(panel, palette.text, 0.05)),
             toolbar: hsla(palette.toolbar_bg),
             status: hsla(mix(palette.bg, palette.text, status_t)),
+            console_info: hsla(palette.console_info),
+            console_warn: hsla(palette.console_warn),
+            console_error: hsla(palette.console_error),
         }
     }
 }

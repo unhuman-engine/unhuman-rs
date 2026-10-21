@@ -4,19 +4,52 @@
 //! for the frame and writes back only through `mirror`'s methods, from the gpui
 //! callbacks it installs. The toolkit's retained widgets replace immediate mode.
 
+pub mod console;
 pub mod content_browser;
 pub mod hierarchy;
 pub mod inspector;
 pub mod viewport;
 
 use gpui::{
-    div, prelude::*, px, ClickEvent, Context, Div, Hsla, IntoElement, SharedString, Window,
+    div, prelude::*, px, AnyElement, ClickEvent, Context, Div, Hsla, IntoElement, SharedString,
+    Window,
 };
 
 use crate::app::EditorApp;
+use crate::layout::PanelId;
 use crate::theme::EditorTheme;
 
 pub const ROW_HEIGHT: f32 = 22.0;
+
+/// The body of a docked panel, dispatched by id. One place so a new panel is
+/// added to the dock system by adding one arm.
+pub fn body_for(
+    panel: PanelId,
+    app: &EditorApp,
+    theme: &EditorTheme,
+    cx: &mut Context<EditorApp>,
+) -> AnyElement {
+    match panel {
+        PanelId::Hierarchy => {
+            let scene = &app.engine.engine().scene;
+            hierarchy::panel(&app.editor, scene, theme, cx).into_any_element()
+        }
+        PanelId::Inspector => {
+            let scene = &app.engine.engine().scene;
+            inspector::panel(&app.editor, scene, theme, cx).into_any_element()
+        }
+        PanelId::ContentBrowser => {
+            content_browser::panel(&app.editor, theme, cx).into_any_element()
+        }
+        PanelId::Console => console::panel(app, theme, cx).into_any_element(),
+        PanelId::Profiler => {
+            let stats = app.editor.profiler.frame();
+            crate::profiler::panel(stats, app.editor.stats.fps, app.numbers, theme)
+                .into_any_element()
+        }
+        PanelId::Shortcuts => crate::shortcuts::panel(theme).into_any_element(),
+    }
+}
 
 /// Dimmed text: an empty panel's message, or a passive readout such as the
 /// backend name in the toolbar.

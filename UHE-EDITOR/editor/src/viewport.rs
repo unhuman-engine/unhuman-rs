@@ -21,12 +21,15 @@ pub const MISSING_FRAME_REASON: &str =
 
 /// A readback frame as a gpui image.
 ///
+/// Takes the frame by value: `from_raw` wants the buffer, and a `clone` of a
+/// full frame here would be a second CPU copy on top of the readback's own.
+///
 /// gpui's `RenderImage` is BGRA, which is the composition target's format, so
 /// the bytes go in unswizzled. The buffer is already tightly packed
 /// (`width * height * 4`), which is what `from_raw` needs.
-pub fn render_image(frame: &FrameImage) -> Arc<RenderImage> {
+pub fn render_image(frame: FrameImage) -> Arc<RenderImage> {
     let buffer: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(frame.width, frame.height, frame.bgra.clone())
+        ImageBuffer::from_raw(frame.width, frame.height, frame.bgra)
             .expect("a readback frame is width * height * 4 bytes");
     Arc::new(RenderImage::new(SmallVec::from_const([Frame::new(buffer)])))
 }
@@ -95,7 +98,7 @@ mod tests {
             height: 3,
             bgra: vec![0; 2 * 3 * 4],
         };
-        let image = render_image(&frame);
+        let image = render_image(frame);
         assert_eq!(image.as_bytes(0).map(<[u8]>::len), Some(2 * 3 * 4));
     }
 
@@ -107,6 +110,6 @@ mod tests {
             height: 2,
             bgra: vec![0; 4],
         };
-        let _ = render_image(&frame);
+        let _ = render_image(frame);
     }
 }

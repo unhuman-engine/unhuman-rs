@@ -7,8 +7,11 @@
 //! gpui's own asset cache, not `vault`. The filter box is a label for the same
 //! reason: gpui has no text input widget in this crate, only the text renderer.
 
-use gpui::{div, prelude::*, px, ClickEvent, Context, IntoElement, SharedString};
-use mirror::content_browser::Entry;
+use gpui::{
+    div, prelude::*, px, ClickEvent, Context, IntoElement, Pixels, Point, Render, SharedString,
+    Window,
+};
+use mirror::content_browser::{DragPayload, Entry};
 use mirror::Editor;
 
 use crate::app::EditorApp;
@@ -36,7 +39,10 @@ pub fn panel(
 
     let mut cells: Vec<gpui::AnyElement> = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        cells.push(cell(index, entry, selected.as_deref(), theme, cx).into_any_element());
+        // The drag carries the registry's virtual path, not the filesystem path:
+        // the drop side resolves it against the mounted root.
+        let payload = browser.payload(entry);
+        cells.push(cell(index, entry, payload, selected.as_deref(), theme, cx).into_any_element());
     }
 
     body()
@@ -105,6 +111,7 @@ fn crumb(
 fn cell(
     index: usize,
     entry: &Entry,
+    payload: DragPayload,
     selected: Option<&str>,
     theme: &EditorTheme,
     cx: &mut Context<EditorApp>,
@@ -142,6 +149,14 @@ fn cell(
         .bg(bg)
         .text_color(text)
         .hover(move |style| style.bg(hover))
+        // A file drags into the viewport, where the drop spawns it. A directory
+        // has nothing to spawn, so it only navigates on click.
+        .when(!is_dir, |cell| {
+            cell.on_drag(payload, |payload, position, _window, cx| {
+                let label: SharedString = payload.path.clone().into();
+                cx.new(|_| DragPreview { label, position })
+            })
+        })
         .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
             let typed_path = std::path::PathBuf::from(&path);
             if is_dir {
@@ -152,4 +167,27 @@ fn cell(
             cx.notify();
         }))
         .child(div().min_w_0().truncate().child(SharedString::from(label)))
+}
+
+/// The tile that follows the cursor while a file is dragged out of the browser.
+struct DragPreview {
+    label: SharedString,
+    position: Point<Pixels>,
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().pl(self.position.x).pt(self.position.y).child(
+            div()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .bg(gpui::rgba(0x1e1e1ecc))
+                .border_1()
+                .border_color(gpui::rgba(0xffffff22))
+                .text_xs()
+                .text_color(gpui::white())
+                .child(self.label.clone()),
+        )
+    }
 }

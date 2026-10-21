@@ -17,6 +17,7 @@ pub mod hierarchy;
 pub mod inspector;
 pub mod picking;
 pub mod play_state;
+pub mod profiler;
 pub mod selection;
 pub mod theme;
 
@@ -28,10 +29,14 @@ pub use hierarchy::{Hierarchy, Row};
 pub use inspector::{Inspector, Property, PropertyKind, PropertyValue};
 pub use picking::Ray;
 pub use play_state::{PlayState, PlayStatus};
+pub use profiler::{
+    Counters, FrameStats, PassTime, Profiler, Stats, SystemLoad, Timings, DEFAULT_SAMPLE_INTERVAL,
+};
 pub use selection::Selection;
 pub use theme::{Palette, Rgba, Theme, ThemeError, ThemeId};
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use adam::{Engine, FrameCtx, Plugin};
 use glam::Mat4;
@@ -40,30 +45,6 @@ use meats::{Entity, Scene};
 use commands::set_tag;
 use gizmo::TransformGizmo;
 use hierarchy::{is_within_subtree, tag_name};
-
-/// Frame timings for the status bar, measured by the engine's own tick rather
-/// than a toolkit counter.
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
-pub struct Stats {
-    pub frame_ms: f32,
-    pub fps: f32,
-}
-
-impl Stats {
-    pub fn update(&mut self, dt: f32) {
-        if dt <= 0.0 {
-            return;
-        }
-        self.frame_ms = dt * 1000.0;
-        // Smoothed, because a raw reciprocal flickers too fast to read.
-        let instantaneous = 1.0 / dt;
-        self.fps = if self.fps <= 0.0 {
-            instantaneous
-        } else {
-            self.fps * 0.9 + instantaneous * 0.1
-        };
-    }
-}
 
 pub struct Editor {
     pub selection: Selection,
@@ -75,7 +56,11 @@ pub struct Editor {
     pub play: PlayState,
     pub history: History,
     pub stats: Stats,
+    pub profiler: Profiler,
     pub console: Console,
+    /// The logger attachment the console shares; dropped with the editor so a
+    /// closed editor stops receiving records.
+    console_sink: adam::logging::SinkId,
 }
 
 impl Default for Editor {
@@ -86,6 +71,15 @@ impl Default for Editor {
 
 impl Editor {
     pub fn new() -> Self {
+        let console = Console::new();
+        // The first line says where the file log is. A process launched from a
+        // desktop entry has no terminal, so that path is how a failure before
+        // the window opened is found again.
+        if let Some(path) = adam::logging::log_path() {
+            console.info(format!("log file: {}", path.display()));
+        }
+        let console_sink = adam::logging::attach(Arc::new(console.clone()));
+
         Self {
             selection: Selection::new(),
             hierarchy: Hierarchy::new(),
@@ -96,7 +90,9 @@ impl Editor {
             play: PlayState::new(),
             history: History::new(),
             stats: Stats::default(),
-            console: Console::new(),
+            profiler: Profiler::new(),
+            console,
+            console_sink,
         }
     }
 
@@ -345,7 +341,9 @@ impl Editor {
     /// the panel has to reach the world transforms before the renderer reads
     /// them this frame.
     pub fn tick(&mut self, scene: &mut Scene, dt: f32) -> f32 {
-        self.stats.update(dt);
+        self.profiler.begin_frame(dt);
+        self.profiler.publish(std::time::Instant::now());
+        self.stats = *self.profiler.stats();
         if !self.inspector.dirty().is_empty() {
             scene.update_transforms();
             self.inspector.clear_dirty();
@@ -479,6 +477,12 @@ impl Editor {
                 self.selection.select(None);
             }
         }
+    }
+}
+
+impl Drop for Editor {
+    fn drop(&mut self) {
+        adam::logging::detach(self.console_sink);
     }
 }
 
