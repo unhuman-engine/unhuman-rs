@@ -101,6 +101,9 @@ pub struct Scene {
     /// Rebuilt by [`Scene::update_transforms`]; consulted by
     /// [`Scene::world_transform`] and invalidated by every structural change.
     world_cache: HashMap<Entity, Mat4>,
+    /// Component names a loaded file carried but this build does not implement.
+    /// Kept per entity so the next save can name what it dropped.
+    dropped: HashMap<Entity, Vec<String>>,
     viewport: (u32, u32),
     name: String,
     next_id: u64,
@@ -118,6 +121,7 @@ impl Scene {
             children: HashMap::new(),
             id_index: HashMap::new(),
             world_cache: HashMap::new(),
+            dropped: HashMap::new(),
             viewport: (0, 0),
             name: "Untitled".to_string(),
             next_id: seed_id(),
@@ -173,6 +177,7 @@ impl Scene {
         self.children.clear();
         self.id_index.clear();
         self.world_cache.clear();
+        self.dropped.clear();
     }
 
     pub fn contains(&self, entity: Entity) -> bool {
@@ -215,6 +220,19 @@ impl Scene {
 
     pub fn entity_of(&self, hecs: hecs::Entity) -> Option<Entity> {
         self.entities.get(&hecs).copied()
+    }
+
+    /// Component names a file carried that this build skipped while loading.
+    /// A save writes them back under `DroppedComponents` so the loss is visible.
+    pub fn dropped_components(&self, entity: Entity) -> &[String] {
+        self.dropped.get(&entity).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub(crate) fn record_dropped_component(&mut self, entity: Entity, name: &str) {
+        let names = self.dropped.entry(entity).or_default();
+        if !names.iter().any(|seen| seen == name) {
+            names.push(name.to_string());
+        }
     }
 
     /// The raw world, for a backend that needs a multi-component query
@@ -617,6 +635,7 @@ impl Scene {
         if let Some(id) = self.world.get::<&Id>(hecs).ok().map(|id| id.0) {
             self.id_index.remove(&id);
         }
+        self.dropped.remove(&entity);
 
         let _ = self.world.despawn(hecs);
         self.release(entity);
@@ -811,6 +830,9 @@ impl Clone for Scene {
             }
             if let Some(id) = self.id_component(*source) {
                 clone.id_index.insert(id.0, *target);
+            }
+            if let Some(names) = self.dropped.get(source) {
+                clone.dropped.insert(*target, names.clone());
             }
         }
         clone

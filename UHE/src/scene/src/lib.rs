@@ -3,6 +3,10 @@
 //! An ECS on `hecs`, a single-parent hierarchy with a per-frame world-transform
 //! cache, the component set, and the `.unhuman` YAML serializer.
 //!
+//! `.unhuman` is the one scene document: a save and a scene asset are the same
+//! text. A cooked binary form would be a derived import, not a second format;
+//! see [`serialize`].
+//!
 //! Two deliberate differences:
 //!
 //! * `Entity` is this crate's own generational handle rather than a bare
@@ -26,7 +30,7 @@ pub use components::{
 };
 pub use entity::{Entity, EntityRef, EntityRefMut};
 pub use scene::{euler_degrees, AssetError, LightSample, MeshSample, Scene};
-pub use serialize::{from_yaml, load, save, to_yaml, Error, Result};
+pub use serialize::{from_yaml, load, save, to_yaml, Error, Result, FORMAT_VERSION};
 
 /// `hecs` is re-exported so a backend can name `hecs::Entity` in a query through
 /// [`Scene::world`] without taking its own dependency on the ECS.

@@ -11,5 +11,5 @@ vault = { workspace = true }
 glam = { workspace = true }
 hecs = { workspace = true }
 serde = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 log = { workspace = true }
