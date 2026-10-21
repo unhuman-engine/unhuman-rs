@@ -1,52 +1,21 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use grind::Jobs;
+use grind::{CancelToken, Jobs, Priority};
 
 use crate::cache::{Cache, DEFAULT_CAPACITY};
 use crate::cache_hash::AssetHash;
-use crate::error::{Error, Result};
-use crate::id::{AssetData, AssetId, AssetKind, Handle};
-use crate::image::{decode_image, Image, MipLevel};
-use crate::ktx2::{is_ktx2, load_ktx2};
-use crate::load_model;
+use crate::decode::{
+    classify, decode_bytes, decode_key, read_and_decode, Decoded, Finished, LoadResult,
+};
+use crate::error::Result;
+use crate::id::{AssetData, AssetId, AssetKind, AssetState, Handle};
+use crate::image::{Image, MipLevel};
 use crate::mesh::{MeshData, ModelData};
+use crate::report::LoadReport;
 use crate::vfs::Vfs;
-
-/// What a finished load reports: the kind that landed, or why it did not.
-///
-/// A plain `Result` rather than a bespoke enum, because that is how a caller
-/// wants to read it: `for (id, result) in assets.poll() { if let Err(error) =
-/// result { ... } }`.
-pub type LoadResult = std::result::Result<AssetKind, Error>;
-
-/// Everything one load produced.
-///
-/// One type for the synchronous and the worker path, so both reach the registry
-/// through the same code and cannot diverge on what a slot holds.
-struct Decoded {
-    /// The content address of `bytes`: the asset's stable identity.
-    hash: AssetHash,
-    /// The address of everything this decode depended on. Equal to `hash` for a
-    /// pure decode; a model folds its directory in, because its external buffers
-    /// resolve relative to the file, and a kind is folded in because the same
-    /// bytes are text under one extension and binary under another.
-    key: AssetHash,
-    kind: AssetKind,
-    bytes: Vec<u8>,
-    image: Option<Image>,
-    mips: Vec<MipLevel>,
-    meshes: Vec<MeshData>,
-    model: Option<ModelData>,
-}
-
-/// A finished asynchronous load, sent from a worker thread.
-struct Finished {
-    id: AssetId,
-    decoded: Result<Decoded>,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LoadState {
@@ -66,6 +35,9 @@ struct Slot {
     /// The decoded payload. Shared with the cache, so two assets with identical
     /// bytes point at one decode without the registry duplicating it.
     decoded: Option<Arc<Decoded>>,
+    /// Set while an asynchronous decode is in flight, so `release` can tell the
+    /// worker to drop a load whose reason is gone.
+    cancel: Option<CancelToken>,
 }
 
 impl Slot {
@@ -78,6 +50,7 @@ impl Slot {
             hash: AssetHash::of(&[]),
             state: LoadState::Loading,
             decoded: None,
+            cancel: None,
         }
     }
 
@@ -127,13 +100,23 @@ impl Assets {
     /// capacity is how a caller bounds memory, and how eviction is exercised
     /// without loading hundreds of assets.
     pub fn with_cache_capacity(root: impl Into<PathBuf>, capacity: usize) -> Self {
+        Self::with_cache_limits(root, capacity, None)
+    }
+
+    /// A registry bounded by both entry count and, when `byte_capacity` is
+    /// positive, the estimated heap of the decoded payloads.
+    pub fn with_cache_limits(
+        root: impl Into<PathBuf>,
+        capacity: usize,
+        byte_capacity: Option<usize>,
+    ) -> Self {
         let mut vfs = Vfs::new();
         vfs.mount(root);
         let (sender, receiver) = mpsc::channel();
         Self {
             vfs,
             slots: Vec::new(),
-            cache: Cache::new(capacity),
+            cache: Cache::with_byte_capacity(capacity, byte_capacity),
             free: Vec::new(),
             paths: HashMap::new(),
             sender,
@@ -168,12 +151,12 @@ impl Assets {
             return Ok(id);
         }
         let physical = self.vfs.resolve(path)?;
-        let bytes = std::fs::read(&physical)?;
+        let bytes: Arc<[u8]> = std::fs::read(&physical)?.into();
         let hash = AssetHash::of(&bytes);
         // Identical bytes already decoded the same way are shared, so a copy of
         // a texture is a hit rather than a second decode.
-        let key = decode_key(hash, classify(path), &physical);
-        if let Some(decoded) = self.cache.get(key).cloned() {
+        let key = decode_key(hash, classify(path), &physical, Arc::clone(&bytes));
+        if let Some(decoded) = self.cache.get(&key).cloned() {
             return Ok(self.store(path, decoded));
         }
         let decoded = decode_bytes(&physical, path, bytes, hash)?;
@@ -204,9 +187,12 @@ impl Assets {
     /// Submits a load to the job system and returns its id immediately.
     ///
     /// The worker reads the file and decodes it (CPU work only) and hands the
-    /// result back through a channel that [`Assets::poll`] drains. A load that
-    /// fails is reported once, and its slot is released, so nothing is
-    /// re-delivered forever.
+    /// result back through a channel that [`Assets::poll`] drains. Until then
+    /// the id is [`AssetState::Pending`]: a consumer draws without the asset and
+    /// it appears once `poll` reports it. The decode runs at
+    /// [`Priority::Low`], because a frame that is recording is waiting and a
+    /// decode can be a frame late. A load that fails is reported once, and its
+    /// slot is released, so nothing is re-delivered forever.
     pub fn load_async(&mut self, jobs: &Jobs, path: &str) -> Result<AssetId> {
         if let Some(id) = self.live_id(path) {
             let kind = self.slot(id).map(|slot| slot.kind);
@@ -218,9 +204,13 @@ impl Assets {
 
         let physical = self.vfs.resolve(path)?;
         let id = self.allocate(path, classify(path));
+        let cancel = CancelToken::new();
+        if let Some(slot) = self.slots.get_mut(id.index() as usize) {
+            slot.cancel = Some(cancel.clone());
+        }
         let sender = self.sender.clone();
         let virtual_path = path.to_owned();
-        jobs.execute(
+        jobs.execute_cancellable(
             Box::new(move || {
                 let decoded = read_and_decode(&physical, &virtual_path);
                 // A closed receiver means the registry is gone; the result has
@@ -228,6 +218,8 @@ impl Assets {
                 let _ = sender.send(Finished { id, decoded });
             }),
             None,
+            Priority::Low,
+            cancel,
         );
         Ok(id)
     }
@@ -273,7 +265,7 @@ impl Assets {
     /// The encoded file bytes, for every kind. Valid UTF-8 for a text asset is
     /// not a promise this makes; [`Assets::text`] is the accessor for that.
     pub fn bytes(&self, id: AssetId) -> Option<&[u8]> {
-        self.slot(id)?.data().map(|data| data.bytes.as_slice())
+        self.slot(id)?.data().map(|data| &data.bytes[..])
     }
 
     /// The decoded image, which is level 0 of a KTX2 chain.
@@ -307,6 +299,17 @@ impl Assets {
         self.slot(id)?.data()?.model.as_ref()
     }
 
+    /// What the load read, skipped and substituted. Reachable from the decoded
+    /// payload, so inspecting it does not re-parse the file.
+    pub fn report(&self, id: AssetId) -> Option<&LoadReport> {
+        let decoded = self.slot(id)?.data()?;
+        decoded
+            .model
+            .as_ref()
+            .map(|model| &model.report)
+            .or(decoded.report.as_ref())
+    }
+
     /// The asset as text, or `None` when it is not a text asset or not UTF-8.
     pub fn text(&self, id: AssetId) -> Option<&str> {
         let slot = self.slot(id)?;
@@ -337,15 +340,39 @@ impl Assets {
         self.cache.capacity()
     }
 
+    /// Estimated bytes charged by the cache, and its optional byte limit.
+    pub fn cache_bytes(&self) -> usize {
+        self.cache.bytes()
+    }
+
+    pub fn cache_byte_capacity(&self) -> Option<usize> {
+        self.cache.byte_capacity()
+    }
+
     /// The virtual path this asset was loaded from.
     pub fn path(&self, id: AssetId) -> Option<&str> {
         self.slot(id).map(|slot| slot.path.as_str())
     }
 
+    /// Whether the id names a pending or a resolved asset.
+    ///
+    /// `None` for an id that names nothing at all, which is the same answer a
+    /// released asset gives. A `Pending` id is valid: it will resolve (or the
+    /// load will fail and be reported by `poll`), so a consumer holds it and
+    /// draws without the asset until then.
+    pub fn state(&self, id: AssetId) -> Option<AssetState> {
+        let slot = self.any_slot(id)?;
+        Some(match slot.state {
+            LoadState::Loading => AssetState::Pending,
+            LoadState::Ready => AssetState::Ready,
+        })
+    }
+
     /// A typed handle, or `None` when the id names nothing or names a different
-    /// payload kind than `T`.
+    /// payload kind than `T`. A pending id still yields a handle: the payload
+    /// resolves later, and `get` returns `None` until it does.
     pub fn handle<T: ?Sized + AssetData>(&self, id: AssetId) -> Option<Handle<T>> {
-        let slot = self.slot(id)?;
+        let slot = self.any_slot(id)?;
         T::accepts(slot.kind).then(|| Handle::new(id))
     }
 
@@ -381,6 +408,13 @@ impl Assets {
             self.paths.remove(&path);
         }
 
+        // A pending decode whose reason is gone is told to stop before it
+        // starts; one already running is not interrupted, but its result is
+        // discarded because the generation below no longer matches.
+        if let Some(cancel) = slot.cancel.take() {
+            cancel.cancel();
+        }
+
         // Wraps after 2^32 releases of one slot, which no session reaches.
         slot.generation = slot.generation.wrapping_add(1);
         slot.state = LoadState::Loading;
@@ -411,12 +445,19 @@ impl Assets {
         self.live == 0
     }
 
-    fn slot(&self, id: AssetId) -> Option<&Slot> {
+    /// The slot if the id's generation matches, regardless of whether the
+    /// decode has finished: a loading slot is a valid handle target.
+    fn any_slot(&self, id: AssetId) -> Option<&Slot> {
         if id.is_null() {
             return None;
         }
         let slot = self.slots.get(id.index() as usize)?;
-        (slot.generation == id.generation() && slot.state == LoadState::Ready).then_some(slot)
+        (slot.generation == id.generation()).then_some(slot)
+    }
+
+    fn slot(&self, id: AssetId) -> Option<&Slot> {
+        self.any_slot(id)
+            .filter(|slot| slot.state == LoadState::Ready)
     }
 
     fn live_id(&self, path: &str) -> Option<AssetId> {
@@ -443,6 +484,7 @@ impl Assets {
         slot.path = path.to_owned();
         slot.kind = kind;
         slot.state = LoadState::Loading;
+        slot.cancel = None;
 
         self.paths.insert(path.to_owned(), id);
         self.live += 1;
@@ -453,11 +495,13 @@ impl Assets {
     /// handle, reusing an existing entry with the same content rather than
     /// keeping a second copy of the decode.
     fn intern(&mut self, decoded: Decoded) -> Arc<Decoded> {
-        if let Some(cached) = self.cache.get(decoded.key).cloned() {
+        let key = decoded.key.clone();
+        if let Some(cached) = self.cache.get(&key).cloned() {
             return cached;
         }
+        let size = decoded.size_bytes();
         let decoded = Arc::new(decoded);
-        let _ = self.cache.insert(decoded.key, Arc::clone(&decoded));
+        let _ = self.cache.insert_sized(key, size, Arc::clone(&decoded));
         decoded
     }
 
@@ -487,121 +531,15 @@ impl Assets {
         slot.hash = decoded.hash;
         slot.state = LoadState::Ready;
         slot.decoded = Some(decoded);
+        // The decode is done; there is nothing left to cancel.
+        slot.cancel = None;
     }
-}
-
-/// The kind a virtual path's extension names.
-///
-/// Choosing a loader from the payload type the caller asked for cannot be right
-/// for a registry keyed by path, because the path is the only thing a caller
-/// has. Unknown extensions are [`AssetKind::Binary`] rather than an error,
-/// because a `.bin` nobody can decode is still worth having the bytes of.
-fn classify(path: &str) -> AssetKind {
-    let extension = path
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "bmp" | "tga" | "ktx2" => AssetKind::Image,
-        "gltf" | "glb" => AssetKind::Model,
-        "txt" | "json" | "md" | "toml" | "xml" | "csv" | "yaml" | "yml" | "unhuman" | "slang"
-        | "wgsl" | "glsl" | "vert" | "frag" | "comp" => AssetKind::Text,
-        _ => AssetKind::Binary,
-    }
-}
-
-/// The cache key for a decode: a content address over everything the decode
-/// reads, not just the bytes.
-///
-/// The loader-kind is folded in because an extension decides how the same bytes
-/// are decoded (text versus binary), so keying on bytes alone would hand a text
-/// asset's payload to a `.bin` of the same content. A model folds in its
-/// directory because its external buffers and images resolve relative to the
-/// file, so identical `.gltf` bytes in two trees can decode differently.
-fn decode_key(hash: AssetHash, kind: AssetKind, physical: &Path) -> AssetHash {
-    let mut context = hash.to_bytes().to_vec();
-    context.push(kind as u8);
-    if kind == AssetKind::Model {
-        context.extend_from_slice(physical.as_os_str().as_encoded_bytes());
-    }
-    AssetHash::of(&context)
-}
-
-/// Reads one file and decodes it, the job-system entry point.
-///
-/// The synchronous path reads the bytes first so it can look them up in the
-/// cache; this is the same work for the worker, which has no cache of its own.
-fn read_and_decode(physical: &Path, virtual_path: &str) -> Result<Decoded> {
-    let bytes = std::fs::read(physical)?;
-    let hash = AssetHash::of(&bytes);
-    decode_bytes(physical, virtual_path, bytes, hash)
-}
-
-/// Decodes bytes that were already read and hashed.
-///
-/// The single place a load happens, shared by the synchronous path and the job
-/// system. A file that is read but does not match its extension is an error,
-/// not a silent binary asset: the caller asked for it as the other kind.
-fn decode_bytes(
-    physical: &Path,
-    virtual_path: &str,
-    bytes: Vec<u8>,
-    hash: AssetHash,
-) -> Result<Decoded> {
-    let kind = classify(virtual_path);
-    let mut decoded = Decoded {
-        hash,
-        key: decode_key(hash, kind, physical),
-        kind,
-        bytes,
-        image: None,
-        mips: Vec::new(),
-        meshes: Vec::new(),
-        model: None,
-    };
-
-    match kind {
-        AssetKind::Image => {
-            if is_ktx2(&decoded.bytes) {
-                let ktx = load_ktx2(&decoded.bytes)?;
-                decoded.image = Some(Image {
-                    width: ktx.width,
-                    height: ktx.height,
-                    rgba8: ktx.rgba8,
-                    srgb: ktx.srgb,
-                });
-                decoded.mips = ktx.mips;
-            } else {
-                // A standalone image is colour data unless a caller says
-                // otherwise; the linear maps only exist inside a material, where
-                // the slot decides.
-                decoded.image = Some(decode_image(&decoded.bytes, true)?);
-            }
-        }
-        AssetKind::Model => {
-            let loaded = load_model::load(physical, &decoded.bytes)?;
-            decoded.meshes = loaded.meshes;
-            decoded.model = Some(loaded.model);
-        }
-        AssetKind::Text | AssetKind::Binary => {}
-    }
-
-    Ok(decoded)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn classification_is_by_extension_and_case_insensitive() {
-        assert_eq!(classify("textures/wall.PNG"), AssetKind::Image);
-        assert_eq!(classify("models/scene.glb"), AssetKind::Model);
-        assert_eq!(classify("shaders/pbr.wgsl"), AssetKind::Text);
-        assert_eq!(classify("data/blob"), AssetKind::Binary);
-        assert_eq!(classify("data/thing.unknownext"), AssetKind::Binary);
-    }
+    use crate::error::Error;
 
     #[test]
     fn a_missing_path_is_an_error_and_allocates_nothing() {

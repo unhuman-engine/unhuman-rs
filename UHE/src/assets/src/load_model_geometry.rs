@@ -17,6 +17,7 @@ use gltf::buffer::Data as BufferData;
 
 use crate::load_model::view_bytes;
 use crate::mesh::{MaterialData, MeshData};
+use crate::report::LoadReport;
 
 /// Extracts one primitive, or `None` when it cannot be drawn.
 ///
@@ -27,10 +28,18 @@ pub(crate) fn extract_primitive(
     buffers: &[BufferData],
     materials: &[MaterialData],
     name: &str,
+    report: &mut LoadReport,
 ) -> Option<MeshData> {
     let reader = primitive.reader(|buffer| view_bytes(buffer, buffers));
-    let positions: Vec<[f32; 3]> = reader.read_positions()?.collect();
+    let positions: Vec<[f32; 3]> = match reader.read_positions() {
+        Some(positions) => positions.collect(),
+        None => {
+            skip_primitive(report, name, "no POSITION attribute");
+            return None;
+        }
+    };
     if positions.is_empty() {
+        skip_primitive(report, name, "POSITION is empty");
         return None;
     }
     let vertex_count = positions.len();
@@ -48,10 +57,10 @@ pub(crate) fn extract_primitive(
             mesh.normals = normals;
             has_normals = true;
         } else {
-            log::warn!(
+            report.warning(format!(
                 "{name}: NORMAL count {} does not match POSITION count {vertex_count}; synthesising",
                 normals.len()
-            );
+            ));
         }
     }
     if !has_normals {
@@ -61,14 +70,14 @@ pub(crate) fn extract_primitive(
     if let Some(uvs) = reader.read_tex_coords(0).map(|uvs| uvs.into_f32()) {
         let uvs: Vec<[f32; 2]> = uvs.collect();
         if uvs.len() == vertex_count {
-            // The V flip is the engine's UV convention and this is the only
-            // place that owns it.
-            mesh.uvs = uvs.into_iter().map(|uv| [uv[0], 1.0 - uv[1]]).collect();
+            // The V flip lives in `uv`, with the transform that has to account
+            // for it, so the two cannot disagree.
+            mesh.uvs = uvs.into_iter().map(crate::uv::import_uv).collect();
         } else {
-            log::warn!(
+            report.warning(format!(
                 "{name}: TEXCOORD_0 count {} does not match POSITION count {vertex_count}; ignoring",
                 uvs.len()
-            );
+            ));
         }
     }
     if mesh.uvs.is_empty() {
@@ -83,10 +92,10 @@ pub(crate) fn extract_primitive(
         } else {
             // A partial colour array would leave a gradient at the seam, so the
             // attribute is dropped rather than half-applied.
-            log::warn!(
+            report.warning(format!(
                 "{name}: COLOR_0 count {} does not match POSITION count {vertex_count}; ignoring vertex colours",
                 colors.len()
-            );
+            ));
         }
     }
 
@@ -108,10 +117,10 @@ pub(crate) fn extract_primitive(
         if tangents.len() == vertex_count {
             mesh.tangents = tangents;
         } else {
-            log::warn!(
+            report.warning(format!(
                 "{name}: TANGENT count {} does not match POSITION count {vertex_count}; ignoring",
                 tangents.len()
-            );
+            ));
         }
     }
 
@@ -133,27 +142,42 @@ pub(crate) fn extract_primitive(
         synthesize_normals(&mut mesh);
     }
 
-    // Material index is optional and defaults to 0, and a file may name one past
-    // the end of its material list; the clamp is here so the fault does not
-    // surface at draw time, far from the load.
+    // A named material may point past the end of the list; the clamp happens
+    // here so the fault does not surface at draw time, far from the load.
     match primitive.material().index() {
         Some(index) if index < materials.len() => mesh.material = materials.get(index).cloned(),
         Some(index) => {
-            log::warn!(
-                "{name}: primitive references material {index} but the file declares {}; clamping to 0",
-                materials.len()
+            let fallback = if materials.is_empty() {
+                "using the default material".to_owned()
+            } else {
+                "using material 0".to_owned()
+            };
+            report.substitution(
+                format!("material ({name})"),
+                format!(
+                    "primitive references material {index} but the file declares {}; {fallback}",
+                    materials.len()
+                ),
             );
             mesh.material = materials.first().cloned();
         }
-        None => mesh.material = materials.first().cloned(),
+        // A missing material means the spec default, not the file's first one.
+        None => mesh.material = None,
     }
 
     compute_bounds(&mut mesh);
 
     if mesh.indices.is_empty() {
+        skip_primitive(report, name, "no drawable indices");
         return None;
     }
+    report.loaded.primitives += 1;
     Some(mesh)
+}
+
+fn skip_primitive(report: &mut LoadReport, name: &str, reason: &str) {
+    report.skipped.primitives += 1;
+    report.warning(format!("{name}: {reason}"));
 }
 
 /// Area-weighted vertex normals from the triangle geometry, for a primitive

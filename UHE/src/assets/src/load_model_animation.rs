@@ -231,6 +231,7 @@ fn fill_vector(
     values: Translations<'_>,
     interpolation: Interpolation,
 ) {
+    track.times = times.to_vec();
     if interpolation == Interpolation::CubicSpline {
         let keys = times.len();
         track.values = vec![[0.0; 3]; keys];
@@ -260,6 +261,7 @@ fn fill_quaternion(
     values: Rotations<'_>,
     interpolation: Interpolation,
 ) {
+    track.times = times.to_vec();
     let values = values.into_f32();
     if interpolation == Interpolation::CubicSpline {
         let keys = times.len();

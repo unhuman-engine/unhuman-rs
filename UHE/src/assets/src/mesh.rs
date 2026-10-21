@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::image::{Image, MipLevel};
+use crate::report::LoadReport;
 
 /// How a keyframe's interpolation is meant (`glTF` sampler interpolation).
 ///
@@ -572,4 +573,6 @@ pub struct ModelData {
     /// Reported at load time because a parsed-but-ignored extension makes an
     /// asset render with subtly wrong shading and no error anywhere.
     pub unsupported_extensions: Vec<String>,
+    /// What the load read, skipped and substituted.
+    pub report: LoadReport,
 }

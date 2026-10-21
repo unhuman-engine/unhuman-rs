@@ -4,6 +4,8 @@
 //! type, not part of the runtime [`AssetId`](crate::AssetId) scheme, and because
 //! the reference implementation is long enough to deserve its own file.
 
+use std::sync::Arc;
+
 /// The seed for the second 64-bit half, so the two halves are independent
 /// digests rather than the same one written twice.
 const SEED_HIGH: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -73,6 +75,50 @@ impl std::fmt::Display for AssetHash {
         write!(f, "{:016x}{:016x}", self.high, self.low)
     }
 }
+
+/// A cache identity: a hash for the bucket and the full content for the key.
+///
+/// [`AssetHash`] only picks a bucket. Two different byte strings can share one,
+/// so an entry is a hit only when the content also matches; otherwise both
+/// live in the same bucket and neither aliases the other.
+#[derive(Clone, Debug)]
+pub struct ContentKey {
+    hash: AssetHash,
+    content: Arc<[u8]>,
+    /// What else the decode depended on, such as the loader kind or a model's
+    /// directory. Compared along with `content`.
+    context: Arc<[u8]>,
+}
+
+impl ContentKey {
+    /// Builds a key from a bucket hash, the full bytes and their context.
+    pub fn new(
+        hash: AssetHash,
+        content: impl Into<Arc<[u8]>>,
+        context: impl Into<Arc<[u8]>>,
+    ) -> Self {
+        Self {
+            hash,
+            content: content.into(),
+            context: context.into(),
+        }
+    }
+
+    /// The bucket this key belongs to.
+    pub fn hash(&self) -> AssetHash {
+        self.hash
+    }
+}
+
+impl PartialEq for ContentKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+            && (Arc::ptr_eq(&self.content, &other.content) || self.content == other.content)
+            && (Arc::ptr_eq(&self.context, &other.context) || self.context == other.context)
+    }
+}
+
+impl Eq for ContentKey {}
 
 const P1: u64 = 0x9E37_79B1_85EB_CA87;
 const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;

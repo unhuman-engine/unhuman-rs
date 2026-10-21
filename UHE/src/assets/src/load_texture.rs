@@ -1,10 +1,11 @@
 //! Texture decoding for a glTF material slot.
 //!
-//! One cache for the whole asset: a glTF image is routinely bound by several
-//! materials and slots, and without the cache the identical pixels are decoded
-//! and resident once per reference. The key includes the colour space and the
-//! sampler, because the same image legitimately becomes both an sRGB and a
-//! linear texture, with different wrap state.
+//! One cache for the whole asset, keyed on the *image* (the file), the colour
+//! space and the sampler. Keying on the glTF texture index would decode the
+//! same image once per texture that names it, so two materials sharing an image
+//! would not share a decode; keying on the image is what makes them. The colour
+//! space and sampler stay in the key because the same file legitimately becomes
+//! both an sRGB and a linear texture, with different wrap state.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,9 +13,11 @@ use std::sync::Arc;
 
 use gltf::buffer::Data as BufferData;
 
+use crate::error::Result;
 use crate::image::{decode_image, Image, MipLevel};
 use crate::ktx2::{is_ktx2, load_ktx2};
 use crate::mesh::{Filter, SamplerData, TextureData, Wrap};
+use crate::report::LoadReport;
 
 /// Decoded material textures, keyed by (image index, colour space, sampler).
 pub(crate) type TextureCache = HashMap<(usize, bool, SamplerData), Option<Arc<TextureData>>>;
@@ -25,6 +28,7 @@ pub(crate) type TextureCache = HashMap<(usize, bool, SamplerData), Option<Arc<Te
 /// texture's own `source` is the fallback for loaders without basis support.
 /// `Texture::source` is deliberately not called, because it panics on a
 /// basisu-only texture whose `source` field is absent.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_texture(
     document: &gltf::Document,
     texture: gltf::Texture<'_>,
@@ -32,27 +36,65 @@ pub(crate) fn load_texture(
     base: &Path,
     buffers: &[BufferData],
     srgb: bool,
+    context: &str,
+    report: &mut LoadReport,
 ) -> Option<Arc<TextureData>> {
     let sampler = sampler_data(texture.sampler());
-    let key = (texture.index(), srgb, sampler);
+    let Some(image_index) = image_index(document, &texture) else {
+        skip_texture(report, context, "the texture names no image".to_owned());
+        return None;
+    };
+    let key = (image_index, srgb, sampler);
     if let Some(cached) = cache.get(&key) {
         return cached.clone();
     }
 
-    let image = image_index(document, &texture)
-        .and_then(|index| document.images().nth(index))
-        .and_then(|image| image_bytes(image.source(), base, buffers))
-        .and_then(|bytes| decode_texture(&bytes, srgb))
-        .map(|(image, mips)| {
-            Arc::new(TextureData {
-                image: Arc::new(image),
-                mips: mips.into(),
-                sampler,
-            })
-        });
+    let image = match document.images().nth(image_index) {
+        None => {
+            skip_texture(
+                report,
+                context,
+                format!("image index {image_index} is past the end of the image list"),
+            );
+            None
+        }
+        Some(image) => match image_bytes(image.source(), base, buffers) {
+            None => {
+                skip_texture(
+                    report,
+                    context,
+                    format!("image {image_index} could not be read"),
+                );
+                None
+            }
+            Some(bytes) => match decode_texture(&bytes, srgb) {
+                Ok((image, mips)) => {
+                    report.loaded.textures += 1;
+                    Some(Arc::new(TextureData {
+                        image: Arc::new(image),
+                        mips: mips.into(),
+                        sampler,
+                    }))
+                }
+                Err(error) => {
+                    skip_texture(
+                        report,
+                        context,
+                        format!("image {image_index} failed to decode: {error}"),
+                    );
+                    None
+                }
+            },
+        },
+    };
 
     cache.insert(key, image.clone());
     image
+}
+
+fn skip_texture(report: &mut LoadReport, context: &str, reason: String) {
+    report.skipped.textures += 1;
+    report.substitution(format!("texture ({context})"), reason);
 }
 
 /// The KTX2 image `KHR_texture_basisu` names, else the texture's own `source`.
@@ -73,32 +115,25 @@ fn image_index(document: &gltf::Document, texture: &gltf::Texture<'_>) -> Option
     (source != u32::MAX as usize).then_some(source)
 }
 
-/// Decodes an image payload, KTX2 or otherwise, keeping any authored mip chain.
-pub(crate) fn decode_texture(bytes: &[u8], srgb: bool) -> Option<(Image, Vec<MipLevel>)> {
+/// Decodes an image payload to RGBA8, KTX2 or otherwise.
+///
+/// One entry point for both routes, used by a material slot and by a standalone
+/// image asset, so a basisu texture and a PNG cannot diverge in how they reach
+/// a texture. A KTX2 file keeps its authored mip chain; a decoded image ships
+/// none. The colour space is the *slot's* (`srgb`), not the file's: the same
+/// bytes are an sRGB map in one slot and a linear map in another.
+pub(crate) fn decode_texture(bytes: &[u8], srgb: bool) -> Result<(Image, Vec<MipLevel>)> {
     if is_ktx2(bytes) {
-        match load_ktx2(bytes) {
-            Ok(ktx) => {
-                let image = Image {
-                    width: ktx.width,
-                    height: ktx.height,
-                    rgba8: ktx.rgba8,
-                    srgb: ktx.srgb,
-                };
-                Some((image, ktx.mips))
-            }
-            Err(error) => {
-                log::warn!("model texture: {error}");
-                None
-            }
-        }
+        let ktx = load_ktx2(bytes)?;
+        let image = Image {
+            width: ktx.width,
+            height: ktx.height,
+            rgba8: ktx.rgba8,
+            srgb,
+        };
+        Ok((image, ktx.mips))
     } else {
-        match decode_image(bytes, srgb) {
-            Ok(image) => Some((image, Vec::new())),
-            Err(error) => {
-                log::warn!("model texture: {error}");
-                None
-            }
-        }
+        Ok((decode_image(bytes, srgb)?, Vec::new()))
     }
 }
 

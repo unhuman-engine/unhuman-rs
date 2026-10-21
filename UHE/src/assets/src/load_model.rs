@@ -11,39 +11,13 @@ use glam::Mat4;
 use gltf::buffer::Data as BufferData;
 
 use crate::error::{Error, Result};
+use crate::extensions;
 use crate::load_lights::{node_light, parse_lights};
 use crate::load_material::load_materials;
 use crate::load_model_animation::{parse_animations, parse_skins};
 use crate::load_model_geometry::extract_primitive;
 use crate::mesh::{MaterialData, MeshData, ModelData, ModelNode};
-
-/// Extensions whose values reach this crate's output.
-///
-/// The list is the C++ loader's contract, minus `KHR_draco_mesh_compression`
-/// (no decoder, deliberately absent) and with `EXT_meshopt_compression` guarded
-/// separately below: its declared buffer views cannot be decoded here, so a file
-/// that actually compresses with it is refused before this list is consulted.
-/// An extension belongs here only if its values are actually shaded with,
-/// because a parsed-but-ignored extension renders subtly wrong with no error
-/// anywhere.
-const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "KHR_materials_pbrSpecularGlossiness",
-    "KHR_texture_transform",
-    "KHR_materials_unlit",
-    "KHR_materials_emissive_strength",
-    "KHR_materials_ior",
-    "KHR_materials_clearcoat",
-    "KHR_materials_specular",
-    "KHR_materials_sheen",
-    "KHR_materials_transmission",
-    "KHR_materials_volume",
-    "KHR_materials_iridescence",
-    "KHR_materials_anisotropy",
-    "KHR_materials_diffuse_transmission",
-    "KHR_lights_punctual",
-    "KHR_texture_basisu",
-    "EXT_meshopt_compression",
-];
+use crate::report::{ExtensionClass, LoadReport};
 
 pub(crate) struct LoadedModel {
     pub meshes: Vec<MeshData>,
@@ -73,7 +47,7 @@ pub(crate) fn node_transform(node: &gltf::Node<'_>) -> Mat4 {
 /// `path` is the physical file the bytes came from: a `.gltf` may reference
 /// buffers and images relative to itself, and that directory is the only thing
 /// that makes those references resolvable.
-pub(crate) fn load(path: &Path, bytes: &[u8]) -> Result<LoadedModel> {
+pub(crate) fn load(path: &Path, bytes: &[u8], report: &mut LoadReport) -> Result<LoadedModel> {
     let parsed = match gltf::Gltf::from_slice(bytes) {
         Ok(parsed) => parsed,
         // A file that fails the crate's validation is retried unvalidated
@@ -84,29 +58,52 @@ pub(crate) fn load(path: &Path, bytes: &[u8]) -> Result<LoadedModel> {
     };
 
     let gltf::Gltf { document, blob } = parsed;
+
+    // Extensions first: a required one this loader does not implement is an
+    // error before any work, and a compression extension actually applied means
+    // the buffers cannot be read at all.
+    report.extensions = extensions::check(&document)?;
+    let mut unsupported_extensions = Vec::new();
+    // Collected first: recording a warning mutates the report the loop reads.
+    let extensions = report.extensions.clone();
+    for extension in &extensions {
+        match extension.classification {
+            ExtensionClass::Handled => {}
+            ExtensionClass::Refused => {
+                report.warning(format!(
+                    "extension '{}' is refused by this build but the file does not apply it",
+                    extension.name
+                ));
+            }
+            ExtensionClass::Ignored => {
+                report.warning(format!(
+                    "extension '{}' is not implemented; ignoring it",
+                    extension.name
+                ));
+                if !unsupported_extensions
+                    .iter()
+                    .any(|seen: &String| seen == &extension.name)
+                {
+                    unsupported_extensions.push(extension.name.clone());
+                }
+            }
+        }
+    }
+    if let Some(name) = extensions::compression_in_use(&document) {
+        let reason = match extensions::classify(name) {
+            extensions::Classification::Refused(reason) => reason,
+            _ => "this crate has no decoder",
+        };
+        return Err(Error::Unsupported(format!("{name}: {reason}")));
+    }
+
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     let buffers = gltf::import_buffers(&document, Some(base), blob)
         .map_err(|error| Error::Decode(format!("glTF buffers: {error}")))?;
 
-    // A compressed view cannot be handed to the accessor readers, which see the
-    // buffer, not the view; the glTF crate has no hook to decode one. Refusing
-    // when a view actually uses the extension beats handing geometry bytes to a
-    // shader as if they were vertices.
-    if uses_meshopt(&document) {
-        return Err(Error::Unsupported(
-            "EXT_meshopt_compression: the file's buffer views are meshopt-compressed and this \
-             crate has no decoder, so the compressed bytes would decode as garbage geometry"
-                .to_owned(),
-        ));
-    }
-
-    let unsupported_extensions = collect_unsupported(&document);
-    for name in &unsupported_extensions {
-        log::warn!("glTF declares unimplemented extension '{name}' - shading may be wrong");
-    }
-
-    let materials = load_materials(&document, base, &buffers);
-    let punctual_lights = parse_lights(&document);
+    let materials = load_materials(&document, base, &buffers, report)?;
+    report.loaded.materials = materials.len();
+    let punctual_lights = parse_lights(&document)?;
     let (skins, skeleton) = parse_skins(&document, &buffers);
     let animations = parse_animations(&document, &buffers);
 
@@ -119,6 +116,7 @@ pub(crate) fn load(path: &Path, bytes: &[u8]) -> Result<LoadedModel> {
         geometry: HashMap::new(),
         mesh_data: Vec::new(),
         model_nodes: Vec::new(),
+        report,
     };
 
     let mut roots = Vec::new();
@@ -146,41 +144,16 @@ pub(crate) fn load(path: &Path, bytes: &[u8]) -> Result<LoadedModel> {
         }
     }
 
+    let report = walk.report.clone();
     let model = ModelData {
         nodes: walk.model_nodes,
         roots,
         skins,
         punctual_lights,
         unsupported_extensions,
+        report,
     };
     Ok(LoadedModel { meshes, model })
-}
-
-/// Whether any buffer view is `EXT_meshopt_compression`-compressed.
-fn uses_meshopt(document: &gltf::Document) -> bool {
-    document
-        .views()
-        .any(|view| view.extension_value("EXT_meshopt_compression").is_some())
-}
-
-/// The declared extensions this loader does not honour, each once.
-///
-/// Both lists are consulted: `extensionsRequired` is a hard requirement the file
-/// cannot be correct without, and a file may require an extension it does not
-/// list as used.
-fn collect_unsupported(document: &gltf::Document) -> Vec<String> {
-    let mut unsupported: Vec<String> = Vec::new();
-    for name in document
-        .extensions_used()
-        .chain(document.extensions_required())
-    {
-        if !SUPPORTED_EXTENSIONS.contains(&name)
-            && !unsupported.iter().any(|seen| seen.as_str() == name)
-        {
-            unsupported.push(name.to_owned());
-        }
-    }
-    unsupported
 }
 
 /// The glTF scene walk: node records in depth-first order, geometry extracted
@@ -194,6 +167,7 @@ struct Walk<'a, 'b> {
     geometry: HashMap<usize, Vec<u32>>,
     mesh_data: Vec<MeshData>,
     model_nodes: Vec<ModelNode>,
+    report: &'b mut LoadReport,
 }
 
 impl<'a, 'b> Walk<'a, 'b> {
@@ -267,13 +241,18 @@ impl<'a, 'b> Walk<'a, 'b> {
         let mut indices = Vec::new();
         for primitive in mesh.primitives() {
             if let Some(extracted) =
-                extract_primitive(&primitive, self.buffers, self.materials, &name)
+                extract_primitive(&primitive, self.buffers, self.materials, &name, self.report)
             {
                 indices.push(self.mesh_data.len() as u32);
                 self.mesh_data.push(extracted);
             }
         }
 
+        if indices.is_empty() {
+            self.report.skipped.meshes += 1;
+        } else {
+            self.report.loaded.meshes += 1;
+        }
         self.geometry.insert(mesh.index(), indices.clone());
         indices
     }
@@ -281,15 +260,6 @@ impl<'a, 'b> Walk<'a, 'b> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn draco_is_not_in_the_supported_list() {
-        assert!(!SUPPORTED_EXTENSIONS.contains(&"KHR_draco_mesh_compression"));
-        assert!(SUPPORTED_EXTENSIONS.contains(&"KHR_materials_clearcoat"));
-        assert!(SUPPORTED_EXTENSIONS.contains(&"KHR_texture_basisu"));
-    }
-
     #[test]
     fn a_nameless_file_is_not_a_valid_document() {
         assert!(gltf::Gltf::from_slice(b"").is_err());

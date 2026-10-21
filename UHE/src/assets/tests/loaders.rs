@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use grind::Jobs;
 use serde_json::Value;
-use vault::{AssetKind, Assets, Error};
+use vault::{AssetKind, AssetState, Assets, Error, Handle, MeshData};
 
 struct Scratch {
     root: PathBuf,
@@ -136,6 +136,88 @@ fn ktx2_basis_payload() -> Vec<u8> {
     bytes.extend_from_slice(&(32u64).to_le_bytes());
     bytes.extend_from_slice(&[0u8; 32]);
     bytes
+}
+
+/// Three positions, little-endian `f32`, and the smallest glTF that uses them.
+fn triangle_bin() -> Vec<u8> {
+    let mut bin = Vec::with_capacity(36);
+    for value in [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+        bin.extend_from_slice(&value.to_le_bytes());
+    }
+    bin
+}
+
+const MODEL_GLTF: &str = r#"{
+  "asset": { "version": "2.0" },
+  "scene": 0,
+  "scenes": [ { "nodes": [ 0 ] } ],
+  "nodes": [ { "name": "Node", "mesh": 0 } ],
+  "meshes": [ {
+    "name": "Tri",
+    "primitives": [ { "attributes": { "POSITION": 0 } } ]
+  } ],
+  "buffers": [ { "uri": "triangle.bin", "byteLength": 36 } ],
+  "bufferViews": [ { "buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962 } ],
+  "accessors": [ {
+    "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+    "min": [ 0.0, 0.0, 0.0 ], "max": [ 1.0, 1.0, 0.0 ]
+  } ]
+}"#;
+
+#[test]
+fn an_async_model_load_is_pending_until_polled_then_resolves() {
+    let scratch = Scratch::new("async-mesh");
+    scratch.write("model.gltf", MODEL_GLTF.as_bytes());
+    scratch.write("triangle.bin", &triangle_bin());
+
+    let jobs = Jobs::new();
+    let mut assets = scratch.assets();
+    let id = assets
+        .load_async(&jobs, "model.gltf")
+        .expect("the path resolves");
+
+    // The frame that asked draws without the asset: a valid handle exists, but
+    // the payload does not resolve yet.
+    assert_eq!(assets.state(id), Some(AssetState::Pending));
+    assert!(assets.mesh(id).is_none());
+    let handle: Handle<MeshData> = assets.handle(id).expect("a model has a mesh handle");
+    assert!(handle.get(&assets).is_none());
+    assert_eq!(handle.state(&assets), Some(AssetState::Pending));
+
+    jobs.wait_for_all();
+    let finished = assets.poll();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].0, id);
+    assert!(matches!(finished[0].1, Ok(AssetKind::Model)));
+
+    // The asset appears when the worker is done.
+    assert_eq!(assets.state(id), Some(AssetState::Ready));
+    assert_eq!(handle.state(&assets), Some(AssetState::Ready));
+    let mesh = handle
+        .get(&assets)
+        .expect("the mesh resolves after the load");
+    assert_eq!(mesh.positions.len(), 3);
+}
+
+#[test]
+fn releasing_a_pending_load_cancels_its_delivery() {
+    let scratch = Scratch::new("async-cancel");
+    scratch.write("model.gltf", MODEL_GLTF.as_bytes());
+    scratch.write("triangle.bin", &triangle_bin());
+
+    let jobs = Jobs::new();
+    let mut assets = scratch.assets();
+    let id = assets
+        .load_async(&jobs, "model.gltf")
+        .expect("the path resolves");
+    assert_eq!(assets.state(id), Some(AssetState::Pending));
+
+    // Closing the scene releases the id; the worker is told to drop the load.
+    assert!(assets.release(id));
+    jobs.wait_for_all();
+    assert!(assets.poll().is_empty(), "a cancelled load was delivered");
+    assert!(!assets.contains(id));
+    assert_eq!(assets.state(id), None);
 }
 
 #[test]

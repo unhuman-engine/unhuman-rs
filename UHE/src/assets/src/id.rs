@@ -86,6 +86,17 @@ pub enum AssetKind {
     Model,
 }
 
+/// Where a handle stands: not decoded yet, or holding a payload.
+///
+/// A load submitted to a worker is [`AssetState::Pending`] until the registry
+/// polls its result, which is what lets a frame draw without the asset instead
+/// of blocking on the decode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AssetState {
+    Pending,
+    Ready,
+}
+
 /// A typed, generation-checked reference to an asset.
 ///
 /// `T` is the payload, so a `Handle<Image>` cannot be passed where a
@@ -114,8 +125,14 @@ impl<T: ?Sized> Handle<T> {
         self.id
     }
 
-    /// The payload, or `None` when the asset was released or the slot was
-    /// reused since this handle was made.
+    /// Whether the asset is still [`AssetState::Pending`] or has resolved.
+    /// `None` when it was released or the slot was reused.
+    pub fn state(&self, assets: &Assets) -> Option<AssetState> {
+        assets.state(self.id)
+    }
+
+    /// The payload, or `None` when the decode has not finished, the asset was
+    /// released, or the slot was reused since this handle was made.
     pub fn get<'a>(&self, assets: &'a Assets) -> Option<&'a T>
     where
         T: AssetData,
