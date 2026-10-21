@@ -4,7 +4,10 @@
 //! plugin crates; this binary names them and picks the surface.
 
 mod args;
+mod crosshair;
 mod headless;
+mod hud;
+mod physics_debug;
 mod plugins;
 mod windowed;
 

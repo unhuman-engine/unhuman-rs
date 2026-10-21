@@ -18,6 +18,8 @@ pub struct Config {
     pub headless: bool,
     pub steps: u64,
     pub scene: Option<PathBuf>,
+    /// Draw femur's collider, contact and broad-phase wireframes.
+    pub physics_debug: bool,
     /// The raw arguments, so the engine factory can resolve `--backend` itself
     /// rather than this parser keeping a second copy of that rule.
     pub raw: Vec<String>,
@@ -30,6 +32,7 @@ impl Default for Config {
             headless: false,
             steps: DEFAULT_STEPS,
             scene: None,
+            physics_debug: false,
             raw: Vec::new(),
             help: false,
         }
@@ -48,6 +51,7 @@ impl Config {
             let (name, inline) = split_flag(argument);
             match name {
                 "--headless" => config.headless = true,
+                "--physics-debug" => config.physics_debug = true,
                 "--steps" => {
                     let value = value_of(name, inline, &mut rest)?;
                     config.steps = value.parse().map_err(|_| {
@@ -126,6 +130,7 @@ OPTIONS:
     --steps N        headless frames to simulate (0 = until a plugin quits)
                      [default: 10000]
     --scene PATH     load a .unhuman scene before the plugins build
+    --physics-debug  draw collider, contact and broad-phase wireframes
     --backend NAME   wgpu (default) or vulkan
     -h, --help       print this help
 

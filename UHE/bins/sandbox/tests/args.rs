@@ -18,6 +18,7 @@ fn default_is_windowed_at_ten_thousand_steps() {
     assert!(!config.headless);
     assert_eq!(config.steps, DEFAULT_STEPS);
     assert_eq!(config.scene, None);
+    assert!(!config.physics_debug);
     assert!(!config.help);
 }
 
@@ -29,6 +30,12 @@ fn no_arguments_is_the_default_apart_from_the_raw_list() {
 #[test]
 fn headless_is_a_flag() {
     assert!(parse(&["--headless"]).unwrap().headless);
+}
+
+#[test]
+fn physics_debug_is_a_flag() {
+    assert!(parse(&["--physics-debug"]).unwrap().physics_debug);
+    assert!(!parse(&[]).unwrap().physics_debug);
 }
 
 #[test]

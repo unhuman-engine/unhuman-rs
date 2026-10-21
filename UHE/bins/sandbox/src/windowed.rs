@@ -47,7 +47,7 @@ pub fn run(config: &Config) -> Result<(), String> {
 
     let instance = stormglass::create_instance();
 
-    let mut app = plugins::app();
+    let mut app = plugins::app_with_physics_debug(config.physics_debug);
     if let Some(path) = &config.scene {
         plugins::load_scene(&mut app, path)?;
     }
@@ -92,8 +92,45 @@ pub fn run(config: &Config) -> Result<(), String> {
         for event in view.events {
             app.engine_mut().events.push(event.clone());
         }
+
+        // Bifrost sizes its targets from `Gpu::extent`, so a resized window must
+        // reach the device before the frame is recorded.
+        let (width, height) = view.window.size();
+        let extent = chassis::Extent2d {
+            width: width.max(1),
+            height: height.max(1),
+        };
+        if let Some(gpu) = app.engine_mut().gpu.as_mut() {
+            if gpu.extent() != extent {
+                if let Err(error) = gpu.resize(extent) {
+                    return fail(error.to_string());
+                }
+            }
+        }
+
+        crate::hud::push(&mut app);
+        crate::physics_debug::push(&mut app);
+
         if let Err(error) = app.frame() {
             return fail(error.to_string());
+        }
+
+        // The demo exposes its state rather than drawing it, so this is the HUD
+        // until a text overlay can read the same `Report`.
+        if let Some(aimlab) = app.plugin::<aimlab::AimLabPlugin>() {
+            let report = aimlab.report();
+            let ammo = if report.ammo.reloading {
+                format!("reloading {:.0}%", report.ammo.reload_progress() * 100.0)
+            } else {
+                format!("{}/{}", report.ammo.rounds, aimlab::MAX_AMMO)
+            };
+            view.window.set_title(&format!(
+                "unhuman sandbox | {} hits / {} shots ({:.0}%) | ammo {}",
+                report.score.hits,
+                report.score.shots,
+                report.accuracy(),
+                ammo
+            ));
         }
         if app.is_running() {
             return true;

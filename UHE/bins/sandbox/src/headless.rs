@@ -10,7 +10,7 @@ use crate::plugins;
 const ENGINE_NAME: &std::ffi::CStr = c"unhuman-sandbox";
 
 pub fn run(config: &Config) -> Result<(), String> {
-    let mut app = plugins::app();
+    let mut app = plugins::app_with_physics_debug(config.physics_debug);
     if let Some(path) = &config.scene {
         plugins::load_scene(&mut app, path)?;
     }
@@ -35,8 +35,22 @@ pub fn run(config: &Config) -> Result<(), String> {
         }
     }
 
-    app.run(config.frames())
-        .map_err(|error| error.to_string())?;
+    app.start().map_err(|error| error.to_string())?;
+    let mut remaining = config.frames();
+    while app.is_running() {
+        // The HUD is queued before the frame that renders it, exactly as the
+        // windowed loop does.
+        crate::hud::push(&mut app);
+        crate::physics_debug::push(&mut app);
+        app.frame().map_err(|error| error.to_string())?;
+        if let Some(steps) = &mut remaining {
+            *steps = steps.saturating_sub(1);
+            if *steps == 0 {
+                break;
+            }
+        }
+    }
+    app.stop().map_err(|error| error.to_string())?;
 
     let engine = app.engine();
     println!(

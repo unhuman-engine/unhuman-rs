@@ -19,4 +19,5 @@ aimlab = { workspace = true }
 mirror = { workspace = true }
 chassis = { workspace = true }
 stormglass = { workspace = true }
+glam = { workspace = true }
 log = { workspace = true }

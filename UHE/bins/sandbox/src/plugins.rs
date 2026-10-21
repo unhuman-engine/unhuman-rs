@@ -12,15 +12,25 @@ use femur::FemurPlugin;
 use mirror::MirrorPlugin;
 use wire::WirePlugin;
 
+use crate::physics_debug::PhysicsDebugPlugin;
+
 /// The game plugin set, in registration order, with the repository's `assets/`
 /// mounted so relative scene and aimlab paths resolve exactly as in the editor.
-pub fn app() -> App {
-    let mut app = App::new()
+///
+/// The physics backend depends on `--physics-debug`: the two installers are
+/// mutually exclusive, and the debug one has to be the world the engine steps
+/// for its view to be current.
+pub fn app_with_physics_debug(physics_debug: bool) -> App {
+    let app = App::new()
         .add(AimLabPlugin::new())
-        .add(BifrostPlugin::new())
-        .add(WirePlugin::new())
-        .add(FemurPlugin)
-        .add(MirrorPlugin::new());
+        .add(BifrostPlugin::new().with_hud())
+        .add(WirePlugin::new());
+    let app = if physics_debug {
+        app.add(PhysicsDebugPlugin::new())
+    } else {
+        app.add(FemurPlugin)
+    };
+    let mut app = app.add(MirrorPlugin::new());
 
     app.engine_mut().assets.mount("assets");
     app
