@@ -16,26 +16,18 @@ Priority is about what blocks what, not about difficulty:
 
 ## Renderer (bifrost)
 
-### P0 - the readback is the frame
+### Fixed - the readback is the frame
 
-At 1998x1135 the engine's frame is 11.8 ms on wgpu, of which the CPU's recording
-is **0.4 ms** and the GPU plus readback is **11.2 ms**. The readback copies the
-composed image to the CPU, then *waits for the GPU to finish* (`bifrost::render`
--> `record_frame` -> `capture_readback`), so the frame is GPU + CPU with no
-overlap instead of the larger of the two. The same engine at 640x360 is 1.4 ms
-(699 fps), which is what the GPU's own time looks like.
+`bifrost` keeps a `READBACK_RING` of buffers with `READBACK_LAG` frames of
+latency, so a frame reads the image from an older submission instead of waiting
+for its own. The editor's viewport sees the image `READBACK_LAG` frames late and the
+frame no longer pays the copy as a stall.
 
-**Fixed when:** the frame time at 2.3 MP is the GPU's own time -- a readback ring
-of N buffers with a fence each, reading the frame from N-1 submissions ago, and
-no per-frame wait in the backends.
+### Fixed - the de-pad copy
 
-### P1 - the de-pad copy
-
-`strip_copy_padding` copies the whole frame again on the CPU, every frame, because
-the render width is arbitrary and the copy's rows are padded to 256 bytes.
-
-**Fixed when:** the render extent's width is a multiple of 64 texels
-(`chassis::copy_row_pitch`), the pitch equals the packed row, and the copy is gone.
+The render width is aligned to `chassis::copy_row_pitch`, so the readback's pitch
+equals the packed row and `strip_copy_padding` is gone; the frame is handed over
+without a second CPU copy.
 
 ### Fixed - the entry point is the module's own
 
@@ -55,41 +47,33 @@ bound resources are unchanged now writes into its existing buffer and keeps the
 group. `a_moving_camera_waits_for_the_oldest_frame_and_rotates_slots` asserts
 that the lap which reuses a slot destroys nothing and creates nothing.
 
-### P2 - the gizmo is invisible against the grid
+### Fixed - the gizmo is invisible against the grid
 
-Both draw the world's X and Z axes as one-pixel lines, so a selected entity at the
-origin has its X and Z arrows lying exactly on the grid's axis lines.
+The grid's axis lines are now a dark tint of the gizmo's hues (`GRID_AXIS_X`,
+`GRID_AXIS_Z` in `passes/lines.rs`) and the gizmo is recorded after the grid in
+one pass, so a selected entity at the origin reads as a bright handle.
 
-**Fixed when:** the gizmo reads as a handle at the origin -- wider lines, a
-different grid colour, or a depth treatment.
+### Fixed - shadows and SSAO are unverified
 
-### P2 - shadows and SSAO are unverified
-
-Both passes run (the frame shows the grid), but no test renders geometry and
-checks a pixel, so "the shadow map has no acne at the cascade seams" and the SSAO
-output are claims with nothing behind them.
-
-**Fixed when:** a scene with a mesh is rendered and read back in a test.
+`engine/tests/shadow_ssao.rs` renders a caster and reads the frame back: the far
+wall stays equal with and without the caster, the contact region darkens (98 to
+87 on Vulkan, 79 to 73 on wgpu), and the old kernel's flat-wall self-occlusion is
+gone.
 
 ## Backends (stormbreaker, stormglass)
 
-### P0 - nothing renders a bifrost frame on a real GPU
+### Fixed - nothing renders a bifrost frame on a real GPU
 
-`UHE/src/renderer/tests/renderer.rs` runs on `FakeGpu`. The six Vulkan bugs found
-by hand (see the `stormbreaker` commit) were invisible to the suite: no test
-recorded a real multi-pass frame through a real backend.
+`engine/tests/render_parity.rs` records the same frame through both backends and
+compares the readback images: mean 0.138, max 81, about 0.2% outliers, against
+the 0.2 / 85 target.
 
-**Fixed when:** one frame is recorded through both backends and the readback
-images are compared -- `docs/WORK.md` Phase 1's "same frame, both backends, same
-image".
+### Fixed - Vulkan's CPU recording is 20x wgpu's
 
-### P1 - Vulkan's CPU recording is 20x wgpu's
-
-Measured at 1998x1135: **8.8 ms** of recording on Vulkan against **0.4 ms** on
-wgpu, for the same graph. The per-frame work is in `record_frame` and the barrier
-encoder.
-
-**Fixed when:** profiled (RenderDoc or Tracy) and in the same order as wgpu's.
+`stormbreaker/tests/bench_recording.rs` now measures **0.708 ms** of record-only
+work at 1998x1135 with 6 passes and 300 draws per pass, against wgpu's **0.4 ms**
+for the same graph. The batched submission ring removed the per-pass queue work
+the 8.8 ms was paying for.
 
 ### Fixed - Vulkan's GPU work is 3x wgpu's
 
@@ -159,13 +143,12 @@ wall (251 rather than 255 sRGB) is gone; that was a kernel artifact, and the
 contact effect is still visible. `render_parity` is mean 0.138, max 81, against
 the target 0.2 / 85.
 
-### P1 - the wgpu swapchain
+### Fixed - the wgpu swapchain
 
-`WgpuSwapchain` is the parity gap: configure, acquire, present, resize, with a
-real `chassis::ImageView` as the current image, and `WgpuGpu::swapchain()`
-returning `Some`.
-
-**Fixed when:** a windowed `sandbox` run presents on wgpu and resizes.
+`WgpuSwapchain` configures, acquires, presents and resizes, exposes the current
+image through a real `chassis::ImageView`, and `WgpuGpu::swapchain()` returns
+`Some`. `WgpuGpu::resize` reconfigures the surface; headless it records the
+extent.
 
 ### P1 - the Vulkan windowed path cannot resize
 
@@ -175,13 +158,13 @@ nothing consumes -- there is no recreation path.
 
 **Fixed when:** a windowed Vulkan run resizes and keeps drawing.
 
-### P2 - wgpu's panics are not errors
+### Fixed - wgpu's panics are not errors
 
-`WgpuError` is a stub: `create_bind_group` and friends panic inside wgpu instead
-of returning `chassis::Error` at the `Resources` boundary.
-
-**Fixed when:** every infallible-looking wgpu call has a pre-check or an error
-scope, and the two known panics are gone.
+`WgpuResources` runs each fallible wgpu call inside `in_validation_scope`, which
+turns the uncaptured-error panic into `chassis::Error::InvalidDescriptor`, and
+`create_bind_group` pre-checks every binding against the layout. The stale-handle
+panics in `WgpuCommandBuffer` remain: they are programmer errors, not device
+validation.
 
 ### P2 - compute pipelines, both backends
 
@@ -198,10 +181,10 @@ queries; nothing in the renderer declares a compute pass yet, and
 `PassType::Transfer` still has no producer. The particle system and the light
 culling in `docs/WORK.md` Phases 6 and 8 therefore have a target but no user.
 
-### P2 - wgpu parallel recording
+### Fixed - wgpu parallel recording
 
-One encoder per pass. Easy on wgpu because there is no command pool to be the
-external-synchronisation object, and it is the parity of what Vulkan already does.
+`WgpuRenderGraphExecutor` records one encoder per pass on `grind::Jobs`, with no
+command pool to act as the external-synchronisation object, matching Vulkan.
 
 ### P3 - open decisions
 
@@ -221,16 +204,16 @@ unverified too.
 
 **Fixed when:** someone orbits with Alt+drag and presses W/E/R on a real session.
 
-### P1 - no layout persistence, no docking, no tabs
+### Fixed - no layout persistence, no docking, no tabs
 
-`Layout` is four fixed panels and three splitters. Nothing survives a restart.
+`editor::layout` persists docks, tabs and the active tab to the config path and
+loads it at launch. Panels move between docks by drag, tab behind a sibling, and
+come back from the file; `layout/tests.rs` covers the move and the round trip.
 
-**Fixed when:** a rearranged layout comes back after a relaunch.
+### Fixed - no selection outline
 
-### P2 - no selection outline
-
-The viewport draws the readback image and the gizmo. A selected entity is visible
-only by its gizmo.
+`editor::gizmo::box_batch` draws an axis-aligned box around the selected entity's
+bounds, folded into the same line batch as the gizmo so both use one upload.
 
 ### P2 - the content browser cannot drag into the viewport
 
@@ -251,24 +234,20 @@ gpui logs `focused element ... has an id but no role` for the focusable viewport
 
 ## Physics (femur)
 
-### P1 - three fixes from the port are unverified
+### Fixed - three fixes from the port are unverified
 
-- Sleeping bodies never sync back (`!IsActive` in the C++): a body that falls
-  asleep must stop writing its transform, not keep the last one.
-- `AllowedDOFs` is serialized and never applied.
-- `BoxCollider`'s `RuntimeShape` is never written.
-
-**Fixed when:** each has a test that fails without the fix.
+All three are applied and tested: `sync_out` writes the step a body falls asleep
+and skips it after, `AllowedDOFs` is a femoral component applied through Rapier's
+enabled translation/rotation axes, and `RuntimeShape` is part of `Source` so a
+changed half-extent or scale rebuilds the collider.
 
 ## Assets (vault)
 
-### P1 - every load is synchronous
+### Fixed - every load is synchronous
 
-The C++ tree loads everything synchronously and `grind` exists with no loader
-using it. A model load blocks the frame that asks for it.
-
-**Fixed when:** a mesh load happens on a worker and the frame that asked for it
-does not wait.
+`Scene::resolve_assets_async` submits every component path to `grind` and returns
+`Pending` handles; the renderer and `wire` draw nothing for them until
+`Assets::poll` reports the payload. See `assets-and-jobs.md`.
 
 ### P2 - no mesh optimisation
 
@@ -289,12 +268,9 @@ Fixed for the shader suites: nine tests in `stormbreaker` printed
 no compiler ran them green having compiled nothing. They panic now, naming
 `SLANGC`, and `scripts/gate.sh` counts `SKIP:` lines and prints the number.
 
-What is left is the same audit everywhere else: the renderer's own tests run on
-`FakeGpu`, so no test would notice a backend that records nothing (see the P0
-above), and 44 device guards still skip silently on a machine with no driver.
-
-**Fixed when:** every suite's skip count is zero on a machine that has what the
-suite needs, and the gate fails when it is not.
+The renderer's own tests still run on `FakeGpu`, but the real-GPU parity test now
+records a frame through both backends. The gate prints the skip count and fails
+when it is not zero; the last run had `0 test(s) skipped`.
 
 ### P3 - RenderDoc has no in-app trigger
 

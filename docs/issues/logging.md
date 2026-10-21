@@ -15,11 +15,11 @@ So a `log::warn!` from `bifrost` about a frame that failed to record goes to the
 terminal the editor was launched from, and the console panel shows nothing about
 it. A user who launched the editor from a desktop menu has no terminal at all.
 
-## P1 - one log, two sinks
+## Fixed - one log, two sinks
 
-**Fixed when:** the logger has a sink that can be attached at runtime, the editor
-attaches one, and the console panel shows engine records and editor records in
-one list with their level and their target.
+`adam::logging::Sink` is a trait the logger holds as `Arc<dyn Sink>`, the editor
+attaches `mirror::Console`, and the console shows engine and editor records in
+one list with level and target. The file sink stays unfiltered.
 
 Notes that matter for the design:
 
@@ -33,22 +33,19 @@ Notes that matter for the design:
   that record passes, so the sink has to be thread-safe and the panel has to be
   allowed to miss a frame of them.
 
-## P1 - the editor needs to start without a terminal
+## Fixed - the editor needs to start without a terminal
 
-Launching from a desktop entry, the process has no stderr anyone will read, so
-everything logged before the window opens is lost. That is also where the
-interesting failures are: no GPU, no driver, a shader that will not compile.
+The editor attaches a file sink next to its config, prints the path as the
+console's first line, and mirrors the same records into the panel.
 
-**Fixed when:** the editor writes its log to a file *and* to the console, and the
-path is printed in the console's first line.
+## Fixed - the console is where a command would go
 
-## P2 - the console is where a command would go
+The console has a one-line input with history; it resolves names and prefixes
+against `editor::commands`, runs them (including `undo`, `new scene`, `play`,
+`profiler`, `shortcuts`), and reports unknown or ambiguous names as errors.
 
-`mirror::console` is a buffer. The same panel is where a command line would live
-once there are commands to type -- the command registry in `mirror::commands`
-already has the vocabulary.
+## Fixed - a level filter
 
-## P3 - a level filter
-
-A debug build logs a lot. The panel needs to filter by level and by target, and
-the filter has to be the logger's, not a second copy of it.
+`Sink::enabled` is asked before a record is formatted, and `mirror::Console`
+owns the minimum level and a case-sensitive target prefix. The filter is the
+logger's, not a second pass over the panel's buffer.

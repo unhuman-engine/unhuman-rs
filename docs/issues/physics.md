@@ -67,13 +67,13 @@ Decided; the ones with code are implemented in `src/`.
 overlap the renderer's frame -- and what the one-frame latency does to a contact
 -- is the design question.
 
-## P2 - the debug view
+## Fixed - the debug view
 
 `debug::PhysicsDebug` is the data: collider wireframes, contact crosses and
 broad-phase boxes as world-space `DebugLine` segments, built by
-`Physics3D::debug_view`. `bifrost`'s line pass draws per-end vertices in its own
-format; femur does not depend on `bifrost`, so turning a `DebugLine` into that
-format is the drawing owner's job, not done here.
+`Physics3D::debug_view`. The sandbox's `--physics-debug` converts them into
+`bifrost`'s line format and draws them in the editor pass; the physics scene
+shows 196 segments from the second frame.
 
 ## To add
 

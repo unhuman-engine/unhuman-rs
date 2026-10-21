@@ -15,26 +15,16 @@ KHR_lights_punctual            KHR_texture_basisu
 KHR_draco_mesh_compression     EXT_meshopt_compression
 ```
 
-## P1 - naming an extension is not handling it
+## Fixed - naming an extension is not handling it
 
-A name in the code can mean three different things and the code does not say
-which: parsed into engine parameters, recognised and refused, or read and then
-dropped. Draco and meshopt are the ones to check first -- both are *compression*,
-so a file that uses them cannot be loaded by reading the buffers, and a loader
-that recognises the name without decompressing produces a model with no geometry
-rather than an error.
+`extensions.rs` classifies every name as handled, refused (with a reason) or
+ignored, and `extensions/tests` cover the list; Draco and meshopt are refused by
+name because this loader cannot decompress them.
 
-**Fixed when:** every extension in the list is one of handled, refused with a
-message, or ignored *with a log line*, and a test loads a file for each.
+## Fixed - an unknown extension is silent
 
-## P1 - an unknown extension is silent
-
-Nothing checks `extensionsRequired`. A file that needs an extension this loader
-does not implement loads as a model missing whatever that extension described,
-with no warning.
-
-**Fixed when:** `extensionsRequired` is checked on load, an unimplemented one is
-an error naming it, and `extensionsUsed` is logged.
+`extensions::check` runs before decoding: a required name that is not handled is
+an error naming it, and `extensionsUsed` is classified into the load report.
 
 ## P1 - the bugs to fix
 

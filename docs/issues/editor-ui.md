@@ -23,20 +23,17 @@ through the CPU, or the readback is at least asynchronous and off the frame's
 critical path. The interface the editor asks `bifrost` for is in
 `editor-viewport-seam.md`.
 
-## P1 - no layout persistence
+## Fixed - no layout persistence
 
-`Layout` in `UHE-EDITOR/editor/src/app.rs` is three widths and a height, in
-memory, for the life of the process. There is no equivalent of an `imgui.ini`.
+`editor::layout` persists docks, tabs, the active tab and panel visibility to the
+config path and loads it at launch; a rearranged layout comes back after a
+relaunch and a closed panel can be reopened from the View menu.
 
-**Fixed when:** a rearranged layout comes back after a relaunch, and a panel can
-be closed and reopened.
+## Fixed - docking and tabs
 
-## P1 - docking and tabs
-
-Every panel is fixed in place. Godot and Unity both let a panel be dragged into
-another, tabbed behind a sibling, or pulled out into its own window.
-
-**Fixed when:** a panel can be moved to a different edge, tabbed, and restored.
+Panels move between docks by drag and tab behind a sibling; `layout/tests.rs`
+covers moving a panel into another dock and the round trip through the saved
+file. Tearing a panel out into its own window is not implemented.
 
 ## P1 - the keyboard is unreachable from the viewport's perspective
 
@@ -48,13 +45,10 @@ because no key event reaches an application in this session (see `engine.md`,
 **Fixed when:** they are pressed on a real session, and the shortcut list is
 somewhere a user can find it.
 
-## P2 - no selection outline
+## Fixed - no selection outline
 
-A selected entity is visible by its gizmo and by nothing else. A model under the
-gizmo, or an entity off screen, has no indication.
-
-**Fixed when:** the selection is drawn in the viewport, and the hierarchy's
-selection matches it.
+`editor::gizmo::box_batch` draws the selected entity's bounds as an axis-aligned
+box in the same line batch as the gizmo, driven by the hierarchy's selection.
 
 ## P2 - the content browser cannot drag into the viewport
 
@@ -70,11 +64,11 @@ performs has to go through it or undo silently loses it.
 **Fixed when:** a test mutates a property, a rename, a reparent and a create, then
 undoes all four.
 
-## P2 - a menu bar, and a command registry the menus read
+## Fixed - a menu bar, and a command registry the menus read
 
-`mirror::commands` exists and the toolbar hardcodes its buttons. A menu that lists
-commands from the registry is how a shortcut and a menu stop being two places to
-change one thing.
+`editor::commands` is the one registry the menu bar, the toolbar, the shortcut
+table and the console's command line read; a command with no key is reachable
+from the menu alone.
 
 ## P3 - the theme is two systems
 
