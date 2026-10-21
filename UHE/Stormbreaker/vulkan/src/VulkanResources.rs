@@ -39,6 +39,7 @@ use crate::vulkan_descriptor_manager::Descriptors;
 use crate::vulkan_error::BackendError;
 use crate::vulkan_pipeline_state::Pipelines;
 use crate::vulkan_shader::Shaders;
+use crate::vulkan_submission_ring::SubmissionToken;
 use crate::vulkan_texture::Textures;
 
 /// Owns every device object the RHI creates.
@@ -88,6 +89,12 @@ pub struct VulkanResources {
     /// its pool and fence rather than sharing one that must be reset and waited on
     /// for every upload.
     upload: Option<crate::vulkan_upload::UploadRing>,
+    /// The fence ring submissions are tracked with, when there is one.
+    ///
+    /// Shared with the recorder: `read_buffer_after` reads a token the recorder
+    /// issued and waits on exactly the fence it names. `None` for resources
+    /// built without a recorder, where every read waits the device idle.
+    submissions: Option<Arc<crate::vulkan_submission_ring::SubmissionRing>>,
     /// `VkPhysicalDeviceLimits::minUniformBufferOffsetAlignment`.
     ///
     /// Checked in `create_bind_group` rather than left to validation, because a
@@ -140,8 +147,37 @@ impl VulkanResources {
             image_views: Registry::new(),
             samplers: Registry::new(),
             upload: None,
+            submissions: None,
             uniform_buffer_alignment: 1,
         }
+    }
+
+    /// Shares the recorder's fence ring, for `read_buffer_after`.
+    pub fn with_submissions(
+        mut self,
+        submissions: Arc<crate::vulkan_submission_ring::SubmissionRing>,
+    ) -> Self {
+        self.submissions = Some(submissions);
+        self
+    }
+
+    /// Waits for every submission the ring knows about.
+    fn wait_all(&self) -> chassis::Result<()> {
+        match &self.submissions {
+            Some(ring) => ring
+                .wait_all()
+                .map_err(|error| chassis::Error::Unsupported(error.to_string())),
+            // No recorder to wait on: the device is the only source of truth.
+            None => unsafe { self.device.device_wait_idle() }
+                .map_err(|error| chassis::Error::Unsupported(format!("vkDeviceWaitIdle: {error}"))),
+        }
+    }
+
+    /// Maps a buffer whose writes have already been retired.
+    fn read_retired(&self, buffer: &chassis::Buffer) -> chassis::Result<Vec<u8>> {
+        let buffers = self.buffers();
+        let resource = buffers.get(*buffer).ok_or(chassis::Error::InvalidHandle)?;
+        resource.read(&self.device).map_err(chassis::Error::from)
     }
 
     pub fn device(&self) -> &ash::Device {
@@ -361,7 +397,8 @@ fn declared_type(
         })?;
     Ok(match declared.kind {
         chassis::DescriptorKind::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
-        chassis::DescriptorKind::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
+        chassis::DescriptorKind::StorageBuffer
+        | chassis::DescriptorKind::StorageBufferReadWrite => vk::DescriptorType::STORAGE_BUFFER,
         other => {
             return Err(chassis::Error::InvalidDescriptor(format!(
                 "binding {binding} is a {other:?}; create_bind_group writes buffers only"
@@ -491,14 +528,13 @@ impl chassis::Resources for VulkanResources {
             "not a SPIR-V module".to_owned(),
         ))?;
 
-        // Stage is taken from the module rather than asked for: the RHI hands
-        // over SPIR-V and a label, and guessing a stage here means a vertex
-        // module created as a fragment one is accepted and fails at pipeline
-        // creation instead of here. Both stages are claimed and the pipeline
-        // picks, because a module's entry point does not say which it is.
+        // Stage is parsed from the module by `Shaders`: the RHI hands over
+        // SPIR-V and a label, and the module's own `OpEntryPoint` says what it
+        // is. Guessing a stage here would let a vertex module be accepted as a
+        // fragment one and fail at pipeline creation instead.
         let device = self.device.clone();
         self.shaders_mut()
-            .create_from_words(&device, &module.words, vk::ShaderStageFlags::ALL_GRAPHICS)
+            .create_from_words(&device, &module.words)
             .map_err(Into::into)
     }
 
@@ -520,6 +556,17 @@ impl chassis::Resources for VulkanResources {
         let mut pipelines = self.pipelines.write().expect("registry lock");
         let mut descriptors = self.descriptors.write().expect("registry lock");
         crate::vulkan_graphic_pipeline::create(&mut pipelines, &mut descriptors, &desc, &shaders)
+            .map_err(Into::into)
+    }
+
+    fn create_compute_pipeline(
+        &mut self,
+        desc: chassis::ComputePipelineDesc,
+    ) -> chassis::Result<chassis::Pipeline> {
+        let shaders = self.shaders.read().expect("registry lock");
+        let mut pipelines = self.pipelines.write().expect("registry lock");
+        let mut descriptors = self.descriptors.write().expect("registry lock");
+        crate::vulkan_compute_pipeline::create(&mut pipelines, &mut descriptors, &desc, &shaders)
             .map_err(Into::into)
     }
 
@@ -804,14 +851,31 @@ impl chassis::Resources for VulkanResources {
     }
 
     fn read_buffer(&mut self, buffer: &chassis::Buffer) -> chassis::Result<Vec<u8>> {
-        // Vulkan has no per-buffer readable flag: readability is the memory
-        // type, and `BufferResource::read` refuses memory that is not
-        // host-visible. The caller must have waited; `read` maps memory that
-        // the queue may still be writing otherwise.
-        let device = self.device.clone();
-        let buffers = self.buffers();
-        let resource = buffers.get(*buffer).ok_or(chassis::Error::InvalidHandle)?;
-        resource.read(&device).map_err(chassis::Error::from)
+        // Wait-for-all. Vulkan has no per-buffer readable flag, so the only
+        // safe stand-alone read is one where no submission can still write it.
+        self.wait_all()?;
+        self.read_retired(buffer)
+    }
+
+    fn read_buffer_after(
+        &mut self,
+        buffer: &chassis::Buffer,
+        submission: chassis::Submission,
+    ) -> chassis::Result<Vec<u8>> {
+        let Some(token) = submission.downcast_ref::<SubmissionToken>() else {
+            return Err(chassis::Error::InvalidDescriptor(
+                "read_buffer_after got a submission token from another backend".to_owned(),
+            ));
+        };
+        match &self.submissions {
+            Some(ring) => ring
+                .wait(*token)
+                .map_err(|error| chassis::Error::Unsupported(error.to_string()))?,
+            // A token with no ring to interpret it is still a token from this
+            // backend; waiting the device is the conservative reading.
+            None => self.wait_all()?,
+        }
+        self.read_retired(buffer)
     }
 
     fn destroy_texture(&mut self, texture: chassis::Texture) {

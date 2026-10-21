@@ -23,7 +23,11 @@ pub use chassis::DescriptorKind;
 pub fn descriptor_type_of(kind: DescriptorKind) -> vk::DescriptorType {
     match kind {
         DescriptorKind::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
-        DescriptorKind::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
+        // Vulkan has one storage-buffer type for read and write; the access is
+        // in the shader, so the two RHI kinds collapse here.
+        DescriptorKind::StorageBuffer | DescriptorKind::StorageBufferReadWrite => {
+            vk::DescriptorType::STORAGE_BUFFER
+        }
         DescriptorKind::SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
         // The same descriptor as `SampledImage`, and the aspect is the image's
         // own -- `VulkanTypes.aspect` reads it from the format, not the kind.

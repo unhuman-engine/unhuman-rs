@@ -92,9 +92,8 @@ fn slang_source_becomes_a_real_shader_module() {
     assert_eq!(reused, 0, "and none reused on the first request");
 }
 
-/// The same SPIR-V for two stages is two modules: Vulkan's dedup key includes
-/// the stage, and collapsing them would hand the vertex stage to a fragment
-/// pipeline that then fails deep inside the driver.
+/// The same source for two stages yields two modules: their SPIR-V differs, so
+/// they hash differently and the dedup key does not need the stage as well.
 #[test]
 fn one_source_yields_two_distinct_stage_modules() {
     let Some(context) = open_device() else { return };

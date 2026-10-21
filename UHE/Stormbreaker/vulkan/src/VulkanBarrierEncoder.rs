@@ -210,41 +210,4 @@ impl BarrierEncoder {
     pub fn device(&self) -> &ash::Device {
         &self.device
     }
-
-    /// Records one barrier. Empty transitions are dropped, so the graph does not
-    /// have to filter them before recording.
-    pub fn encode(
-        &self,
-        command_buffer: vk::CommandBuffer,
-        target: Target,
-        barrier: &ImageBarrier,
-        format: TextureFormat,
-    ) {
-        if barrier.is_empty() {
-            return;
-        }
-
-        match self.tier {
-            SyncTier::Legacy => unsafe {
-                let barriers = [image_barrier_legacy(target, *barrier, format)];
-                self.device.cmd_pipeline_barrier(
-                    command_buffer,
-                    vulkan_types::stage_legacy(barrier.src_stage),
-                    vulkan_types::stage_legacy(barrier.dst_stage),
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &barriers,
-                );
-            },
-            SyncTier::Sync2 | SyncTier::Sync2Timeline => unsafe {
-                let barriers = [image_barrier2(target, *barrier, format)];
-                let dependency = vk::DependencyInfo::default()
-                    .dependency_flags(vk::DependencyFlags::empty())
-                    .image_memory_barriers(&barriers);
-                self.device
-                    .cmd_pipeline_barrier2(command_buffer, &dependency);
-            },
-        }
-    }
 }

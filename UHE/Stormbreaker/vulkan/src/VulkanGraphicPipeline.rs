@@ -31,7 +31,10 @@ pub fn create(
     let layout = pipelines.create_layout(&desc.set_layouts, descriptors)?;
     let handle = build(pipelines, desc, shaders, layout)?;
 
-    Ok(pipelines.insert(hash, PipelineResource::new(handle, layout, &desc.label)))
+    Ok(pipelines.insert(
+        hash,
+        PipelineResource::new(handle, layout, vk::PipelineBindPoint::GRAPHICS, &desc.label),
+    ))
 }
 
 /// Compiles one graphics pipeline. Dynamic rendering, no `VkRenderPass`.
@@ -55,21 +58,35 @@ fn build(
         return Err(BackendError::InvalidHandle);
     }
 
-    // Every stage's module, as one array.
+    // Each stage's entry point comes from its own module: Slang emits `main`,
+    // naga emits the source's name, and the module is authoritative.
     //
-    // One module is one entry point, named `forge::ENTRY_POINT`: Slang renames
-    // the source's entry point to that, and so does `forge::wgsl::to_spirv_entry`.
-    // Naming the source's own name here creates no pipeline at all -- and the
-    // driver reports it as a shader error, which points at the wrong file.
-    let entry_name = std::ffi::CString::new(forge::ENTRY_POINT).expect("no interior NUL");
-    let mut stage_infos: Vec<vk::PipelineShaderStageCreateInfo> =
-        Vec::with_capacity(desc.shaders.len());
+    // The `CString`s are built first so they outlive the stage infos that point
+    // at them.
+    let mut entry_names = Vec::with_capacity(desc.shaders.len());
     for declared in &desc.shaders {
         let Some(shader) = shaders.get(declared.shader) else {
             return Err(BackendError::InvalidHandle);
         };
+        let entry = shader.entry(declared.stage).ok_or_else(|| {
+            BackendError::ShaderCompilation(format!(
+                "a {:?} stage was declared but the shader module has no entry point for it",
+                declared.stage
+            ))
+        })?;
+        entry_names.push(std::ffi::CString::new(entry).map_err(|_| {
+            BackendError::ShaderCompilation("the entry point name contains a NUL byte".to_owned())
+        })?);
+    }
+
+    let mut stage_infos: Vec<vk::PipelineShaderStageCreateInfo> =
+        Vec::with_capacity(desc.shaders.len());
+    for (declared, entry_name) in desc.shaders.iter().zip(&entry_names) {
+        let Some(shader) = shaders.get(declared.shader) else {
+            return Err(BackendError::InvalidHandle);
+        };
         stage_infos.push(vk::PipelineShaderStageCreateInfo {
-            stage: shader_stage_of(declared.stage),
+            stage: crate::vulkan_shader::stage_flags(declared.stage),
             module: shader.module(),
             p_name: entry_name.as_ptr(),
             ..Default::default()
@@ -279,18 +296,5 @@ fn front_face_of(value: u32) -> vk::FrontFace {
         vk::FrontFace::CLOCKWISE
     } else {
         vk::FrontFace::COUNTER_CLOCKWISE
-    }
-}
-
-fn shader_stage_of(stage: chassis::ShaderStage) -> vk::ShaderStageFlags {
-    match stage {
-        chassis::ShaderStage::Vertex => vk::ShaderStageFlags::VERTEX,
-        chassis::ShaderStage::Fragment => vk::ShaderStageFlags::FRAGMENT,
-        chassis::ShaderStage::Compute => vk::ShaderStageFlags::COMPUTE,
-        chassis::ShaderStage::Geometry => vk::ShaderStageFlags::GEOMETRY,
-        chassis::ShaderStage::TessellationControl => vk::ShaderStageFlags::TESSELLATION_CONTROL,
-        chassis::ShaderStage::TessellationEvaluation => {
-            vk::ShaderStageFlags::TESSELLATION_EVALUATION
-        }
     }
 }

@@ -150,8 +150,8 @@ fn a_wgpu_backend_is_usable_as_dyn_gpu() {
     assert!(!info.name.is_empty(), "the device reported a name");
     assert!(info.max_texture_size >= 2048);
     assert_eq!(
-        info.frames_in_flight, 1,
-        "one, until more are actually wired"
+        info.frames_in_flight, 3,
+        "the renderer rings its per-frame data by this depth"
     );
 
     gpu.frame_begin().expect("frame begin");
@@ -182,6 +182,32 @@ fn a_wgpu_backend_is_usable_as_dyn_gpu() {
     resources.destroy_buffer(buffer);
 
     let _: &mut dyn chassis::RenderGraph = gpu.graph();
+}
+
+/// wgpu has no pass timestamp area to read, and says so.
+///
+/// The failure this pins: a backend that reports an empty frame at zero
+/// milliseconds, which reads as "every pass is free" in the profiler panel.
+#[test]
+fn wgpu_reports_gpu_timing_as_unavailable_not_zero() {
+    let Some(gpu) = open_gpu() else { return };
+    let mut gpu: Box<dyn Gpu> = Box::new(gpu);
+
+    assert!(
+        !gpu.enable_gpu_timing(),
+        "wgpu cannot write pass timestamps"
+    );
+    gpu.collect_gpu_timings()
+        .expect("collection is a no-op, not an error");
+    assert!(
+        gpu.gpu_timings().is_empty(),
+        "unavailable is an empty list, never a zeroed pass",
+    );
+    assert_eq!(
+        gpu.gpu_frame_ms(),
+        None,
+        "and the frame time is absent, not zero",
+    );
 }
 
 /// A headless backend has no swapchain and says so.

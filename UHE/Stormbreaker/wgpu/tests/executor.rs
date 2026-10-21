@@ -3,6 +3,8 @@
 //! The graph is `chassis::graph`, built once and used by both backends. That is
 //! the claim being tested: one frame description, two very different executors.
 
+use std::sync::Arc;
+
 use chassis::graph as rg;
 use chassis::graph::{NoRecording, PassRecorder, PassScope, SlotTable};
 use chassis::{CommandList, Resources};
@@ -84,8 +86,9 @@ fn a_compiled_frame_runs_through_the_executor() {
     assert_eq!(compiled.passes.len(), 2, "both passes survive culling");
     bind_target(&mut executor, target);
 
+    let jobs = grind::Jobs::new();
     executor
-        .execute(&compiled, &NoRecording)
+        .execute(&compiled, Arc::new(NoRecording), &jobs)
         .expect("a frame with no recordings still submits");
     executor.wait_idle().expect("the queue drains");
 
@@ -126,9 +129,10 @@ fn two_frames_in_a_row_both_run() {
     let compiled = graph.compile().expect("compiles");
     bind_target(&mut executor, target);
 
+    let jobs = grind::Jobs::new();
     for _ in 0..2 {
         executor
-            .execute(&compiled, &NoRecording)
+            .execute(&compiled, Arc::new(NoRecording), &jobs)
             .expect("each frame runs");
     }
     executor.wait_idle().expect("drains");
@@ -160,8 +164,9 @@ fn an_empty_frame_submits_nothing() {
 
     let graph = rg::RenderGraph::new();
     let compiled = graph.compile().expect("an empty graph compiles");
+    let jobs = grind::Jobs::new();
     executor
-        .execute(&compiled, &NoRecording)
+        .execute(&compiled, Arc::new(NoRecording), &jobs)
         .expect("not an error");
     executor.wait_idle().expect("drains");
 
@@ -206,22 +211,34 @@ fn a_renderer_writes_one_pass_recorder_for_either_backend() {
     // compile, so a renderer that wants to collect per-pass state reaches for
     // interior mutability immediately. A `Cell` would do for a single thread and
     // would silently stop the cross-thread recording the bound exists to allow.
-    let visited = std::sync::Mutex::new(Vec::new());
-    let record = |scope: &PassScope<'_>, _list: &mut dyn CommandList| {
-        visited
-            .lock()
-            .expect("not poisoned")
-            .push(scope.name.to_owned());
-        assert_eq!(scope.extent.width, WIDTH);
-        Ok(())
+    let visited = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = {
+        let visited = Arc::clone(&visited);
+        move |scope: &PassScope<'_>, _list: &mut dyn CommandList| {
+            visited
+                .lock()
+                .expect("not poisoned")
+                .push(scope.name.to_owned());
+            assert_eq!(scope.extent.width, WIDTH);
+            Ok(())
+        }
     };
 
-    executor.execute(&compiled, &record).expect("runs");
-    let visited = visited.into_inner().expect("not poisoned");
+    let jobs = grind::Jobs::new();
+    executor
+        .execute(&compiled, Arc::new(record), &jobs)
+        .expect("runs");
+    // A worker can still hold the recorder's `Arc` for a moment after
+    // `parallel_for` returns, so the shared value is read, not unwrapped.
+    let mut visited = visited.lock().expect("not poisoned").clone();
+    // Recording order is not the guarantee -- submission order is. Passes are
+    // independent, so the workers may reach them in either order; the submit
+    // that follows is sorted back into compiled order.
+    visited.sort();
     assert_eq!(
         visited,
         vec!["draw", "resolve"],
-        "every pass was visited, in compiled order",
+        "every pass was visited exactly once",
     );
 }
 
@@ -262,20 +279,83 @@ fn a_pass_that_never_closes_its_render_scope_is_refused() {
         .read_texture(target);
     let compiled = graph.compile().expect("compiles");
 
-    let record = |scope: &PassScope<'_>, list: &mut dyn CommandList| {
+    // A real attachment: wgpu refuses a pass with none, and the point here is
+    // the unbalanced scope, not an invalid descriptor.
+    let target = executor
+        .resources_mut()
+        .create_texture(chassis::TextureDesc::new_2d(
+            chassis::Extent {
+                width: WIDTH,
+                height: HEIGHT,
+                depth: 1,
+            },
+            chassis::TextureFormat::Rgba8Unorm,
+            chassis::TextureUsage::COLOR_ATTACHMENT,
+        ))
+        .expect("an attachment for the leaky pass");
+
+    let record = move |scope: &PassScope<'_>, list: &mut dyn CommandList| {
         // Opens a scope and never ends it.
         let mut desc = chassis::RenderPassDesc::color(chassis::TextureFormat::Rgba8Unorm);
         desc.label = scope.name.to_owned();
+        desc.colors[0].texture = target;
         list.begin_rendering(&desc);
         Ok(())
     };
 
+    let jobs = grind::Jobs::new();
     let error = executor
-        .execute(&compiled, &record)
+        .execute(&compiled, Arc::new(record), &jobs)
         .expect_err("an unclosed scope must not be submitted");
     assert!(
         error.to_string().contains("leaky"),
         "the error names the pass, got {error}",
+    );
+}
+
+/// Two failing passes report the first in compiled order, not the first to
+/// finish.
+///
+/// With one worker, recording order happens to match compiled order; with
+/// several it does not. Reading the failures by pass index is what makes the
+/// answer independent of which thread won.
+#[test]
+fn a_failure_is_reported_by_compiled_order_not_thread_timing() {
+    let Some(adapter) = Adapter::request(0) else {
+        eprintln!("SKIP: no wgpu adapter");
+        return;
+    };
+    let Some((device, queue)) = adapter.create_device("stormglass-failures") else {
+        return;
+    };
+    let resources = WgpuResources::new(&device);
+    let mut executor = WgpuExecutor::new(
+        queue,
+        resources,
+        chassis::Extent2d {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+    );
+
+    let (graph, target) = two_pass_frame();
+    let compiled = graph.compile().expect("compiles");
+    bind_target(&mut executor, target);
+
+    let record = |scope: &PassScope<'_>, _list: &mut dyn CommandList| {
+        Err(chassis::Error::Unsupported(format!(
+            "{} failed",
+            scope.name
+        )))
+    };
+
+    let jobs = grind::Jobs::new();
+    let error = executor
+        .execute(&compiled, Arc::new(record), &jobs)
+        .expect_err("both passes fail");
+    assert!(
+        error.to_string().contains("draw"),
+        "the first compiled pass's error wins, got {error}",
     );
 }
 
@@ -514,14 +594,20 @@ fn the_recorded_scope_sees_the_bound_swapchain_image() {
         .resolve_backbuffer(&compiled, Some(acquired))
         .expect("the acquired image is bound");
 
-    let seen = std::sync::Mutex::new(None);
-    let record = |scope: &PassScope<'_>, _list: &mut dyn CommandList| {
-        if scope.name == "composite" {
-            *seen.lock().expect("not poisoned") = scope.texture(backbuffer);
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let record: Arc<dyn PassRecorder> = Arc::new({
+        let seen = Arc::clone(&seen);
+        move |scope: &PassScope<'_>, _list: &mut dyn CommandList| {
+            if scope.name == "composite" {
+                *seen.lock().expect("not poisoned") = scope.texture(backbuffer);
+            }
+            Ok(())
         }
-        Ok(())
-    };
-    executor.execute(&compiled, &record).expect("records");
+    });
+    let jobs = grind::Jobs::new();
+    executor
+        .execute(&compiled, Arc::clone(&record), &jobs)
+        .expect("records");
 
     assert_eq!(
         *seen.lock().expect("not poisoned"),
@@ -538,7 +624,7 @@ fn the_recorded_scope_sees_the_bound_swapchain_image() {
     assert!(error.to_string().contains("slot 3"));
 
     let error = executor
-        .execute(&compiled, &record)
+        .execute(&compiled, record, &jobs)
         .expect_err("nothing is bound to the swapchain slot");
     assert!(error.to_string().contains("slot 3"));
 }

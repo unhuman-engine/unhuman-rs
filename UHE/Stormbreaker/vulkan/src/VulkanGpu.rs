@@ -128,11 +128,15 @@ impl VulkanGpu {
         .map_err(|error| chassis::Error::Unsupported(error.to_string()))?;
 
         let memory = context.memory_properties();
+        // The recorder's fence ring is shared so `read_buffer_after` can wait on
+        // the exact submission that wrote a readback slot.
+        let submissions = recorder.submissions();
         // With the upload ring, for the same reason the wgpu backend passes its
         // queue: `bifrost` uploads its 1x1 textures while its plugin is built, and
         // a `Gpu` whose resources cannot upload cannot build the renderer.
         let resources = VulkanResources::new(&context.device, memory)
             .with_uniform_buffer_alignment(capabilities.min_uniform_buffer_offset_alignment)
+            .with_submissions(submissions)
             .with_upload(
                 &context.device,
                 &memory,
@@ -146,10 +150,9 @@ impl VulkanGpu {
             name: capabilities.device_name.clone(),
             sync_tier: capabilities.sync_tier,
             max_texture_size: capabilities.max_texture_dimension_2d,
-            // One. More needs the recorder to hold two sets of pools and submit to
-            // a swapchain image that is not the current one; claiming more here
-            // would be a lie that shows up as a validation error about a fence.
-            frames_in_flight: 1,
+            // The recorder's fence ring: submissions return without waiting, so
+            // this many may be in flight at once.
+            frames_in_flight: crate::vulkan_submission_ring::FRAMES_IN_FLIGHT as u32,
         };
 
         Ok(Self {
@@ -241,6 +244,44 @@ impl VulkanGpu {
     pub fn set_extent(&mut self, extent: chassis::Extent2d) {
         self.extent = extent;
         self.executor.set_extent(extent);
+    }
+
+    /// Starts recording per-pass GPU timestamps. Returns false when this queue
+    /// cannot write them.
+    pub fn enable_gpu_timing(&mut self) -> bool {
+        let valid_bits = self
+            .context
+            .capabilities
+            .graphics_queue_family
+            .and_then(|wanted| {
+                self.context
+                    .capabilities
+                    .queue_families
+                    .iter()
+                    .find(|family| family.index == wanted)
+                    .map(|family| family.timestamp_valid_bits)
+            })
+            .unwrap_or(0);
+        self.executor
+            .enable_gpu_timing(self.context.capabilities.timestamp_period, valid_bits)
+    }
+
+    /// The last collected per-pass times. Empty until
+    /// [`VulkanGpu::collect_gpu_timings`] runs after a wait.
+    pub fn gpu_timings(&self) -> &[crate::vulkan_gpu_profiler::GpuPassTiming] {
+        self.executor.gpu_timings()
+    }
+
+    /// Reads the timestamps for the frame just submitted. The caller waits the
+    /// submission first; collecting early is not an error, just unavailable.
+    pub fn collect_gpu_timings(&mut self) -> RhiResult<()> {
+        self.executor
+            .collect_gpu_timings()
+            .map_err(|error| chassis::Error::Unsupported(error.to_string()))
+    }
+
+    pub fn gpu_frame_ms(&self) -> Option<f32> {
+        self.executor.gpu_frame_ms()
     }
 }
 
@@ -446,8 +487,17 @@ impl VulkanGpu {
         // The acquired image has to be in PRESENT_SRC before present, and the
         // render graph cannot do it: a swapchain image is handed out by the
         // driver and no pass ever declares it.
-        self.executor
+        let token = self
+            .executor
             .transition_to_present(image, format)
+            .map_err(|error| chassis::Error::Unsupported(error.to_string()))?;
+        // Present hands the image to the presentation engine; the layout
+        // transition that precedes it has to have executed. This is one wait per
+        // presented frame, not the per-submit wait that used to serialise
+        // recording.
+        self.executor
+            .recorder_mut()
+            .wait(token)
             .map_err(|error| chassis::Error::Unsupported(error.to_string()))?;
 
         let result = self
@@ -573,12 +623,28 @@ impl chassis::Gpu for VulkanGpu {
         &mut self.resources
     }
 
+    fn enable_gpu_timing(&mut self) -> bool {
+        VulkanGpu::enable_gpu_timing(self)
+    }
+
+    fn collect_gpu_timings(&mut self) -> RhiResult<()> {
+        VulkanGpu::collect_gpu_timings(self)
+    }
+
+    fn gpu_timings(&self) -> &[chassis::GpuPassTime] {
+        VulkanGpu::gpu_timings(self)
+    }
+
+    fn gpu_frame_ms(&self) -> Option<f32> {
+        VulkanGpu::gpu_frame_ms(self)
+    }
+
     fn record_frame(
         &mut self,
         frame: &chassis::graph::CompiledGraph,
         slots: &SlotTable,
         recorder: Arc<dyn PassRecorder>,
-    ) -> RhiResult<()> {
+    ) -> RhiResult<chassis::Submission> {
         // The swapchain's extent when there is one: it is the clamped, configured
         // size, and the frontend sized this frame's targets from the same one.
         self.executor.set_extent(Swapchain::extent(self));
@@ -611,14 +677,15 @@ impl chassis::Gpu for VulkanGpu {
         // `submit` does for the same reason.
         let resources = executor_resources(&self.resources);
         let jobs = self.jobs();
-        self.executor
+        let token = self
+            .executor
             .execute(frame, resources, recorder, &jobs)
             .map_err(|error| chassis::Error::Unsupported(error.to_string()))?;
 
         // No present here. The frame loop is `frame_begin` -> this -> `submit`,
         // and `submit` owns the present: one per frame, at the point every caller
         // reaches through `Box<dyn Gpu>`.
-        Ok(())
+        Ok(chassis::Submission::new(token))
     }
 
     fn frame_begin(&mut self) -> RhiResult<()> {
@@ -652,7 +719,7 @@ impl chassis::Gpu for VulkanGpu {
                 .executor
                 .execute(&compiled, resources, Arc::new(NoRecording), &jobs),
         };
-        result.map_err(|error| chassis::Error::Unsupported(error.to_string()))?;
+        let _ = result.map_err(|error| chassis::Error::Unsupported(error.to_string()))?;
 
         // The trait's own sentence for `submit` is "submit every list produced this
         // frame, then present", and this is the only place a caller gets the second
@@ -671,6 +738,20 @@ impl chassis::Gpu for VulkanGpu {
             self.present()?;
         }
         Ok(())
+    }
+
+    fn wait_for_submission(&mut self, submission: chassis::Submission) -> RhiResult<()> {
+        let Some(token) =
+            submission.downcast_ref::<crate::vulkan_submission_ring::SubmissionToken>()
+        else {
+            return Err(chassis::Error::Unsupported(
+                "wait_for_submission got a submission token from another backend".to_owned(),
+            ));
+        };
+        self.executor
+            .recorder_mut()
+            .wait(*token)
+            .map_err(|error| chassis::Error::Unsupported(error.to_string()))
     }
 
     fn wait_idle(&mut self) {

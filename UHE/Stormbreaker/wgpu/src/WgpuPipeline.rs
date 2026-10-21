@@ -30,16 +30,36 @@ use chassis::{PipelineDesc, ShaderStage};
 use crate::wgpu_device;
 use crate::wgpu_resources::WgpuResources;
 
+/// The two pipeline objects wgpu has, behind one RHI handle.
+enum PipelineInner {
+    Render(wgpu::RenderPipeline),
+    Compute(wgpu::ComputePipeline),
+}
+
 /// A compiled pipeline and the layouts it was built against.
 pub struct PipelineResource {
-    inner: wgpu::RenderPipeline,
+    inner: PipelineInner,
     label: String,
     bind_group_layouts: Vec<wgpu::BindGroupLayout>,
 }
 
 impl PipelineResource {
-    pub fn inner(&self) -> &wgpu::RenderPipeline {
-        &self.inner
+    pub fn as_render(&self) -> Option<&wgpu::RenderPipeline> {
+        match &self.inner {
+            PipelineInner::Render(pipeline) => Some(pipeline),
+            PipelineInner::Compute(_) => None,
+        }
+    }
+
+    pub fn as_compute(&self) -> Option<&wgpu::ComputePipeline> {
+        match &self.inner {
+            PipelineInner::Render(_) => None,
+            PipelineInner::Compute(pipeline) => Some(pipeline),
+        }
+    }
+
+    pub fn is_compute(&self) -> bool {
+        matches!(self.inner, PipelineInner::Compute(_))
     }
 
     pub fn label(&self) -> &str {
@@ -57,7 +77,9 @@ impl PipelineResource {
 /// Everything the descriptor borrows, so all of it outlives the call.
 struct ShaderState<'a> {
     vertex_module: wgpu::ShaderModule,
+    vertex_entry: String,
     fragment_module: Option<wgpu::ShaderModule>,
+    fragment_entry: Option<String>,
     /// Built in the caller and stored, because `VertexBufferLayout` borrows its
     /// attributes and a layout built inside a method would borrow a `Vec` that
     /// dies when the method returns.
@@ -69,11 +91,7 @@ impl ShaderState<'_> {
     fn vertex_state(&self) -> wgpu::VertexState<'_> {
         wgpu::VertexState {
             module: &self.vertex_module,
-            // `None` means "the single entry point", which is what Slang emits:
-            // SPIR-V names it `main` regardless of what it was called in source.
-            // Spelling `Some("main")` works today and breaks the moment a shader
-            // has two entry points, which is every vertex/fragment pair.
-            entry_point: None,
+            entry_point: Some(&self.vertex_entry),
             buffers: &self.buffers,
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         }
@@ -84,7 +102,7 @@ impl ShaderState<'_> {
             .as_ref()
             .map(|module| wgpu::FragmentState {
                 module,
-                entry_point: None,
+                entry_point: self.fragment_entry.as_deref(),
                 targets: &self.targets,
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             })
@@ -151,20 +169,70 @@ pub fn create(
         immediate_size: 0,
     });
 
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(&desc.label),
-        layout: Some(&layout),
-        vertex: state.vertex_state(),
-        primitive: primitive_of(&desc.primitive),
-        depth_stencil: depth_of(&desc.depth),
-        multisample: multisample_of(desc.samples),
-        fragment: state.fragment_state(),
-        multiview_mask: None,
-        cache: None,
-    });
+    // Infallible in its signature, validated in the driver. The scope is what
+    // makes a bad pipeline an error instead of the device handler's panic.
+    let pipeline = crate::wgpu_resources::in_validation_scope(resources.device(), || {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&desc.label),
+            layout: Some(&layout),
+            vertex: state.vertex_state(),
+            primitive: primitive_of(&desc.primitive),
+            depth_stencil: depth_of(&desc.depth),
+            multisample: multisample_of(desc.samples),
+            fragment: state.fragment_state(),
+            multiview_mask: None,
+            cache: None,
+        })
+    })?;
 
     Ok(resources.register_pipeline(PipelineResource {
-        inner: pipeline,
+        inner: PipelineInner::Render(pipeline),
+        label: desc.label.clone(),
+        bind_group_layouts: layouts,
+    }))
+}
+
+/// Build a compute pipeline from an RHI description.
+///
+/// Same layout cache as a graphics pipeline: wgpu compares bind groups and
+/// pipelines by layout identity, so the shared `bind_group_layout` is what
+/// makes a group created for one usable with the other.
+pub fn create_compute(
+    resources: &mut WgpuResources,
+    desc: &chassis::ComputePipelineDesc,
+) -> chassis::Result<chassis::Pipeline> {
+    let device = resources.device().inner().clone();
+    let mut layouts = Vec::with_capacity(desc.set_layouts.len());
+    for set in &desc.set_layouts {
+        layouts.push(resources.bind_group_layout(set)?);
+    }
+    let Some(shader) = resources.get_shader(desc.shader) else {
+        return Err(chassis::Error::InvalidHandle);
+    };
+    let entry = entry_of(shader, ShaderStage::Compute)?;
+    let layout_refs: Vec<Option<&wgpu::BindGroupLayout>> = layouts.iter().map(Some).collect();
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&desc.label),
+        bind_group_layouts: &layout_refs,
+        // wgpu has no push constants. The RHI reports that rather than letting
+        // a shader declare a block no backend can fill.
+        immediate_size: 0,
+    });
+
+    let pipeline = crate::wgpu_resources::in_validation_scope(resources.device(), || {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(&desc.label),
+            layout: Some(&layout),
+            module: shader.inner(),
+            // The module owns the name, and this is what the parser read.
+            entry_point: Some(&entry),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        })
+    })?;
+
+    Ok(resources.register_pipeline(PipelineResource {
+        inner: PipelineInner::Compute(pipeline),
         label: desc.label.clone(),
         bind_group_layouts: layouts,
     }))
@@ -182,14 +250,22 @@ fn shader_state<'a>(
     buffers: Vec<Option<wgpu::VertexBufferLayout<'a>>>,
 ) -> chassis::Result<ShaderState<'a>> {
     let mut vertex = None;
+    let mut vertex_entry = None;
     let mut fragment = None;
+    let mut fragment_entry = None;
     for declared in &desc.shaders {
         let Some(shader) = resources.get_shader(declared.shader) else {
             return Err(chassis::Error::InvalidHandle);
         };
         match declared.stage {
-            ShaderStage::Vertex => vertex = Some(shader.inner().clone()),
-            ShaderStage::Fragment => fragment = Some(shader.inner().clone()),
+            ShaderStage::Vertex => {
+                vertex_entry = Some(entry_of(shader, declared.stage)?);
+                vertex = Some(shader.inner().clone());
+            }
+            ShaderStage::Fragment => {
+                fragment_entry = Some(entry_of(shader, declared.stage)?);
+                fragment = Some(shader.inner().clone());
+            }
             other => {
                 // Named, not ignored. wgpu's `VertexState`/`FragmentState` pair
                 // has no room for a geometry or tessellation stage, and dropping
@@ -202,6 +278,9 @@ fn shader_state<'a>(
         }
     }
     let vertex_module = vertex.ok_or_else(|| {
+        chassis::Error::Unsupported("a graphics pipeline needs a vertex stage".to_owned())
+    })?;
+    let vertex_entry = vertex_entry.ok_or_else(|| {
         chassis::Error::Unsupported("a graphics pipeline needs a vertex stage".to_owned())
     })?;
 
@@ -230,9 +309,23 @@ fn shader_state<'a>(
 
     Ok(ShaderState {
         vertex_module,
+        vertex_entry,
         fragment_module: fragment,
+        fragment_entry,
         buffers,
         targets,
+    })
+}
+
+/// The module's own entry name for `stage`.
+fn entry_of(
+    shader: &crate::wgpu_resources::ShaderResource,
+    stage: ShaderStage,
+) -> chassis::Result<String> {
+    shader.entry(stage).map(str::to_owned).ok_or_else(|| {
+        chassis::Error::InvalidDescriptor(format!(
+            "a {stage:?} stage was declared but the shader module has no entry point for it"
+        ))
     })
 }
 
@@ -284,6 +377,14 @@ pub(crate) fn layout_type_of(kind: chassis::DescriptorKind) -> chassis::Result<w
         // when a shader needs to write one.
         chassis::DescriptorKind::StorageBuffer => wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        // The writable half. wgpu validates this against the shader's access,
+        // so a compute shader writing through a read-only layout is refused at
+        // pipeline creation rather than at dispatch.
+        chassis::DescriptorKind::StorageBufferReadWrite => wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
             has_dynamic_offset: false,
             min_binding_size: None,
         },
@@ -405,6 +506,13 @@ mod tests {
             layout_type_of(DescriptorKind::StorageBuffer),
             Ok(BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: true },
+                ..
+            })
+        ));
+        assert!(matches!(
+            layout_type_of(DescriptorKind::StorageBufferReadWrite),
+            Ok(BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
                 ..
             })
         ));

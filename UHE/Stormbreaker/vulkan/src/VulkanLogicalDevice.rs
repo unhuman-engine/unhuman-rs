@@ -110,6 +110,7 @@ pub fn create(
         memory_budget: check.supports_memory_budget(),
         descriptor_indexing: probe.descriptor_indexing,
         max_texture_dimension_2d: properties.limits.max_image_dimension2_d,
+        timestamp_period: properties.limits.timestamp_period,
         min_uniform_buffer_offset_alignment: properties.limits.min_uniform_buffer_offset_alignment,
     };
 

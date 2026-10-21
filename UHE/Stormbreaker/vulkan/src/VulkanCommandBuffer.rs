@@ -45,6 +45,9 @@ pub struct Recording {
     /// is: a bind group's validity is defined relative to the bound pipeline, so
     /// the thing that has to remember it is the thing that records the bind.
     layout: vk::PipelineLayout,
+    /// The bind point of the bound pipeline. Descriptor sets are bound at the
+    /// same point, and graphics and compute are distinct.
+    bind_point: vk::PipelineBindPoint,
 }
 
 impl Recording {
@@ -56,6 +59,7 @@ impl Recording {
             slot,
             rendering: false,
             layout: vk::PipelineLayout::null(),
+            bind_point: vk::PipelineBindPoint::GRAPHICS,
         }
     }
 
@@ -140,29 +144,28 @@ impl Recording {
         unsafe { self.device.cmd_set_scissor(self.buffer, 0, &[scissor]) };
     }
 
-    pub fn bind_pipeline(&mut self, pipeline: vk::Pipeline, layout: vk::PipelineLayout) {
+    pub fn bind_pipeline(
+        &mut self,
+        bind_point: vk::PipelineBindPoint,
+        pipeline: vk::Pipeline,
+        layout: vk::PipelineLayout,
+    ) {
         unsafe {
             self.device
-                .cmd_bind_pipeline(self.buffer, vk::PipelineBindPoint::GRAPHICS, pipeline)
+                .cmd_bind_pipeline(self.buffer, bind_point, pipeline)
         };
         // Remembered, not discarded: `vkCmdBindDescriptorSets` must be given the
         // layout of the currently bound pipeline, so binding a group against a
         // null layout is a validation error.
         self.layout = layout;
-    }
-
-    pub fn bind_compute_pipeline(&mut self, pipeline: vk::Pipeline) {
-        unsafe {
-            self.device
-                .cmd_bind_pipeline(self.buffer, vk::PipelineBindPoint::COMPUTE, pipeline)
-        };
+        self.bind_point = bind_point;
     }
 
     pub fn bind_group(&mut self, set: u32, group: vk::DescriptorSet, layout: vk::PipelineLayout) {
         unsafe {
             self.device.cmd_bind_descriptor_sets(
                 self.buffer,
-                vk::PipelineBindPoint::GRAPHICS,
+                self.bind_point,
                 layout,
                 set,
                 &[group],
@@ -319,6 +322,40 @@ impl Recording {
         unsafe { self.device.cmd_pipeline_barrier2(self.buffer, &dependency) };
     }
 
+    /// A timestamp after every command recorded so far in this list. Only the
+    /// profiler calls this; a frame that is not profiled records none.
+    pub fn write_timestamp2(&mut self, pool: vk::QueryPool, query: u32) {
+        unsafe {
+            self.device.cmd_write_timestamp2(
+                self.buffer,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                pool,
+                query,
+            )
+        };
+    }
+
+    pub fn write_timestamp(&mut self, pool: vk::QueryPool, query: u32) {
+        unsafe {
+            self.device.cmd_write_timestamp(
+                self.buffer,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                pool,
+                query,
+            )
+        };
+    }
+
+    /// Clears the query pool before this frame's first timestamp. Recorded in
+    /// the first list rather than reset on the host, so the reset has an order
+    /// relative to the writes that follows even on the 1.0 path.
+    pub fn reset_query_pool(&mut self, pool: vk::QueryPool, query_count: u32) {
+        unsafe {
+            self.device
+                .cmd_reset_query_pool(self.buffer, pool, 0, query_count)
+        };
+    }
+
     pub fn is_inside_rendering(&self) -> bool {
         self.rendering
     }
@@ -454,6 +491,14 @@ impl chassis::CommandList for CommandList<'_> {
         self.recording.end_rendering();
     }
 
+    fn begin_compute(&mut self) {
+        // Vulkan has no compute scope: a dispatch is legal anywhere outside a
+        // render pass, and the bind point comes from the pipeline. Kept so a
+        // recorder written against the trait works on both backends.
+    }
+
+    fn end_compute(&mut self) {}
+
     fn set_viewport(&mut self, extent: chassis::Extent2d) {
         self.recording.set_viewport(vk::Extent2D {
             width: extent.width,
@@ -467,9 +512,11 @@ impl chassis::CommandList for CommandList<'_> {
 
     fn bind_pipeline(&mut self, pipeline: &chassis::Pipeline) {
         match self.pipelines.get(*pipeline) {
-            Some(resource) => self
-                .recording
-                .bind_pipeline(resource.handle(), resource.layout()),
+            Some(resource) => self.recording.bind_pipeline(
+                resource.bind_point(),
+                resource.handle(),
+                resource.layout(),
+            ),
             // An unresolved handle means the pipeline was destroyed while a pass
             // still referenced it. Binding nothing would fail later and less
             // clearly, so this is reported now.
@@ -495,12 +542,16 @@ impl chassis::CommandList for CommandList<'_> {
             .bind_group(set, handle.handle(), self.recording.layout);
     }
 
-    fn set_push_constants(&mut self, data: &[u8]) {
-        self.recording.set_push_constants(
-            vk::PipelineLayout::null(),
-            vk::ShaderStageFlags::ALL,
-            data,
-        );
+    fn set_push_constants(&mut self, _data: &[u8]) -> chassis::Result<()> {
+        // Vulkan supports push constants, but a pipeline layout must declare the
+        // range first and `PipelineDesc`/`ComputePipelineDesc` have no field for
+        // one. Calling `vkCmdPushConstants` against the empty range is a
+        // validation error, which is what the old null layout produced.
+        Err(chassis::Error::Unsupported(
+            "push constants need a declared pipeline range, which this RHI does \
+             not carry; use a small uniform buffer"
+                .to_owned(),
+        ))
     }
 
     fn bind_vertex_buffer(&mut self, slot: u32, buffer: &chassis::Buffer, offset: u64) {

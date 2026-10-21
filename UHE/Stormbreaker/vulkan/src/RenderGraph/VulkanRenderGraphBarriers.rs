@@ -23,12 +23,12 @@
 //! `vulkan_render_graph_resources`. Doing it per barrier here would mean the
 //! same lookup twice per barrier, with two chances to disagree.
 
-use ash::vk;
 use chassis::graph::pass::SlotTable;
 // The trait, not just the type: `begin_rendering` and `set_viewport` are trait
 // methods, and `VulkanCommandList`'s inherent methods do not cover them.
 use chassis::CommandList as _;
 
+use crate::vulkan_barrier_batch::BarrierBatch;
 use crate::vulkan_barrier_encoder::BarrierEncoder;
 use crate::vulkan_command_buffer::CommandList as VulkanCommandList;
 use crate::vulkan_error::{BackendError, Result};
@@ -46,29 +46,23 @@ pub fn record_pre_barriers(
     buffers: &crate::vulkan_buffer::Buffers,
     list: &mut VulkanCommandList<'_>,
 ) -> Result<u32> {
-    let mut count = 0u32;
     let buffer = list.raw().handle();
+    let mut batch = BarrierBatch::new(encoder);
 
     for barrier in &pass.pre_barriers {
         if barrier.is_empty() {
-            continue; // the encoder would drop it; do not count it either
+            continue; // the batch would drop it; do not count it either
         }
         let Some(handle) = slots.texture(barrier.texture) else {
             return Err(BackendError::InvalidHandle);
         };
         let resource = textures.get(handle).ok_or(BackendError::InvalidHandle)?;
-        encoder.encode(
-            buffer,
-            resource.barrier_target(),
-            barrier,
-            resource.format(),
-        );
-        count += 1;
+        batch.image(resource.barrier_target(), barrier, resource.format());
     }
 
-    // Buffer barriers go through the free functions rather than the encoder,
-    // because a buffer has no subresource range and no format -- the encoder's
-    // `Target` is an image concept and would be a lie here.
+    // Buffer barriers go through the batch rather than the encoder, because a
+    // buffer has no subresource range and no format -- the encoder's `Target` is
+    // an image concept and would be a lie here.
     for barrier in &pass.pre_buffer_barriers {
         let Some(handle) = slots.buffer(barrier.buffer) else {
             return Err(BackendError::InvalidHandle);
@@ -80,46 +74,10 @@ pub fn record_pre_barriers(
             (_, chassis::graph::WHOLE_SIZE) => (0, resource.size()),
             (offset, size) => (offset, size),
         };
-        unsafe {
-            // Sync2 and Sync2Timeline both use `vkCmdPipelineBarrier2`; they
-            // differ in semaphore type, not in barrier spelling. Matching on the
-            // tier name instead is how a tier gets added and one branch silently
-            // stops compiling.
-            match encoder.tier().uses_sync2() {
-                true => {
-                    let barriers = [crate::vulkan_barrier_encoder::buffer_barrier2(
-                        resource.handle(),
-                        offset,
-                        size,
-                        *barrier,
-                    )];
-                    let dependency = vk::DependencyInfo::default()
-                        .dependency_flags(vk::DependencyFlags::empty())
-                        .buffer_memory_barriers(&barriers);
-                    encoder.device().cmd_pipeline_barrier2(buffer, &dependency);
-                }
-                false => {
-                    let barriers = [crate::vulkan_barrier_encoder::buffer_barrier_legacy(
-                        resource.handle(),
-                        offset,
-                        size,
-                        *barrier,
-                    )];
-                    encoder.device().cmd_pipeline_barrier(
-                        buffer,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &barriers,
-                        &[],
-                    );
-                }
-            }
-        }
-        count += 1;
+        batch.buffer(resource.handle(), offset, size, barrier);
     }
-    Ok(count)
+
+    Ok(batch.flush(buffer))
 }
 
 /// Record a pass's post barriers, after the pass body and the render scope.
@@ -140,8 +98,8 @@ pub fn record_post_barriers(
     textures: &Textures,
     list: &mut VulkanCommandList<'_>,
 ) -> Result<u32> {
-    let mut count = 0u32;
     let buffer = list.raw().handle();
+    let mut batch = BarrierBatch::new(encoder);
     for barrier in &pass.post_barriers {
         if barrier.is_empty() {
             continue;
@@ -150,15 +108,9 @@ pub fn record_post_barriers(
             return Err(BackendError::InvalidHandle);
         };
         let resource = textures.get(handle).ok_or(BackendError::InvalidHandle)?;
-        encoder.encode(
-            buffer,
-            resource.barrier_target(),
-            barrier,
-            resource.format(),
-        );
-        count += 1;
+        batch.image(resource.barrier_target(), barrier, resource.format());
     }
-    Ok(count)
+    Ok(batch.flush(buffer))
 }
 
 /// Begin dynamic rendering for a pass, if it has attachments. Returns whether a

@@ -21,6 +21,14 @@ optional = true
 version = "0.6"
 optional = true
 
+[dev-dependencies]
+bifrost = { workspace = true }
+glam = { workspace = true }
+grind = { workspace = true }
+meats = { workspace = true }
+stormglass = { workspace = true }
+vault = { workspace = true }
+
 [features]
 default = []
 alloc = ["dep:vma"]

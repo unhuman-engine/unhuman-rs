@@ -211,6 +211,8 @@ pub struct Capabilities {
     pub memory_budget: bool,
     pub descriptor_indexing: bool,
     pub max_texture_dimension_2d: u32,
+    /// Nanoseconds per timestamp tick, for the GPU profiler.
+    pub timestamp_period: f32,
     /// `VkPhysicalDeviceLimits::minUniformBufferOffsetAlignment`.
     ///
     /// Read once at device creation so anything writing a descriptor can refuse a

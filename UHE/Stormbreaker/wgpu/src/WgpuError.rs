@@ -3,14 +3,13 @@
 //! The twin of `stormbreaker`'s `VulkanError.rs`: `chassis::Error` says what a
 //! frontend can recover from, this says what wgpu reported before it became that.
 //!
-//! ## What it cannot catch
+//! ## What it covers
 //!
-//! Not every wgpu failure returns. `create_shader_module` and `create_bind_group`
-//! are infallible in wgpu 30 and report a bad argument by panicking, so the check
-//! has to happen *before* the call -- see the SPIR-V magic check in
-//! `WgpuResources::create_shader` and the `count: Some(1)` note beside
-//! `bind_group_layout`. A `WgpuError` therefore means a call returned, never that
-//! wgpu was happy.
+//! Surface and adapter negotiation. Resource creation reports a bad argument
+//! through the device's uncaptured-error handler, which panics with no scope
+//! installed; `in_validation_scope` in `WgpuResources` turns those into
+//! `chassis::Error::InvalidDescriptor`. A `WgpuError` therefore means a call
+//! returned, never that wgpu was happy.
 
 use std::fmt;
 

@@ -11,6 +11,17 @@
 //!
 //! Both express the same dependency. The caller never asks which, which is the
 //! point: `Recorder::uses_timeline` exists only for diagnostics.
+//!
+//! ## Batched submits
+//!
+//! A caller with its own synchronisation -- the render graph, which emits a
+//! barrier for every cross-pass dependency -- can put every list in one
+//! `vkQueueSubmit2`/`vkQueueSubmit` and pay no semaphore at all. Command buffers
+//! in one submit execute in submission order, and a barrier's first scope reaches
+//! back across that order, so the graph's barriers are the ordering. This is
+//! `batched`: no wait, no signal, one submit. A caller with no barriers (a raw
+//! `Recorder::submit`) keeps the chain, which is the only thing ordering its
+//! lists.
 
 use ash::{vk, Device};
 
@@ -31,6 +42,9 @@ pub struct Chain<'a> {
     /// The timeline value this chain starts from. Frames in flight advance it by
     /// the chain length.
     pub value_base: u64,
+    /// One submit with no semaphores, for a caller that supplies its own
+    /// synchronisation. See the module comment.
+    pub batched: bool,
 }
 
 impl Chain<'_> {
@@ -38,10 +52,50 @@ impl Chain<'_> {
         if self.buffers.is_empty() {
             return Ok(());
         }
+        if self.batched {
+            return match self.tier {
+                SyncTier::Sync2 | SyncTier::Sync2Timeline => self.submit_sync2_batched(),
+                SyncTier::Legacy => self.submit_legacy_batched(),
+            };
+        }
         match self.tier {
             SyncTier::Sync2 | SyncTier::Sync2Timeline => self.submit_sync2(),
             SyncTier::Legacy => self.submit_legacy(),
         }
+    }
+
+    /// One `vkQueueSubmit2` holding every list, with no semaphores.
+    fn submit_sync2_batched(&self) -> Result<()> {
+        let command_infos: Vec<vk::CommandBufferSubmitInfo> = self
+            .buffers
+            .iter()
+            .map(|b| vk::CommandBufferSubmitInfo {
+                command_buffer: *b,
+                device_mask: 0,
+                ..Default::default()
+            })
+            .collect();
+
+        let submit = vk::SubmitInfo2 {
+            command_buffer_info_count: command_infos.len() as u32,
+            p_command_buffer_infos: command_infos.as_ptr(),
+            ..Default::default()
+        };
+
+        unsafe { self.device.queue_submit2(self.queue, &[submit], self.fence) }
+            .map_err(|e| BackendError::vk("vkQueueSubmit2", e))
+    }
+
+    /// One `vkQueueSubmit` holding every list, with no semaphores.
+    fn submit_legacy_batched(&self) -> Result<()> {
+        let submit = vk::SubmitInfo {
+            command_buffer_count: self.buffers.len() as u32,
+            p_command_buffers: self.buffers.as_ptr(),
+            ..Default::default()
+        };
+
+        unsafe { self.device.queue_submit(self.queue, &[submit], self.fence) }
+            .map_err(|e| BackendError::vk("vkQueueSubmit", e))
     }
 
     /// `vkQueueSubmit2`: one semaphore, values `base + 1 ..= base + n`.

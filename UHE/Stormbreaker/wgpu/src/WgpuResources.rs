@@ -109,6 +109,7 @@ impl TextureResource {
 pub struct ShaderResource {
     inner: wgpu::ShaderModule,
     label: String,
+    entries: Vec<chassis::EntryPoint>,
 }
 
 impl ShaderResource {
@@ -118,6 +119,14 @@ impl ShaderResource {
 
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// The module's name for `stage`, which is what a pipeline must ask for.
+    pub fn entry(&self, stage: chassis::ShaderStage) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|entry| entry.stage == stage)
+            .map(|entry| entry.name.as_str())
     }
 }
 
@@ -151,6 +160,29 @@ pub struct WgpuResources {
     bind_group_layouts: std::collections::HashMap<u64, wgpu::BindGroupLayout>,
 }
 
+/// Run `create` inside a validation error scope and return what wgpu captured.
+///
+/// Several wgpu creation calls are infallible in their signature but validate
+/// the object they were handed. With no scope installed the error reaches the
+/// device handler and panics; the scope turns it into the `Result` the RHI
+/// promises. Scope push/pop is thread-local, so this stays on the caller's
+/// thread.
+pub(crate) fn in_validation_scope<T>(
+    device: &Device,
+    create: impl FnOnce() -> T,
+) -> chassis::Result<T> {
+    let scope = device
+        .inner()
+        .push_error_scope(wgpu::ErrorFilter::Validation);
+    let value = create();
+    match pollster::block_on(scope.pop()) {
+        Some(error) => Err(chassis::Error::InvalidDescriptor(format!(
+            "wgpu rejected the object: {error}"
+        ))),
+        None => Ok(value),
+    }
+}
+
 impl WgpuResources {
     pub fn new(device: &Device) -> Self {
         Self::with_queue(device, None)
@@ -178,6 +210,44 @@ impl WgpuResources {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Maps `buffer` and polls with `poll`, which is where the wait lives.
+    fn read_buffer_with(
+        &mut self,
+        buffer: &chassis::Buffer,
+        poll: wgpu::PollType,
+    ) -> chassis::Result<Vec<u8>> {
+        let resource = self
+            .buffers
+            .get(*buffer)
+            .ok_or(chassis::Error::InvalidHandle)?;
+        // Refused here rather than left to wgpu, which validates the map against
+        // the creation usage and reports it through an error scope -- a panic
+        // when none is installed, and an unactionable one at that.
+        if !resource.usage().contains(chassis::BufferUsage::MAP_READ) {
+            return Err(chassis::Error::Unsupported(
+                "read_buffer needs a buffer created with BufferUsage::MAP_READ".to_owned(),
+            ));
+        }
+
+        let slice = resource.inner().slice(..);
+        // `map_async`'s callback runs from `poll`, so the poll is not optional:
+        // without it the callback never fires and the range is not mapped.
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+
+        self.device
+            .inner()
+            .poll(poll)
+            .map_err(|_| chassis::Error::DeviceLost)?;
+
+        let view = slice.get_mapped_range().map_err(|error| {
+            chassis::Error::Unsupported(format!("buffer not mappable: {error}"))
+        })?;
+        let bytes = view.to_vec();
+        drop(view);
+        resource.inner().unmap();
+        Ok(bytes)
     }
 
     pub fn get_buffer(&self, handle: chassis::Buffer) -> Option<&BufferResource> {
@@ -333,13 +403,14 @@ impl WgpuResources {
                 count: binding_count(binding.count),
             });
         }
-        let layout =
+        let layout = in_validation_scope(&self.device, || {
             self.device
                 .inner()
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some(&desc.label),
                     entries: &entries,
-                });
+                })
+        })?;
         self.bind_group_layouts.insert(key, layout.clone());
         Ok(layout)
     }
@@ -504,32 +575,34 @@ impl chassis::Resources for WgpuResources {
     fn create_shader(&mut self, label: &str, spirv: &[u8]) -> chassis::Result<chassis::Shader> {
         let module = forge::Module::from_bytes(spirv)
             .ok_or_else(|| chassis::Error::InvalidDescriptor("not SPIR-V".to_owned()))?;
+        let entries = chassis::spirv::entry_points(&module.words)
+            .filter(|entries| !entries.is_empty())
+            .ok_or_else(|| {
+                chassis::Error::InvalidDescriptor(
+                    "the module has no entry point, so no pipeline can name it".to_owned(),
+                )
+            })?;
 
-        // The magic number is checked above by `forge`, and that check is doing
-        // more than tidiness: wgpu's `create_shader_module` is infallible, so a
-        // module it dislikes goes to an error scope, and with no scope installed
-        // it *panics*. Vulkan's returns `Result` and does not. Validating here is
-        // what makes the two backends agree on the common case -- truncated and
-        // wrong-magic input.
-        //
-        // What it does not catch is a module with a correct magic number and a
-        // corrupt body. That panics here and is not caught, deliberately: a panic
-        // is loud and immediate, and wrapping it in a catch would turn a
-        // specific failure into a silent wrong answer.
-        let inner = self
-            .device
-            .inner()
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                // SPIR-V, straight from forge. The same bytes the Vulkan backend
-                // takes: one compiler, two consumers. naga validates on the way
-                // in, so a malformed module is reported here rather than as an
-                // opaque failure at pipeline creation.
-                source: wgpu::ShaderSource::SpirV(Cow::Owned(module.words)),
-            });
+        // The magic number is checked by `forge`; the error scope catches what
+        // the magic cannot. `create_shader_module` is infallible in wgpu and
+        // reports a corrupt body through the device handler, which panics when
+        // no scope is installed. This is the scope, so the two backends agree.
+        let inner = in_validation_scope(&self.device, || {
+            self.device
+                .inner()
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some(label),
+                    // SPIR-V, straight from forge. The same bytes the Vulkan
+                    // backend takes: one compiler, two consumers. naga validates
+                    // on the way in, so a malformed module is reported here
+                    // rather than as an opaque failure at pipeline creation.
+                    source: wgpu::ShaderSource::SpirV(Cow::Owned(module.words)),
+                })
+        })?;
         Ok(self.shaders.create(ShaderResource {
             inner,
             label: label.to_owned(),
+            entries,
         }))
     }
 
@@ -538,6 +611,13 @@ impl chassis::Resources for WgpuResources {
         desc: chassis::PipelineDesc,
     ) -> chassis::Result<chassis::Pipeline> {
         crate::wgpu_pipeline::create(self, &desc)
+    }
+
+    fn create_compute_pipeline(
+        &mut self,
+        desc: chassis::ComputePipelineDesc,
+    ) -> chassis::Result<chassis::Pipeline> {
+        crate::wgpu_pipeline::create_compute(self, &desc)
     }
 
     fn create_bind_group(
@@ -553,18 +633,11 @@ impl chassis::Resources for WgpuResources {
         // pipeline and the failure would be at draw time, naming neither.
         let group_layout = self.bind_group_layout(layout)?;
 
-        // Checked here because `create_bind_group` cannot report it.
-        //
-        // wgpu's `create_bind_group` is infallible: it panics on a binding the
-        // layout does not declare ("Unable to find a corresponding declaration
-        // for the given binding 9"). Vulkan returns an error for the same mistake
-        // and the RHI returns `Result`, so a caller cannot defend itself -- the
-        // only way to give it an error instead of a panic is to refuse first.
-        //
-        // This is the same asymmetry as shader module creation, where wgpu panics
-        // on a corrupt SPIR-V body and Vulkan returns `Result`. The rule that
-        // follows: where a wgpu call cannot fail, this layer checks what it needs
-        // and turns the panic into an error.
+        // Checked here as well as scoped below. The scope catches the validation
+        // error, but a binding the layout does not declare is the caller's
+        // mistake and can be named without a driver message. Vulkan returns an
+        // error for the same mistake, so the RHI returning `Result` must not be
+        // a lie on this backend.
         let declared = |binding: u32| -> chassis::Result<chassis::DescriptorKind> {
             layout
                 .bindings
@@ -664,14 +737,15 @@ impl chassis::Resources for WgpuResources {
             });
         }
 
-        let group = self
-            .device
-            .inner()
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&layout.label),
-                layout: &group_layout,
-                entries: &entries,
-            });
+        let group = in_validation_scope(&self.device, || {
+            self.device
+                .inner()
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&layout.label),
+                    layout: &group_layout,
+                    entries: &entries,
+                })
+        })?;
         Ok(self.bind_groups.create(group))
     }
 
@@ -771,36 +845,27 @@ impl chassis::Resources for WgpuResources {
     }
 
     fn read_buffer(&mut self, buffer: &chassis::Buffer) -> chassis::Result<Vec<u8>> {
-        let resource = self
-            .buffers
-            .get(*buffer)
-            .ok_or(chassis::Error::InvalidHandle)?;
-        // Refused here rather than left to wgpu, which validates the map against
-        // the creation usage and reports it through an error scope -- a panic
-        // when none is installed, and an unactionable one at that.
-        if !resource.usage().contains(chassis::BufferUsage::MAP_READ) {
+        self.read_buffer_with(buffer, wgpu::PollType::wait_indefinitely())
+    }
+
+    fn read_buffer_after(
+        &mut self,
+        buffer: &chassis::Buffer,
+        submission: chassis::Submission,
+    ) -> chassis::Result<Vec<u8>> {
+        let Some(index) = submission.downcast_ref::<wgpu::SubmissionIndex>() else {
             return Err(chassis::Error::Unsupported(
-                "read_buffer needs a buffer created with BufferUsage::MAP_READ".to_owned(),
+                "read_buffer_after got a submission token from another backend".to_owned(),
             ));
-        }
-
-        let slice = resource.inner().slice(..);
-        // `map_async`'s callback runs from `poll`, so the poll is not optional:
-        // without it the callback never fires and the range is not mapped.
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-
-        self.device
-            .inner()
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|_| chassis::Error::DeviceLost)?;
-
-        let view = slice.get_mapped_range().map_err(|error| {
-            chassis::Error::Unsupported(format!("buffer not mappable: {error}"))
-        })?;
-        let bytes = view.to_vec();
-        drop(view);
-        resource.inner().unmap();
-        Ok(bytes)
+        };
+        // Only this submission: a ring slot written `READBACK_LAG` frames ago is
+        // usually already retired, so the poll returns without waiting for the
+        // frame just submitted.
+        let poll = wgpu::PollType::Wait {
+            submission_index: Some(index.clone()),
+            timeout: None,
+        };
+        self.read_buffer_with(buffer, poll)
     }
 
     fn destroy_texture(&mut self, texture: chassis::Texture) {

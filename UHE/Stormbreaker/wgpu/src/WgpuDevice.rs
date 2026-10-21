@@ -299,6 +299,7 @@ pub fn to_wgpu_format(format: TextureFormat) -> Option<wgpu::TextureFormat> {
         TextureFormat::Bgra8Srgb => wgpu::TextureFormat::Bgra8UnormSrgb,
         TextureFormat::R16Float => wgpu::TextureFormat::R16Float,
         TextureFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
+        TextureFormat::Rgba16Uint => wgpu::TextureFormat::Rgba16Uint,
         TextureFormat::R32Float => wgpu::TextureFormat::R32Float,
         TextureFormat::R32G32Float => wgpu::TextureFormat::Rg32Float,
         // wgpu has no 3-channel 32-bit float, so a caller asking for one gets
@@ -328,6 +329,7 @@ pub fn from_wgpu_format(format: wgpu::TextureFormat) -> Option<TextureFormat> {
         wgpu::TextureFormat::Bgra8UnormSrgb => TextureFormat::Bgra8Srgb,
         wgpu::TextureFormat::R16Float => TextureFormat::R16Float,
         wgpu::TextureFormat::Rgba16Float => TextureFormat::Rgba16Float,
+        wgpu::TextureFormat::Rgba16Uint => TextureFormat::Rgba16Uint,
         wgpu::TextureFormat::R32Float => TextureFormat::R32Float,
         wgpu::TextureFormat::Rg32Float => TextureFormat::R32G32Float,
         wgpu::TextureFormat::Rgba32Float => TextureFormat::Rgba32Float,
@@ -381,6 +383,7 @@ pub fn to_vertex_format(format: TextureFormat) -> Option<wgpu::VertexFormat> {
         TextureFormat::R32G32Float => wgpu::VertexFormat::Float32x2,
         TextureFormat::R32G32B32Float => wgpu::VertexFormat::Float32x3,
         TextureFormat::Rgba32Float => wgpu::VertexFormat::Float32x4,
+        TextureFormat::Rgba16Uint => wgpu::VertexFormat::Uint16x4,
         // The packed unorm formats, which is how a mesh format usually arrives.
         _ => return None,
     })

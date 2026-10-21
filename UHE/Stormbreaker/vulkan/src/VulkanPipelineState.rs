@@ -107,14 +107,24 @@ impl PipelineHash {
 pub struct PipelineResource {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
+    /// Which `vkCmdBindPipeline` bind point the pipeline belongs to. A bind
+    /// group must be bound at the same point, and the two are not
+    /// interchangeable.
+    bind_point: vk::PipelineBindPoint,
     label: String,
 }
 
 impl PipelineResource {
-    pub fn new(pipeline: vk::Pipeline, layout: vk::PipelineLayout, label: &str) -> Self {
+    pub fn new(
+        pipeline: vk::Pipeline,
+        layout: vk::PipelineLayout,
+        bind_point: vk::PipelineBindPoint,
+        label: &str,
+    ) -> Self {
         Self {
             pipeline,
             layout,
+            bind_point,
             label: label.to_string(),
         }
     }
@@ -125,6 +135,10 @@ impl PipelineResource {
 
     pub fn layout(&self) -> vk::PipelineLayout {
         self.layout
+    }
+
+    pub fn bind_point(&self) -> vk::PipelineBindPoint {
+        self.bind_point
     }
 
     pub fn label(&self) -> &str {

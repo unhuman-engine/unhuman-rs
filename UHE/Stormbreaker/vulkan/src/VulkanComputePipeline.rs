@@ -11,25 +11,12 @@ use crate::vulkan_error::{BackendError, Result};
 use crate::vulkan_pipeline_state::{PipelineHash, PipelineResource, Pipelines};
 use crate::vulkan_shader::Shaders;
 
-/// What a compute pass declares. No vertex layout, no attachments: a compute
-/// pipeline has none of either.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ComputePipelineDesc {
-    pub label: String,
-    pub shader: chassis::Shader,
-    /// Descriptor set shapes, indexed by set number. Empty is legal and common.
-    pub set_layouts: Vec<chassis::DescriptorSetLayoutDesc>,
-}
-
-impl ComputePipelineDesc {
-    pub fn new(label: impl Into<String>, shader: chassis::Shader) -> Self {
-        Self {
-            label: label.into(),
-            shader,
-            set_layouts: Vec::new(),
-        }
-    }
-}
+/// One description for both backends.
+///
+/// Re-exported rather than defined here: a second struct with the same fields is
+/// how the two backends drift until a pipeline that creates on one cannot be
+/// described to the other.
+pub use chassis::ComputePipelineDesc;
 
 pub fn create(
     pipelines: &mut Pipelines,
@@ -46,7 +33,10 @@ pub fn create(
     // A compute pipeline declares its sets on the description, like graphics.
     let layout = pipelines.create_layout(&desc.set_layouts, descriptors)?;
     let handle = build(pipelines, desc, shaders, layout)?;
-    Ok(pipelines.insert(hash, PipelineResource::new(handle, layout, &desc.label)))
+    Ok(pipelines.insert(
+        hash,
+        PipelineResource::new(handle, layout, vk::PipelineBindPoint::COMPUTE, &desc.label),
+    ))
 }
 
 /// Hashes the compute description. Kept separate from `PipelineHash` because the
@@ -79,8 +69,17 @@ fn build(
         return Err(BackendError::InvalidHandle);
     };
 
-    // One module is one entry point, named `forge::ENTRY_POINT`.
-    let entry_name = std::ffi::CString::new(forge::ENTRY_POINT).expect("no interior NUL");
+    // The module owns its entry point name, which is `main` from Slang and the
+    // source's own name from naga.
+    let entry = shader.entry(chassis::ShaderStage::Compute).ok_or_else(|| {
+        BackendError::ShaderCompilation(
+            "a compute pipeline was declared but the shader module has no compute entry point"
+                .to_owned(),
+        )
+    })?;
+    let entry_name = std::ffi::CString::new(entry).map_err(|_| {
+        BackendError::ShaderCompilation("the entry point name contains a NUL byte".to_owned())
+    })?;
     let stage = vk::PipelineShaderStageCreateInfo {
         stage: vk::ShaderStageFlags::COMPUTE,
         module: shader.module(),

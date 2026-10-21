@@ -107,6 +107,7 @@ pub struct ShaderResource {
     module: vk::ShaderModule,
     hash: u64,
     stage: vk::ShaderStageFlags,
+    entries: Vec<chassis::EntryPoint>,
 }
 
 impl ShaderResource {
@@ -121,6 +122,28 @@ impl ShaderResource {
     pub fn stage(&self) -> vk::ShaderStageFlags {
         self.stage
     }
+
+    /// The module's name for `stage`, which is what a pipeline must ask for.
+    pub fn entry(&self, stage: chassis::ShaderStage) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|entry| entry.stage == stage)
+            .map(|entry| entry.name.as_str())
+    }
+}
+
+/// The Vulkan flag for a stage the RHI can name.
+pub fn stage_flags(stage: chassis::ShaderStage) -> vk::ShaderStageFlags {
+    match stage {
+        chassis::ShaderStage::Vertex => vk::ShaderStageFlags::VERTEX,
+        chassis::ShaderStage::Fragment => vk::ShaderStageFlags::FRAGMENT,
+        chassis::ShaderStage::Compute => vk::ShaderStageFlags::COMPUTE,
+        chassis::ShaderStage::Geometry => vk::ShaderStageFlags::GEOMETRY,
+        chassis::ShaderStage::TessellationControl => vk::ShaderStageFlags::TESSELLATION_CONTROL,
+        chassis::ShaderStage::TessellationEvaluation => {
+            vk::ShaderStageFlags::TESSELLATION_EVALUATION
+        }
+    }
 }
 
 /// Owns shader modules, deduplicated by content hash.
@@ -130,7 +153,7 @@ pub struct Shaders {
     /// dereferenced later.
     device: Option<ash::Device>,
     registry: Registry<ShaderResource, chassis::ShaderTag>,
-    by_hash: HashMap<(u64, vk::ShaderStageFlags), Shader>,
+    by_hash: HashMap<u64, Shader>,
     compiled: u32,
     reused: u32,
 }
@@ -152,12 +175,12 @@ impl Shaders {
         }
     }
 
-    /// The cached module for this SPIR-V and stage, if one was loaded.
+    /// The cached module for this SPIR-V, if one was loaded.
     ///
     /// Split out from `create` so the dedup rule is testable without a device,
     /// which is the part most likely to be wrong.
-    pub fn lookup(&self, spirv: &[u8], stage: vk::ShaderStageFlags) -> Option<Shader> {
-        self.by_hash.get(&(content_hash(spirv), stage)).copied()
+    pub fn lookup(&self, spirv: &[u8]) -> Option<Shader> {
+        self.by_hash.get(&content_hash(spirv)).copied()
     }
 
     /// Creates a module from words `forge` already validated.
@@ -166,18 +189,13 @@ impl Shaders {
     /// the magic number and produced words, so this skips the byte
     /// reinterpretation `create` has to do. A shader that arrived from Slang
     /// should never be re-validated or re-aligned to reach the driver.
-    pub fn create_from_words(
-        &mut self,
-        device: &ash::Device,
-        words: &[u32],
-        stage: vk::ShaderStageFlags,
-    ) -> Result<Shader> {
+    pub fn create_from_words(&mut self, device: &ash::Device, words: &[u32]) -> Result<Shader> {
         if words.first().copied() != Some(SPIRV_MAGIC) {
             return Err(BackendError::MalformedSpirv {
                 len: words.len() * 4,
             });
         }
-        self.upload(device, words, stage)
+        self.upload(device, words)
     }
 
     /// Compile a Slang source through `forge` and create the module.
@@ -195,42 +213,37 @@ impl Shaders {
         let module = forge
             .compile(&request, scratch)
             .map_err(|error| BackendError::ShaderCompilation(error.to_string()))?;
-        let flags = shader_stage_flags(module.stage).ok_or_else(|| {
-            BackendError::ShaderCompilation(format!(
-                "{} is not a stage this backend can bind",
-                module.stage
-            ))
-        })?;
-        self.create_from_words(device, &module.words, flags)
+        self.create_from_words(device, &module.words)
     }
 
-    /// Creates a module, or returns the existing one when the same SPIR-V for
-    /// the same stage was already loaded this run.
-    pub fn create(
-        &mut self,
-        device: &ash::Device,
-        spirv: &[u8],
-        stage: vk::ShaderStageFlags,
-    ) -> Result<Shader> {
+    /// Creates a module, or returns the existing one when the same SPIR-V was
+    /// already loaded this run.
+    pub fn create(&mut self, device: &ash::Device, spirv: &[u8]) -> Result<Shader> {
         let words = spirv_to_words(spirv)?;
-        self.upload(device, words, stage)
+        self.upload(device, words)
     }
 
     /// The shared dedup-then-upload path behind every `create*`.
-    fn upload(
-        &mut self,
-        device: &ash::Device,
-        words: &[u32],
-        stage: vk::ShaderStageFlags,
-    ) -> Result<Shader> {
+    fn upload(&mut self, device: &ash::Device, words: &[u32]) -> Result<Shader> {
         // Hash the words, not the bytes: both entry points see the same module,
         // so hashing the input type would mean hashing a different buffer for
         // the same content.
         let hash = content_hash_words(words);
-        if let Some(existing) = self.by_hash.get(&(hash, stage)) {
+        if let Some(existing) = self.by_hash.get(&hash) {
             self.reused += 1;
             return Ok(*existing);
         }
+
+        let entries = chassis::spirv::entry_points(words)
+            .filter(|entries| !entries.is_empty())
+            .ok_or(BackendError::MalformedSpirv {
+                len: words.len() * 4,
+            })?;
+        let stage = entries
+            .iter()
+            .fold(vk::ShaderStageFlags::empty(), |flags, entry| {
+                flags | stage_flags(entry.stage)
+            });
 
         let create_info = vk::ShaderModuleCreateInfo::default().code(words);
         let module = unsafe { device.create_shader_module(&create_info, None) }
@@ -240,8 +253,9 @@ impl Shaders {
             module,
             hash,
             stage,
+            entries,
         });
-        self.by_hash.insert((hash, stage), handle);
+        self.by_hash.insert(hash, handle);
         self.compiled += 1;
         Ok(handle)
     }
@@ -254,7 +268,7 @@ impl Shaders {
         let Some(resource) = self.registry.get(handle) else {
             return false;
         };
-        self.by_hash.remove(&(resource.hash, resource.stage));
+        self.by_hash.remove(&resource.hash);
         if let Some(resource) = self.registry.remove(handle) {
             unsafe { device.destroy_shader_module(resource.module, None) };
             true

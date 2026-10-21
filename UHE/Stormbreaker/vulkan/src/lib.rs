@@ -12,6 +12,8 @@
 
 #[path = "VulkanAllocation.rs"]
 pub mod vulkan_allocation;
+#[path = "VulkanBarrierBatch.rs"]
+pub mod vulkan_barrier_batch;
 #[path = "VulkanBarrierEncoder.rs"]
 pub mod vulkan_barrier_encoder;
 #[path = "VulkanBuffer.rs"]
@@ -44,6 +46,8 @@ pub mod vulkan_fence;
 pub mod vulkan_frame_context;
 #[path = "VulkanFramebuffer.rs"]
 pub mod vulkan_framebuffer;
+#[path = "VulkanGpuProfiler.rs"]
+pub mod vulkan_gpu_profiler;
 #[path = "VulkanGraphicPipeline.rs"]
 pub mod vulkan_graphic_pipeline;
 #[path = "VulkanImageView.rs"]
@@ -64,6 +68,8 @@ pub mod vulkan_scopes;
 pub mod vulkan_semaphore;
 #[path = "VulkanShader.rs"]
 pub mod vulkan_shader;
+#[path = "VulkanSubmissionRing.rs"]
+pub mod vulkan_submission_ring;
 #[path = "VulkanSubmitEncoder.rs"]
 pub mod vulkan_submit_encoder;
 #[path = "VulkanSwapChain.rs"]
@@ -97,11 +103,13 @@ pub use vulkan_extension_check::{select_sync_tier, Capabilities, QueueFamily, Sy
 pub use vulkan_extension_check::{version_major, version_minor};
 pub use vulkan_fence::Fence;
 pub use vulkan_frame_context::Recorder;
+pub use vulkan_gpu_profiler::{GpuPassTiming, GpuProfiler};
 pub use vulkan_graphic_pipeline as graphic;
 pub use vulkan_pipeline_cache::PipelineCache;
 pub use vulkan_pipeline_state::{PipelineHash, PipelineResource, Pipelines};
 pub use vulkan_semaphore::Semaphore;
 pub use vulkan_shader::{content_hash, ShaderResource, Shaders};
+pub use vulkan_submission_ring::{SubmissionRing, SubmissionToken, FRAMES_IN_FLIGHT};
 pub use vulkan_texture::{TextureResource, Textures};
 pub use vulkan_upload::UploadRing;
 #[path = "VulkanGpu.rs"]

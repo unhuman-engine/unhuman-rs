@@ -39,7 +39,11 @@ impl Fence {
     }
 
     pub fn is_signalled(&self) -> bool {
-        unsafe { self.device.get_fence_status(self.fence) }.is_ok()
+        // NOT_READY is `Ok(false)`, not an error; `is_ok` would call it signalled.
+        matches!(
+            unsafe { self.device.get_fence_status(self.fence) },
+            Ok(true)
+        )
     }
 
     /// Blocks until signalled. Returns false on timeout.

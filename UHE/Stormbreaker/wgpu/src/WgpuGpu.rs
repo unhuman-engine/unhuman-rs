@@ -70,9 +70,20 @@ pub struct WgpuGpu {
     /// The pass recorder a frame is driven by. `None` until one is installed,
     /// which is not an error: a frame with no frontend attached still submits.
     recorder: Option<Arc<dyn PassRecorder>>,
+    /// The shared recording pool. Built on the first frame that records, so a
+    /// headless test that never submits does not pay for the threads.
+    jobs: std::sync::OnceLock<Arc<grind::Jobs>>,
 }
 
 impl WgpuGpu {
+    /// The shared recording pool, created on first use.
+    ///
+    /// The same lifetime as the device: a pool per frame would spawn threads the
+    /// frame then waits on, which is the cost parallel recording exists to avoid.
+    pub fn jobs(&self) -> Arc<grind::Jobs> {
+        Arc::clone(self.jobs.get_or_init(|| Arc::new(grind::Jobs::new())))
+    }
+
     /// A headless device.
     ///
     /// The default construction: no window, no surface, no swapchain. A `Gpu`
@@ -163,12 +174,11 @@ impl WgpuGpu {
             name,
             sync_tier: SyncTier::Sync2Timeline,
             max_texture_size,
-            // One. wgpu orders submissions to a queue itself and gives back a
-            // promise per submit, so more than one frame in flight is a real
-            // option here, and it is not wired. Claiming 2 here would be the
-            // same "one less than the truth" that the Vulkan backend's
-            // `frames_in_flight: 1` deliberately is not.
-            frames_in_flight: 1,
+            // wgpu orders submissions to a queue itself and reports each one
+            // through a `SubmissionIndex`. Three is what the frontend's ring
+            // holds, matching the Vulkan backend, so both backends let the
+            // same number of frames overlap.
+            frames_in_flight: 3,
         };
 
         Self {
@@ -181,6 +191,7 @@ impl WgpuGpu {
             extent,
             surface: None,
             recorder: None,
+            jobs: std::sync::OnceLock::new(),
         }
     }
 
@@ -415,6 +426,24 @@ impl chassis::Gpu for WgpuGpu {
         self.executor.resources_mut()
     }
 
+    // wgpu exposes no timestamp query for a render pass here. The seam is
+    // answered, not left to a zero: unsupported, empty, and no frame time.
+    fn enable_gpu_timing(&mut self) -> bool {
+        false
+    }
+
+    fn collect_gpu_timings(&mut self) -> RhiResult<()> {
+        Ok(())
+    }
+
+    fn gpu_timings(&self) -> &[chassis::GpuPassTime] {
+        &[]
+    }
+
+    fn gpu_frame_ms(&self) -> Option<f32> {
+        None
+    }
+
     fn frame_begin(&mut self) -> RhiResult<()> {
         self.graph.reset();
         if let Some(surface) = self.surface.as_mut() {
@@ -454,7 +483,8 @@ impl chassis::Gpu for WgpuGpu {
             Some(recorder) => recorder,
             None => Arc::new(NoRecording),
         };
-        self.executor.execute(&compiled, recorder.as_ref())?;
+        let jobs = self.jobs();
+        let _ = self.executor.execute(&compiled, recorder, &jobs)?;
 
         // The trait's own sentence for `submit` is "submit every list produced this
         // frame, then present", and this is the only place a caller gets the second
@@ -480,7 +510,7 @@ impl chassis::Gpu for WgpuGpu {
         frame: &chassis::graph::CompiledGraph,
         slots: &SlotTable,
         recorder: Arc<dyn PassRecorder>,
-    ) -> RhiResult<()> {
+    ) -> RhiResult<chassis::Submission> {
         // The swapchain's extent when there is one: it is the clamped, configured
         // size, and the frontend sized this frame's targets from the same one.
         let extent = chassis::Swapchain::extent(self);
@@ -499,12 +529,29 @@ impl chassis::Gpu for WgpuGpu {
         let acquired = self.surface.as_ref().and_then(WgpuSurface::texture);
         self.executor.resolve_backbuffer(frame, acquired)?;
 
-        self.executor.execute(frame, recorder.as_ref())?;
+        let jobs = self.jobs();
+        let submission = self.executor.execute(frame, recorder, &jobs)?;
 
         // No present here, deliberately: `submit` is the frame loop's last call and
         // the single present site, and this frame is already recorded onto the
         // queue, so `submit` presents it. Presenting here too would present twice
         // per frame -- once for this frame and once for the backend's own graph.
+        Ok(chassis::Submission::new(submission))
+    }
+
+    fn wait_for_submission(&mut self, submission: chassis::Submission) -> RhiResult<()> {
+        let Some(index) = submission.downcast_ref::<wgpu::SubmissionIndex>() else {
+            return Err(chassis::Error::Unsupported(
+                "wait_for_submission got a submission token from another backend".to_owned(),
+            ));
+        };
+        self.device
+            .inner()
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(index.clone()),
+                timeout: None,
+            })
+            .map_err(|_| chassis::Error::DeviceLost)?;
         Ok(())
     }
 

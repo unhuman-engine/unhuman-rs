@@ -39,6 +39,7 @@ use crate::vulkan_command_buffer::{CommandList as VulkanCommandList, Recording};
 use crate::vulkan_descriptor_manager::Descriptors;
 use crate::vulkan_error::{BackendError, Result};
 use crate::vulkan_frame_context::Recorder;
+use crate::vulkan_gpu_profiler::{self, GpuPassTiming, GpuProfiler, PassQueries};
 use crate::vulkan_pipeline_state::Pipelines;
 use crate::vulkan_render_graph_barriers::{
     open_render_scope, record_post_barriers, record_pre_barriers,
@@ -176,6 +177,9 @@ fn attachment_extent(
 #[allow(clippy::too_many_arguments)]
 fn record_pass(
     pass: &chassis::graph::CompiledPass,
+    position: u32,
+    pass_count: u32,
+    queries: Option<PassQueries>,
     encoder: &BarrierEncoder,
     slots: &SlotTable,
     textures: &Textures,
@@ -186,7 +190,19 @@ fn record_pass(
 ) -> RecordedPass {
     let mut barriers = 0u32;
     let outcome = (|| -> Result<()> {
+        if let Some(queries) = queries {
+            if position == 0 {
+                list.raw().reset_query_pool(queries.pool, queries.capacity);
+                vulkan_gpu_profiler::write_timestamp(list.raw(), queries, 0);
+            }
+        }
+
         barriers += record_pre_barriers(encoder, pass, slots, textures, buffers, list)?;
+
+        if let Some(queries) = queries {
+            let index = 2 + position * 2;
+            vulkan_gpu_profiler::write_timestamp(list.raw(), queries, index);
+        }
 
         // Tell the list what layouts the graph says are current, so a transfer in
         // this pass copies from the right layout instead of guessing one.
@@ -226,7 +242,15 @@ fn record_pass(
 
         // After the body and after the render scope, which is the only place a
         // post barrier can go.
-        record_post_barriers(encoder, pass, slots, textures, list).map(|_| ())
+        record_post_barriers(encoder, pass, slots, textures, list)?;
+
+        if let Some(queries) = queries {
+            if position + 1 == pass_count {
+                vulkan_gpu_profiler::write_timestamp(list.raw(), queries, 1);
+            }
+            vulkan_gpu_profiler::write_timestamp(list.raw(), queries, 3 + position * 2);
+        }
+        Ok(())
     })();
 
     RecordedPass { outcome, barriers }
@@ -259,6 +283,9 @@ pub struct VulkanRenderGraphExecutor {
     value_base: u64,
     stats: ExecutorStats,
     last_frame: usize,
+    /// `Some` only when a caller asked for per-pass GPU times. Recording the
+    /// timestamps otherwise would be a cost every frame pays for a benchmark.
+    profiler: Option<GpuProfiler>,
 }
 
 impl VulkanRenderGraphExecutor {
@@ -271,7 +298,33 @@ impl VulkanRenderGraphExecutor {
             value_base: 1,
             stats: ExecutorStats::default(),
             last_frame: 0,
+            profiler: None,
         }
+    }
+
+    /// Turns on per-pass timestamp queries. Returns false when the queue cannot
+    /// write timestamps, which is a driver property and not an error.
+    pub fn enable_gpu_timing(&mut self, period: f32, valid_bits: u32) -> bool {
+        self.profiler = GpuProfiler::new(self.recorder.device(), period, valid_bits);
+        self.profiler.is_some()
+    }
+
+    /// The last collected per-pass times, empty before a frame is collected.
+    pub fn gpu_timings(&self) -> &[GpuPassTiming] {
+        self.profiler.as_ref().map_or(&[], GpuProfiler::timings)
+    }
+
+    /// Reads the timestamps of the frame just submitted. The caller must have
+    /// waited for its fence; without that the values are not available yet.
+    pub fn collect_gpu_timings(&mut self) -> Result<()> {
+        match self.profiler.as_mut() {
+            Some(profiler) => profiler.collect(),
+            None => Ok(()),
+        }
+    }
+
+    pub fn gpu_frame_ms(&self) -> Option<f32> {
+        self.profiler.as_ref().and_then(GpuProfiler::frame_ms)
     }
 
     pub fn slots(&self) -> &SlotTable {
@@ -318,14 +371,24 @@ impl VulkanRenderGraphExecutor {
         scope_resources: ExecutorResources,
         record: Arc<dyn PassRecorder>,
         jobs: &grind::Jobs,
-    ) -> Result<()> {
+    ) -> Result<crate::vulkan_submission_ring::SubmissionToken> {
         let passes = &frame.passes;
         if passes.is_empty() {
             // A frame with nothing in it still advances the frame counter, so a
             // graph that compiles to nothing every frame -- a real bug, and one
             // the graph tests cover -- is visible here rather than silent.
             self.stats.frames += 1;
-            return Ok(());
+            return Ok(crate::vulkan_submission_ring::SubmissionToken::NONE);
+        }
+
+        // The query pool is reset by the first command list, so the previous
+        // frame's reset must have retired before this one records over it.
+        if self.profiler.is_some() {
+            self.recorder.submissions().wait_all()?;
+            let names: Vec<&str> = passes.iter().map(|pass| pass.name.as_str()).collect();
+            if let Some(profiler) = self.profiler.as_mut() {
+                profiler.begin_frame(&names);
+            }
         }
 
         // Resolve the whole frame *before* a single command buffer is recorded.
@@ -350,6 +413,10 @@ impl VulkanRenderGraphExecutor {
         let mut recordings = self.recorder.take(passes.len())?;
         let tier = self.recorder.tier();
         let device = self.recorder.device().clone();
+        let queries = self
+            .profiler
+            .as_ref()
+            .map(|profiler| profiler.queries(tier.uses_sync2()));
 
         // A pass recorder returns `chassis::Error`; the rest of this function
         // speaks the backend's. Bridged once, here, rather than by making every
@@ -448,6 +515,9 @@ impl VulkanRenderGraphExecutor {
 
                 let recorded = record_pass(
                     pass,
+                    position as u32,
+                    pass_count as u32,
+                    queries,
                     &encoder,
                     &slots,
                     &textures,
@@ -534,17 +604,23 @@ impl VulkanRenderGraphExecutor {
             .into_iter()
             .map(|recording| recording.end())
             .collect::<Result<Vec<_>>>()?;
-        self.recorder.submit(finished, self.value_base)?;
-        // Strictly increasing: a repeated value is what a timeline semaphore
-        // rejects, and the driver reports it as a lost signal rather than as the
-        // duplicate it is.
+        // One submit, not one per pass. The compiled graph emits a barrier for
+        // every cross-pass dependency, and those barriers order the passes across
+        // a single submission, so the per-link semaphore chain bought nothing but
+        // one `vkQueueSubmit2` per pass.
+        let token = self.recorder.submit_batched(finished)?;
+        // `value_base` still advances: `transition_to_present` rides the chain,
+        // and it must signal a value past the timeline's current one. The batched
+        // path signals nothing, so skipping values here is not a duplicate.
         self.value_base += passes.len().max(1) as u64;
 
         self.stats.passes = passes.len() as u32;
         self.stats.barriers = barrier_count;
         self.stats.frames += 1;
         self.last_frame = passes.len();
-        Ok(())
+        // No wait here. The token names the fence this frame will signal, and a
+        // readback waits on that fence when it reads the slot this frame wrote.
+        Ok(token)
     }
 
     /// Move one image into `PRESENT_SRC_KHR` and submit that.
@@ -567,13 +643,13 @@ impl VulkanRenderGraphExecutor {
     /// ## One list, submitted on its own
     ///
     /// Not appended to the frame's lists: the frame is already submitted by the
-    /// time a swapchain is presentable, and the present path waits for the device
-    /// anyway. Serialising the two would be correct and slower.
+    /// time a swapchain is presentable. It returns its fence token so the present
+    /// path can wait on exactly this transition, not the whole device.
     pub fn transition_to_present(
         &mut self,
         image: ash::vk::Image,
         format: chassis::TextureFormat,
-    ) -> Result<()> {
+    ) -> Result<crate::vulkan_submission_ring::SubmissionToken> {
         let tier = self.recorder.tier();
         let mut recordings = self.recorder.take(1)?;
         let mut recording = match recordings.pop() {
@@ -611,14 +687,14 @@ impl VulkanRenderGraphExecutor {
         }
 
         recordings.push(recording.end()?);
-        let result = self.recorder.submit(recordings, self.value_base);
+        let token = self.recorder.submit(recordings, self.value_base);
         // The timeline value has to advance for *every* submit, including this
         // one. Without it the present transition signals the value the frame's
         // last pass already signalled, and that is
         // `VUID-VkSubmitInfo2-semaphore-03882`: "signal value (2) must be greater
         // than current value (2)".
         self.value_base += 1;
-        result
+        token
     }
 
     pub fn last_frame_passes(&self) -> usize {

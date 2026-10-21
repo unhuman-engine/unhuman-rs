@@ -10,12 +10,15 @@
 //! for recording is the pool, not the buffer, so one pool per worker makes
 //! concurrent recording sound.
 
+use std::sync::Arc;
+
 use ash::{vk, Device};
 
 use crate::vulkan_command_buffer::Recording;
 use crate::vulkan_command_pool;
 use crate::vulkan_error::{BackendError, Result};
 use crate::vulkan_extension_check::SyncTier;
+use crate::vulkan_submission_ring::{SubmissionRing, SubmissionToken, FRAMES_IN_FLIGHT};
 use crate::vulkan_submit_encoder::Chain;
 
 /// Secondary buffers, allocated once and recycled.
@@ -31,12 +34,18 @@ pub struct Recorder {
     /// `(slot, buffer)`. The slot is the pool index, so it is a stable identity
     /// rather than a per-frame position.
     free: Vec<(u32, vk::CommandBuffer)>,
+    /// Buffers submitted on each fence slot, held until that fence signals.
+    ///
+    /// A buffer here is still in the queue's hands. Returning it to `free` before
+    /// the fence completes lets the next frame reset a buffer the GPU is reading.
+    pending: Vec<Vec<(u32, vk::CommandBuffer)>>,
 
     /// One timeline semaphore carries the whole chain when the tier has one.
     timeline: Option<vk::Semaphore>,
     /// Otherwise one binary semaphore per link.
     chain: Vec<vk::Semaphore>,
-    fence: vk::Fence,
+    /// The fence ring every submit path shares.
+    submissions: Arc<SubmissionRing>,
 }
 
 impl Recorder {
@@ -73,14 +82,13 @@ impl Recorder {
             }
         }
 
-        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-        let fence = match unsafe { device.create_fence(&fence_info, None) } {
-            Ok(fence) => fence,
+        let submissions = match SubmissionRing::new(device, FRAMES_IN_FLIGHT) {
+            Ok(ring) => Arc::new(ring),
             Err(e) => {
                 for existing in pools.drain(..) {
                     vulkan_command_pool::reset_and_destroy(device, existing);
                 }
-                return Err(BackendError::vk("vkCreateFence", e));
+                return Err(e);
             }
         };
 
@@ -97,7 +105,6 @@ impl Recorder {
             match unsafe { device.create_semaphore(&info, None) } {
                 Ok(s) => timeline = Some(s),
                 Err(e) => {
-                    unsafe { device.destroy_fence(fence, None) };
                     for existing in pools.drain(..) {
                         vulkan_command_pool::reset_and_destroy(device, existing);
                     }
@@ -110,7 +117,6 @@ impl Recorder {
                 match unsafe { device.create_semaphore(&info, None) } {
                     Ok(s) => chain.push(s),
                     Err(e) => {
-                        unsafe { device.destroy_fence(fence, None) };
                         for existing in pools.drain(..) {
                             vulkan_command_pool::reset_and_destroy(device, existing);
                         }
@@ -127,9 +133,10 @@ impl Recorder {
             tier,
             pools,
             free,
+            pending: vec![Vec::new(); FRAMES_IN_FLIGHT],
             timeline,
             chain,
-            fence,
+            submissions,
         })
     }
 
@@ -138,16 +145,32 @@ impl Recorder {
         self.pools.get(slot as usize).copied()
     }
 
-    /// How many lists can be in flight at once. One per recording thread.
+    /// How many lists the arena holds. One per recording thread.
     pub fn capacity(&self) -> usize {
-        self.free.len()
+        self.pools.len()
+    }
+
+    /// The fence ring, shared with `VulkanResources` for readback waits.
+    pub fn submissions(&self) -> Arc<SubmissionRing> {
+        Arc::clone(&self.submissions)
     }
 
     /// Hands out one recording per list, in ascending slot order.
     ///
     /// Fails rather than truncating: a frame that asked for more lists than the
     /// arena holds would otherwise silently drop passes.
+    ///
+    /// Blocks only when the arena is short, and then only on the oldest pending
+    /// fence, because those are the submissions that can return a buffer. A
+    /// buffer whose fence has not signalled is never handed out.
     pub fn take(&mut self, count: usize) -> Result<Vec<Recording>> {
+        if count > self.pools.len() {
+            return Err(BackendError::ListArenaExhausted {
+                requested: count,
+                available: self.pools.len(),
+            });
+        }
+        self.make_room(count)?;
         if count > self.free.len() {
             return Err(BackendError::ListArenaExhausted {
                 requested: count,
@@ -173,44 +196,149 @@ impl Recorder {
         Ok(out)
     }
 
-    /// Submits in slot order, each waiting on its predecessor, then blocks until
-    /// the frame's work is done.
+    /// Returns buffers whose fence has signalled, without blocking.
+    fn release_completed(&mut self) -> usize {
+        let completed = self.submissions.completed();
+        completed
+            .into_iter()
+            .map(|index| self.release_slot(index))
+            .sum()
+    }
+
+    fn release_slot(&mut self, index: usize) -> usize {
+        let buffers = std::mem::take(&mut self.pending[index]);
+        let count = buffers.len();
+        self.free.extend(buffers);
+        count
+    }
+
+    /// Waits for one pending slot, oldest first, and recycles it.
+    ///
+    /// "Oldest" is the slot the ring reuses next, not the first non-empty one in
+    /// Vec order: waiting the newest would stall the CPU on work it does not
+    /// need yet.
+    fn wait_one_pending(&mut self) -> Result<bool> {
+        let depth = self.pending.len();
+        let start = self.submissions.next_index();
+        for offset in 0..depth {
+            let index = (start + offset) % depth;
+            if self.pending[index].is_empty() {
+                continue;
+            }
+            self.submissions.wait_index(index)?;
+            self.release_slot(index);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn make_room(&mut self, count: usize) -> Result<()> {
+        while self.free.len() < count {
+            self.release_completed();
+            if self.free.len() >= count {
+                break;
+            }
+            if !self.wait_one_pending()? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Submits in slot order, each waiting on its predecessor.
+    ///
+    /// Returns the token that names the fence this submission signals. The call
+    /// does not wait for that fence; a caller that needs the result calls
+    /// [`Recorder::wait`] with the token.
     ///
     /// `value_base` is the timeline value this chain starts from; frames in
     /// flight advance it by the chain length.
-    pub fn submit(&mut self, recordings: Vec<Recording>, value_base: u64) -> Result<()> {
+    ///
+    /// Use this when the lists carry no barriers between them: the semaphore
+    /// chain is the only thing ordering one against the next. A caller with its
+    /// own barriers wants [`Recorder::submit_batched`].
+    pub fn submit(
+        &mut self,
+        recordings: Vec<Recording>,
+        value_base: u64,
+    ) -> Result<SubmissionToken> {
+        self.submit_inner(recordings, value_base, false)
+    }
+
+    /// Submits every list in one `vkQueueSubmit2`/`vkQueueSubmit`, no semaphores.
+    ///
+    /// The render graph's barriers order its passes, so the per-link semaphore
+    /// chain is redundant work: one submit is a single queue operation instead of
+    /// one per pass, and no semaphore signal/wait per link. Only correct when the
+    /// lists are already ordered by their own barriers.
+    pub fn submit_batched(&mut self, recordings: Vec<Recording>) -> Result<SubmissionToken> {
+        self.submit_inner(recordings, 0, true)
+    }
+
+    fn submit_inner(
+        &mut self,
+        recordings: Vec<Recording>,
+        value_base: u64,
+        batched: bool,
+    ) -> Result<SubmissionToken> {
         let mut ordered = recordings;
         ordered.sort_by_key(Recording::slot);
         if ordered.is_empty() {
-            return Ok(());
+            return Ok(SubmissionToken::NONE);
         }
         let buffers: Vec<vk::CommandBuffer> = ordered.iter().map(Recording::handle).collect();
 
-        // Reset once, *before* the submit. Resetting again afterwards unsigns a
-        // fence the in-flight submit is about to signal, which is illegal and
-        // segfaults on Mesa.
-        unsafe { self.device.reset_fences(&[self.fence])? };
+        // Waits the fence about to be reused, then resets it. This is the only
+        // fence the new submit may safely signal: the other two still belong to
+        // submissions the CPU has not caught up with.
+        let token = self.submissions.acquire()?;
+        let index = token.index() as usize;
+        self.release_slot(index);
 
         let chain = Chain {
             device: &self.device,
             queue: self.queue,
-            fence: self.fence,
+            fence: self.submissions.handle(token)?,
             buffers: &buffers,
             timeline: self.timeline,
             binary_chain: &self.chain,
             tier: self.tier,
             value_base,
+            batched,
         };
-        chain.submit()?;
-
-        unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        if let Err(error) = chain.submit() {
+            // The fence was reset but no submission will signal it. Recreate it
+            // signalled, or the next reuse would wait forever.
+            self.submissions.abandon(token)?;
+            for recording in ordered {
+                self.free.push((recording.slot(), recording.into_buffer()));
+            }
+            return Err(error);
         }
 
-        for recording in ordered {
-            self.free.push((recording.slot(), recording.into_buffer()));
-        }
+        // The queue owns these buffers until the fence signals. They go back to
+        // `free` from `release_slot` on a later lap, never before.
+        self.pending[index] = ordered
+            .into_iter()
+            .map(|recording| (recording.slot(), recording.into_buffer()))
+            .collect();
+        Ok(token)
+    }
+
+    /// Waits for exactly the submission this token names.
+    ///
+    /// Buffers that fence owned come back to the arena as part of the wait; a
+    /// caller that only waits through `VulkanResources` leaves them for the next
+    /// `take`, which polls the same fences.
+    pub fn wait(&mut self, token: SubmissionToken) -> Result<()> {
+        self.submissions.wait(token)?;
+        self.release_completed();
         Ok(())
+    }
+
+    /// Whether the submission this token names is still on the GPU.
+    pub fn is_pending(&self, token: SubmissionToken) -> bool {
+        self.submissions.is_pending(token)
     }
 
     /// Hand command buffers back without submitting them.
@@ -228,8 +356,10 @@ impl Recorder {
         self.free.sort_by_key(|(slot, _)| *slot);
     }
 
-    /// Command buffers currently available. Falls as `take` succeeds and a
-    /// recycle path fails, so a leak shows up as a shrinking number.
+    /// Command buffers not owned by an in-flight submission.
+    ///
+    /// Falls as `take` succeeds and rises when a fence signals or `recycle`
+    /// returns an unsubmitted list. A number that keeps falling is a leak.
     pub fn available(&self) -> usize {
         self.free.len()
     }
@@ -250,10 +380,6 @@ impl Recorder {
         self.family
     }
 
-    pub fn fence(&self) -> vk::Fence {
-        self.fence
-    }
-
     /// True when the chain rides one timeline semaphore rather than one binary
     /// semaphore per link. Diagnostics only; callers do not branch on it.
     pub fn uses_timeline(&self) -> bool {
@@ -263,9 +389,10 @@ impl Recorder {
 
 impl Drop for Recorder {
     fn drop(&mut self) {
+        // Every submitted command buffer still belongs to the queue until its
+        // fence signals. Resetting the pools first would free buffers in use.
+        let _ = self.submissions.wait_all();
         unsafe {
-            let _ = self.device.wait_for_fences(&[self.fence], true, u64::MAX);
-            self.device.destroy_fence(self.fence, None);
             if let Some(timeline) = self.timeline {
                 self.device.destroy_semaphore(timeline, None);
             }

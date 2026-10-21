@@ -78,14 +78,10 @@ fn stages(
         .expect("the test shader compiles");
 
     let vertex = shaders
-        .create_from_words(&context.device, &vertex.words, vk::ShaderStageFlags::VERTEX)
+        .create_from_words(&context.device, &vertex.words)
         .expect("a vertex module");
     let fragment = shaders
-        .create_from_words(
-            &context.device,
-            &fragment.words,
-            vk::ShaderStageFlags::FRAGMENT,
-        )
+        .create_from_words(&context.device, &fragment.words)
         .expect("a fragment module");
     (vertex, fragment)
 }
@@ -276,11 +272,7 @@ fn a_different_fragment_shader_is_a_different_pipeline() {
         )
         .expect("alternate fragment stage");
     let other_fragment = shaders
-        .create_from_words(
-            &context.device,
-            &alternate.words,
-            vk::ShaderStageFlags::FRAGMENT,
-        )
+        .create_from_words(&context.device, &alternate.words)
         .expect("second fragment module");
 
     let mut pipelines = stormbreaker::vulkan_pipeline_state::Pipelines::new(

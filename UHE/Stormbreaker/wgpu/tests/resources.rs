@@ -270,6 +270,39 @@ fn a_bind_group_is_built_from_its_declared_layout() {
     });
 }
 
+/// A binding the layout does not declare is an error, not wgpu's panic.
+///
+/// `create_bind_group` is infallible in wgpu and reports the mistake through the
+/// device handler. The pre-check names the binding; the validation scope behind
+/// it catches anything the check does not.
+#[test]
+fn an_undeclared_binding_is_an_error() {
+    with_backend!(|resources| {
+        let layout =
+            chassis::DescriptorSetLayoutDesc::new("frame").with(chassis::BindingDesc::new(
+                0,
+                chassis::DescriptorKind::UniformBuffer,
+                chassis::StageMask::ALL,
+            ));
+        let buffer = resources
+            .create_buffer(
+                chassis::BufferDesc::new(256, chassis::BufferUsage::UNIFORM),
+                None,
+            )
+            .expect("a uniform buffer");
+
+        let resources: &mut dyn Resources = &mut resources;
+        let error = resources
+            .create_bind_group(&layout, &[(9, buffer, 0)], &[], &[])
+            .expect_err("binding 9 is not declared");
+        let message = error.to_string();
+        assert!(
+            message.contains('9'),
+            "the error names the binding: {message}"
+        );
+    });
+}
+
 /// The shared layout cache, which in wgpu is load-bearing rather than an
 /// optimisation.
 ///
@@ -433,6 +466,72 @@ fn a_graphics_pipeline_from_the_shared_shader_creates() {
     assert!(!handle.is_null());
 }
 
+/// A pipeline whose module names its entries `vs_main`/`fs_main`, not `main`.
+///
+/// naga keeps the source's names and Slang emits `main`. The backend reads
+/// `OpEntryPoint` from the module, so both build a pipeline without either
+/// compiler's naming being copied by the other.
+#[test]
+fn a_pipeline_uses_the_modules_own_entry_point_names() {
+    const WGSL: &str = r#"
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    let positions = array<vec2<f32>, 3>(
+        vec2<f32>(-0.5, -0.5),
+        vec2<f32>( 0.5, -0.5),
+        vec2<f32>( 0.0,  0.5),
+    );
+    return vec4<f32>(positions[index], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+}
+"#;
+
+    with_backend!(|resources| {
+        let spirv = forge::wgsl::to_spirv(WGSL, "own-entry").expect("the WGSL compiles");
+        let resources: &mut dyn Resources = &mut resources;
+        let shader = resources
+            .create_shader("own-entry", &spirv)
+            .expect("the module wgpu accepts");
+
+        let handle = resources
+            .create_pipeline(chassis::PipelineDesc {
+                label: "own-entry".to_owned(),
+                shaders: vec![
+                    chassis::ShaderStageDesc {
+                        stage: chassis::ShaderStage::Vertex,
+                        shader,
+                    },
+                    chassis::ShaderStageDesc {
+                        stage: chassis::ShaderStage::Fragment,
+                        shader,
+                    },
+                ],
+                set_layouts: Vec::new(),
+                vertex: chassis::VertexLayout::default(),
+                index_format: None,
+                primitive: chassis::PrimitiveState {
+                    cull_mode: 0,
+                    ..chassis::PrimitiveState::default()
+                },
+                depth: chassis::DepthState::default(),
+                blend: chassis::BlendState::default(),
+                color_targets: vec![chassis::ColorTargetState {
+                    format: chassis::TextureFormat::Rgba8Unorm,
+                    blend: false,
+                    write_mask: 0xf,
+                }],
+                samples: chassis::SampleCount::X1,
+            })
+            .expect("the parsed entry names build the pipeline");
+
+        assert!(!handle.is_null());
+    });
+}
+
 /// A pipeline with no vertex stage is refused.
 ///
 /// wgpu's `VertexState` has no such thing, so the alternative is an error deep
@@ -488,38 +587,29 @@ fn a_pipeline_without_a_vertex_stage_is_refused() {
     );
 }
 
-/// A module with a valid magic number and a garbage body **panics** wgpu.
+/// A module with a valid magic number and a garbage body is an error, not a panic.
 ///
-/// Found by writing a test badly. The two backends do not agree here and the
-/// difference is worth naming:
+/// The two backends get the same answer by different routes:
 ///
 ///   Vulkan  `create_shader_module` returns `Result`, so a bad module is an error
-///   wgpu    `create_shader_module` is infallible; validation goes to an error
-///           scope, and with none installed it panics.
+///   wgpu    `create_shader_module` is infallible; validation goes to the device
+///           handler, which panics when no error scope is installed.
 ///
-/// So `WgpuResources::create_shader` validates the magic number itself before
-/// calling wgpu, which catches truncated and wrong-magic input. What is *not*
-/// caught is a module with a correct magic number and a corrupt body -- naga
-/// parses it and panics.
-///
-/// Not papered over. Catching a panic around a wgpu call is worse than the
-/// panic: it converts a loud, immediate, specific failure into a silent wrong
-/// answer, and a shader that validates in one place and not another is exactly
-/// the bug this backend exists to avoid. The honest options are `push_error_scope`
-/// around the call, or only ever feeding this function something `forge`
-/// produced -- and `forge` checks the magic, so in practice the second holds.
-///
-/// This test pins the behaviour so the difference cannot be rediscovered by
-/// accident.
+/// `WgpuResources::create_shader` installs a validation scope, so the corrupt
+/// body comes back as `InvalidDescriptor`. The magic check in `forge` still
+/// refuses truncated and wrong-magic input before wgpu sees it.
 #[test]
-#[should_panic(expected = "Validation Error")]
-fn a_module_with_a_valid_magic_and_a_corrupt_body_panics_wgpu() {
-    let Some(mut resources) = backend() else {
-        eprintln!("SKIP: no wgpu adapter");
-        return;
-    };
-    let resources: &mut dyn Resources = &mut resources;
-    let _ = resources.create_shader("any", &[0x03, 0x02, 0x23, 0x07, 0, 0, 0, 0]);
+fn a_module_with_a_valid_magic_and_a_corrupt_body_is_an_error() {
+    with_backend!(|resources| {
+        let resources: &mut dyn Resources = &mut resources;
+        let error = resources
+            .create_shader("any", &[0x03, 0x02, 0x23, 0x07, 0, 0, 0, 0])
+            .expect_err("a corrupt body is not a shader");
+        assert!(
+            matches!(error, chassis::Error::InvalidDescriptor(_)),
+            "a corrupt body gave {error:?}",
+        );
+    });
 }
 
 /// A stage wgpu has no room for is named, not dropped.

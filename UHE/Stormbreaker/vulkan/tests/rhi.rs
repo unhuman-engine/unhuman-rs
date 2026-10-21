@@ -250,6 +250,73 @@ fn bind_groups_refuse_what_they_cannot_write() {
     );
 }
 
+/// A pipeline whose module names its entries `vs_main`/`fs_main`, not `main`.
+///
+/// naga keeps the source's names and Slang emits `main`. The backend reads
+/// `OpEntryPoint` from the module, so both build a pipeline without either
+/// compiler's naming being copied by the other.
+#[test]
+fn a_pipeline_uses_the_modules_own_entry_point_names() {
+    const WGSL: &str = r#"
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    let positions = array<vec2<f32>, 3>(
+        vec2<f32>(-0.5, -0.5),
+        vec2<f32>( 0.5, -0.5),
+        vec2<f32>( 0.0,  0.5),
+    );
+    return vec4<f32>(positions[index], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+}
+"#;
+
+    let Some(context) = open_device() else { return };
+    let mut backend = resources(&context);
+    let resources: &mut dyn Resources = &mut backend;
+
+    let spirv = forge::wgsl::to_spirv(WGSL, "own-entry").expect("the WGSL compiles");
+    let shader = resources
+        .create_shader("own-entry", &spirv)
+        .expect("the module the driver accepts");
+
+    let pipeline = resources
+        .create_pipeline(chassis::PipelineDesc {
+            label: "own-entry".to_owned(),
+            shaders: vec![
+                chassis::ShaderStageDesc {
+                    stage: chassis::ShaderStage::Vertex,
+                    shader,
+                },
+                chassis::ShaderStageDesc {
+                    stage: chassis::ShaderStage::Fragment,
+                    shader,
+                },
+            ],
+            set_layouts: Vec::new(),
+            vertex: chassis::VertexLayout::default(),
+            index_format: None,
+            primitive: chassis::PrimitiveState {
+                cull_mode: 0,
+                ..chassis::PrimitiveState::default()
+            },
+            depth: chassis::DepthState::default(),
+            blend: chassis::BlendState::default(),
+            color_targets: vec![chassis::ColorTargetState {
+                format: chassis::TextureFormat::Rgba8Unorm,
+                blend: false,
+                write_mask: 0xf,
+            }],
+            samples: chassis::SampleCount::X1,
+        })
+        .expect("the parsed entry names build the pipeline");
+
+    assert!(!pipeline.is_null());
+}
+
 /// A pipeline built through the RHI is cached by description, and the cache key
 /// has to cover everything that changes the result.
 ///

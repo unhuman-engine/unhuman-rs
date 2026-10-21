@@ -137,42 +137,31 @@ fn shader_lookups_deduplicate_by_content() {
     // Testable with no device, which is where the rule is most likely to rot.
     let shaders = Shaders::new();
     let bytes = not_spirv(64);
-    let stage = vk::ShaderStageFlags::VERTEX;
 
     assert!(
-        shaders.lookup(&bytes, stage).is_none(),
+        shaders.lookup(&bytes).is_none(),
         "cache returned a miss as a hit"
     );
 
     let other = not_spirv(64);
     assert_eq!(content_hash(&bytes), content_hash(&other));
     assert_ne!(content_hash(&bytes), content_hash(&not_spirv(60)));
-    assert_eq!(shaders.lookup(&bytes, stage), shaders.lookup(&other, stage));
-    assert_eq!(
-        shaders.lookup(&bytes, vk::ShaderStageFlags::FRAGMENT),
-        shaders.lookup(&other, stage),
-        "the same bytes for a different stage are a different module"
-    );
+    assert_eq!(shaders.lookup(&bytes), shaders.lookup(&other));
 }
 
 #[test]
 fn malformed_spirv_is_rejected_before_the_driver_sees_it() {
     let Some(context) = open() else { return };
     let mut shaders = Shaders::new();
-    let stage = vk::ShaderStageFlags::VERTEX;
 
     // No magic word.
-    assert!(shaders
-        .create(&context.device, &not_spirv(64), stage)
-        .is_err());
+    assert!(shaders.create(&context.device, &not_spirv(64)).is_err());
     // Right magic, not a multiple of four.
     let mut odd = vec![0x03u8, 0x02, 0x23, 0x07, 0x00];
     odd.push(0x00);
-    assert!(shaders.create(&context.device, &odd, stage).is_err());
+    assert!(shaders.create(&context.device, &odd).is_err());
     // Shorter than the magic word itself.
-    assert!(shaders
-        .create(&context.device, &[0x03, 0x02], stage)
-        .is_err());
+    assert!(shaders.create(&context.device, &[0x03, 0x02]).is_err());
 }
 
 #[test]
@@ -346,7 +335,8 @@ fn parallel_recordings_submit_in_order() {
     // `staging` proves the arena is wider than the lists in flight.
     let _ = staging_handle;
 
-    recorder.submit(finished, 0).expect("submit");
+    let token = recorder.submit(finished, 0).expect("submit");
+    recorder.wait(token).expect("wait for the submit");
 
     let read = buffers
         .get(readback)
@@ -382,11 +372,12 @@ fn the_recorder_refuses_more_lists_than_its_arena_holds() {
 
     let lists = recorder.take(2).unwrap();
     let finished: Vec<_> = lists.into_iter().map(|l| l.end().unwrap()).collect();
-    recorder.submit(finished, 0).unwrap();
+    let token = recorder.submit(finished, 0).unwrap();
+    recorder.wait(token).unwrap();
     assert_eq!(
-        recorder.capacity(),
+        recorder.available(),
         2,
-        "lists were not returned to the arena"
+        "lists were not returned to the arena after their fence signalled"
     );
 }
 

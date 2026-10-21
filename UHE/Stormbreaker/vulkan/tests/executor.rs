@@ -160,18 +160,10 @@ fn fixture() -> Result<Fixture, String> {
 
     let mut shaders = stormbreaker::vulkan_shader::Shaders::with_device(Some(&context.device));
     let vertex_shader = shaders
-        .create_from_words(
-            &context.device,
-            &vertex_module.words,
-            vk::ShaderStageFlags::VERTEX,
-        )
+        .create_from_words(&context.device, &vertex_module.words)
         .map_err(|e| format!("vertex module: {e}"))?;
     let fragment_shader = shaders
-        .create_from_words(
-            &context.device,
-            &fragment_module.words,
-            vk::ShaderStageFlags::FRAGMENT,
-        )
+        .create_from_words(&context.device, &fragment_module.words)
         .map_err(|e| format!("fragment module: {e}"))?;
 
     let description = chassis::PipelineDesc {
@@ -703,13 +695,17 @@ fn the_triangle_is_actually_in_the_image() {
         Ok(())
     };
 
-    executor
+    let token = executor
         .execute(&compiled, fixture.resources(), Arc::new(record), &jobs())
         .expect("the frame records and submits");
+    executor
+        .recorder_mut()
+        .wait(token)
+        .expect("wait for the submit");
 
-    // The submit waited on a fence, so the copy has retired and the buffer is
-    // safe to map. Reading it without waiting is the classic race that makes a
-    // readback test fail once in fifty.
+    // The fence has signalled, so the copy has retired and the buffer is safe to
+    // map. Reading it without waiting is the classic race that makes a readback
+    // test fail once in fifty.
     let pixels = {
         let buffers = fixture.buffers.read().expect("registry lock");
         let resource = buffers.get(readback).expect("readback handle");

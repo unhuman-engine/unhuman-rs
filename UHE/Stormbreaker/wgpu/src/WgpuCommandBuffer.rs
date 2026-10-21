@@ -43,9 +43,15 @@ pub struct Recording {
     /// locked behind it and wgpu errors at runtime on a violation rather than
     /// letting it be undefined.
     pass: Option<wgpu::RenderPass<'static>>,
-    /// The pipeline's layouts, so `set_push_constants` can slice the byte block
-    /// the way wgpu wants it. wgpu has one flat block rather than Vulkan's
-    /// ranged list, so the split comes from the pipeline, not from the caller.
+    /// `Some` between `begin_compute` and `end_compute`.
+    ///
+    /// wgpu will not set a compute pipeline or bind group outside a compute
+    /// pass, so the scope is what makes a dispatch possible at all.
+    compute: Option<wgpu::ComputePass<'static>>,
+    /// The pipeline's layouts, so a caller that inspects them sees the same
+    /// shape on both backends. wgpu has one flat push-constant block rather than
+    /// Vulkan's ranged list, and this backend has none, so nothing here splits
+    /// one.
     pipeline_layouts: Vec<wgpu::BindGroupLayout>,
     current_pipeline: Option<chassis::Pipeline>,
     commands: u32,
@@ -57,6 +63,7 @@ impl Recording {
             encoder: device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) }),
             pass: None,
+            compute: None,
             pipeline_layouts: Vec::new(),
             current_pipeline: None,
             commands: 0,
@@ -76,6 +83,10 @@ impl Recording {
         self.pass.is_some()
     }
 
+    pub fn is_inside_compute_pass(&self) -> bool {
+        self.compute.is_some()
+    }
+
     /// Finishes the encoder and hands back the command buffer.
     ///
     /// Ending an open pass first. Dropping the pass would end it too, but doing
@@ -83,6 +94,7 @@ impl Recording {
     /// silent truncation of the pass.
     pub fn finish(mut self) -> wgpu::CommandBuffer {
         self.pass = None;
+        self.compute = None;
         self.encoder.finish()
     }
 
@@ -241,6 +253,33 @@ impl CommandList for WgpuCommandList<'_> {
         }
     }
 
+    fn begin_compute(&mut self) {
+        debug_assert!(
+            self.recording.pass.is_none(),
+            "a render pass cannot be open when a compute pass begins",
+        );
+        let pass = self
+            .recording
+            .encoder()
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("compute"),
+                // Timestamp queries are not requested by this backend, and a
+                // write against a set that does not exist is a validation error.
+                timestamp_writes: None,
+            });
+        // Safe for the same reason as the render pass: the encoder is locked
+        // while a pass is open, and wgpu reports a violation at runtime.
+        self.recording.compute = Some(pass.forget_lifetime());
+        self.recording.commands += 1;
+    }
+
+    fn end_compute(&mut self) {
+        if self.recording.compute.take().is_some() {
+            // Dropping ends the pass.
+            self.recording.commands += 1;
+        }
+    }
+
     fn set_viewport(&mut self, extent: chassis::Extent2d) {
         // Goes to the open pass when there is one. Dynamic state in wgpu is set
         // on the pass, not the encoder, so this is the only correct target.
@@ -266,12 +305,22 @@ impl CommandList for WgpuCommandList<'_> {
         let Some(resource) = self.resources.get_pipeline(*pipeline) else {
             return;
         };
-        // The layouts travel with the pipeline, so push constants can be split
-        // later without a second lookup.
         self.recording.pipeline_layouts = resource.bind_group_layouts().to_vec();
         self.recording.current_pipeline = Some(*pipeline);
-        if self.recording.pass.is_some() {
-            self.recording.begin().set_pipeline(resource.inner());
+
+        if let Some(compute) = resource.as_compute() {
+            let Some(pass) = self.recording.compute.as_mut() else {
+                panic!(
+                    "bind_pipeline on compute pipeline {:?} outside a compute pass; \
+                     call begin_compute first",
+                    pipeline
+                );
+            };
+            pass.set_pipeline(compute);
+        } else if let Some(render) = resource.as_render() {
+            if self.recording.pass.is_some() {
+                self.recording.begin().set_pipeline(render);
+            }
         }
     }
 
@@ -291,17 +340,25 @@ impl CommandList for WgpuCommandList<'_> {
         // overload takes `Option<&BindGroup>`, where `None` means "use the
         // fallback bind group". Passing the fallback would bind nothing and look
         // like it worked.
-        self.recording
-            .begin()
-            .set_bind_group(set, Some(bind_group), &[]);
+        if let Some(pass) = self.recording.compute.as_mut() {
+            pass.set_bind_group(set, Some(bind_group), &[]);
+        } else {
+            self.recording
+                .begin()
+                .set_bind_group(set, Some(bind_group), &[]);
+        }
     }
 
-    fn set_push_constants(&mut self, _data: &[u8]) {
-        // wgpu takes push constants as a byte block on `set_bind_group` and on
-        // draw calls rather than as a separate call, so this needs the pipeline's
-        // layout to slice. Deferred until bind groups land, since a push constant
-        // with no bind group is a contradiction.
-        unimplemented!("push constants wait on bind groups here")
+    fn set_push_constants(&mut self, _data: &[u8]) -> chassis::Result<()> {
+        // wgpu has no push constants at all. Its pipeline layout has an
+        // `immediate_size`, but a shader cannot declare a push-constant block
+        // and the RHI has no range to fill. Reporting the alternative beats a
+        // panic and beats a no-op that silently drops the caller's values.
+        Err(chassis::Error::Unsupported(
+            "wgpu has no push constants; pass the values in a small uniform buffer \
+             through a bind group"
+                .to_owned(),
+        ))
     }
 
     fn bind_vertex_buffer(&mut self, slot: u32, buffer: &chassis::Buffer, offset: u64) {
@@ -341,11 +398,14 @@ impl CommandList for WgpuCommandList<'_> {
     }
 
     fn dispatch(&mut self, x: u32, y: u32, z: u32) {
-        // Outside any pass: a compute pass is its own scope in wgpu, and a
-        // dispatch inside a render pass is a validation error. The engine does
-        // not create compute passes yet, so this records nothing and says so.
-        let _ = (x, y, z);
-        unimplemented!("compute passes are not wired for wgpu yet")
+        let Some(pass) = self.recording.compute.as_mut() else {
+            // A dispatch outside a compute pass is a validation error in wgpu,
+            // and the message would name the encoder rather than the pass that
+            // forgot its scope.
+            panic!("dispatch outside a compute pass; call begin_compute first");
+        };
+        pass.dispatch_workgroups(x, y, z);
+        self.recording.commands += 1;
     }
 
     fn copy_buffer(&mut self, src: &chassis::Buffer, dst: &chassis::Buffer) {

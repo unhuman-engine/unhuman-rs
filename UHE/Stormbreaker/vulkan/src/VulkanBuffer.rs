@@ -117,13 +117,40 @@ impl Buffers {
             vk::MemoryPropertyFlags::DEVICE_LOCAL
         };
 
-        let (buffer, device_memory, allocated) = vulkan_allocation::create_buffer(
-            device,
-            &self.memory_properties,
-            desc.size,
-            usage,
-            required,
-        )?;
+        // A readback buffer is read by the CPU every frame. Without HOST_CACHED
+        // RADV hands back uncached memory on this APU and the 9 MB copy runs at
+        // ~250 MB/s, which cost more than the whole frame. Cached is a
+        // preference because not every device offers it; coherent keeps the
+        // read legal without an explicit invalidate.
+        let cached = required | vk::MemoryPropertyFlags::HOST_CACHED;
+        let wants_cache = host_accessible && desc.usage.contains(BufferUsage::MAP_READ);
+        let (buffer, device_memory, allocated) = if wants_cache {
+            match vulkan_allocation::create_buffer(
+                device,
+                &self.memory_properties,
+                desc.size,
+                usage,
+                cached,
+            ) {
+                Ok(created) => created,
+                Err(BackendError::NoMemoryType { .. }) => vulkan_allocation::create_buffer(
+                    device,
+                    &self.memory_properties,
+                    desc.size,
+                    usage,
+                    required,
+                )?,
+                Err(error) => return Err(error),
+            }
+        } else {
+            vulkan_allocation::create_buffer(
+                device,
+                &self.memory_properties,
+                desc.size,
+                usage,
+                required,
+            )?
+        };
 
         let host_visible = required.contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
         let resource = BufferResource {

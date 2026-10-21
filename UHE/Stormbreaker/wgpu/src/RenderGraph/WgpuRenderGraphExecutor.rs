@@ -72,7 +72,10 @@
 //! how the slot is found: from the compiled frame, which is all a backend is ever
 //! handed.
 
+use std::sync::Arc;
+
 use chassis::graph::pass::{PassRecorder, PassScope, SlotTable};
+use chassis::graph::types::PassType;
 use chassis::graph::{CompiledGraph, ImageState, TextureId};
 use chassis::CommandList;
 
@@ -98,7 +101,10 @@ pub struct ExecutorStats {
 /// place rather than spread across a call site.
 pub struct WgpuRenderGraphExecutor {
     queue: Queue,
-    resources: WgpuResources,
+    /// Shared with the workers for the length of one `execute`. The registries
+    /// are read-only while a frame records, which is what makes an unlocked
+    /// `Arc` enough.
+    resources: Arc<WgpuResources>,
     slots: SlotTable,
     extent: chassis::Extent2d,
     stats: ExecutorStats,
@@ -108,7 +114,7 @@ impl WgpuRenderGraphExecutor {
     pub fn new(queue: Queue, resources: WgpuResources, extent: chassis::Extent2d) -> Self {
         Self {
             queue,
-            resources,
+            resources: Arc::new(resources),
             slots: SlotTable::default(),
             extent,
             stats: ExecutorStats::default(),
@@ -128,7 +134,7 @@ impl WgpuRenderGraphExecutor {
     }
 
     pub fn resources(&self) -> &WgpuResources {
-        &self.resources
+        self.resources.as_ref()
     }
 
     /// Mutable, because the executor has to own the only registry.
@@ -140,7 +146,10 @@ impl WgpuRenderGraphExecutor {
     ///
     /// One registry, owned here, reachable from both directions.
     pub fn resources_mut(&mut self) -> &mut WgpuResources {
-        &mut self.resources
+        // A clone only lives while `execute` runs, and this is not reachable
+        // then -- the executor is borrowed mutably. If that ever stops being
+        // true, refusing is better than silently handing out a stale registry.
+        Arc::get_mut(&mut self.resources).expect("resources are not shared outside a frame")
     }
 
     /// The frame's size, so a pass gets a viewport without asking the swapchain.
@@ -160,20 +169,24 @@ impl WgpuRenderGraphExecutor {
         resolve_backbuffer(graph, &mut self.slots, acquired)
     }
 
-    /// Record every pass and submit, in the graph's compiled order.
+    /// Record every pass on the pool, then submit in the graph's compiled order.
     ///
-    /// `recordings` must be in compiled order and the submit keeps it, because
-    /// wgpu executes submissions to one queue in the order they were made. That is
-    /// what replaces the Vulkan executor's whole chain of timeline semaphore
-    /// waits: same guarantee, one fewer piece of machinery to get wrong.
+    /// One encoder per pass means no pass needs anything from another, so the
+    /// pool may record them in any order. The finished buffers are sorted back
+    /// before the submit, because wgpu executes submissions to one queue in the
+    /// order they were made -- that is the ordering guarantee, not the order the
+    /// recorder happens to run in. It also replaces the Vulkan executor's chain
+    /// of timeline semaphore waits: same guarantee, one fewer piece of machinery
+    /// to get wrong.
     ///
     /// [`Self::resolve_backbuffer`] comes first: a frame that draws the swapchain
     /// image records against a slot nothing has bound until it has run.
     pub fn execute(
         &mut self,
         graph: &CompiledGraph,
-        record: &dyn PassRecorder,
-    ) -> Result<(), chassis::Error> {
+        record: Arc<dyn PassRecorder>,
+        jobs: &grind::Jobs,
+    ) -> Result<wgpu::SubmissionIndex, chassis::Error> {
         // The swapchain slot is the backend's to bind, so a frame that draws one
         // and never got it bound is refused here rather than at `begin_rendering`
         // -- where the message would name a pass and not the image that was never
@@ -186,49 +199,152 @@ impl WgpuRenderGraphExecutor {
             )));
         }
 
-        let mut buffers = Vec::with_capacity(graph.passes.len());
+        let pass_count = graph.passes.len();
+        if pass_count == 0 {
+            let submission = self.queue.inner().submit(std::iter::empty());
+            self.stats.passes = 0;
+            self.stats.buffers = 0;
+            self.stats.frames += 1;
+            return Ok(submission);
+        }
 
-        for pass in &graph.passes {
-            let mut recording = Recording::new(self.resources.device().inner(), &pass.name);
-            {
-                let mut list = WgpuCommandList::new(&mut recording, &self.resources);
-                let pass_extent =
-                    attachment_extent(pass, &self.slots, &self.resources, self.extent);
-                let scope = PassScope {
-                    index: pass.index,
-                    name: &pass.name,
-                    extent: pass_extent,
-                    slots: &self.slots,
+        // Snapshots for the workers, which `parallel_for` requires to be
+        // `'static`. A pass is pure data and the slot table is this frame's, so
+        // both are cheap next to recording one.
+        let passes = Arc::new(graph.passes.clone());
+        let slots = Arc::new(self.slots.clone());
+        let resources = Arc::clone(&self.resources);
+        let extent = self.extent;
+        // One slot per pass, so two failures cannot race for the first error and
+        // make which one comes back depend on thread timing.
+        let failures = Arc::new(std::sync::Mutex::new(vec![
+            None::<chassis::Error>;
+            pass_count
+        ]));
+        // Each worker finishes its own recording and sends it back. `parallel_for`
+        // takes an `Fn`, so a shared `Vec` cannot be appended to from the body.
+        let (sender, finished) = std::sync::mpsc::channel();
+
+        let parallel = {
+            let passes = Arc::clone(&passes);
+            let slots = Arc::clone(&slots);
+            let resources = Arc::clone(&resources);
+            let record = Arc::clone(&record);
+            let failures = Arc::clone(&failures);
+
+            move |position: u32| {
+                let index = position as usize;
+                let Some(pass) = passes.get(index) else {
+                    return;
                 };
-                let opened =
-                    open_render_scope(pass, &self.slots, &self.resources, pass_extent, &mut list)?;
-                record.record(&scope, &mut list)?;
-                if opened {
-                    list.end_rendering();
+                let sender = sender.clone();
+
+                let mut recording = Recording::new(resources.device().inner(), &pass.name);
+                let pass_extent = attachment_extent(pass, &slots, &resources, extent);
+                let outcome = (|| {
+                    let mut list = WgpuCommandList::new(&mut recording, &resources);
+                    let scope = PassScope {
+                        index: pass.index,
+                        name: &pass.name,
+                        extent: pass_extent,
+                        slots: &slots,
+                    };
+                    let compute = pass.kind == PassType::Compute;
+                    let opened = if compute {
+                        list.begin_compute();
+                        false
+                    } else {
+                        open_render_scope(pass, &slots, &resources, pass_extent, &mut list)?
+                    };
+                    record.record(&scope, &mut list)?;
+                    if compute {
+                        list.end_compute();
+                    } else if opened {
+                        list.end_rendering();
+                    }
+                    Ok::<(), chassis::Error>(())
+                })();
+
+                let failure = outcome.err().or_else(|| {
+                    // A pass that began a render scope and never ended it.
+                    // Submitted as-is, wgpu ends the scope at `finish` and the
+                    // tail of the pass is quietly lost, so it is refused here,
+                    // where the message can name the pass.
+                    recording
+                        .is_inside_render_pass()
+                        .then(|| {
+                            chassis::Error::Unsupported(format!(
+                                "pass '{}' ended while still inside a render pass",
+                                pass.name
+                            ))
+                        })
+                        .or_else(|| {
+                            recording.is_inside_compute_pass().then(|| {
+                                chassis::Error::Unsupported(format!(
+                                    "pass '{}' ended while still inside a compute pass",
+                                    pass.name
+                                ))
+                            })
+                        })
+                });
+                if let Some(error) = failure {
+                    let mut guard = failures.lock().expect("failure slots");
+                    if guard[index].is_none() {
+                        guard[index] = Some(error);
+                    }
                 }
+
+                // The receiver outlives `parallel_for` and is drained straight
+                // after it, so this cannot fail -- and a dropped send would be a
+                // command buffer that never reached the submit.
+                sender
+                    .send((index, recording.finish()))
+                    .expect("the recording channel outlives parallel_for");
             }
-            if recording.is_inside_render_pass() {
-                // A pass that began a render scope and never ended it. Submitted
-                // as-is, wgpu ends the scope at `finish` and the tail of the pass
-                // is quietly lost -- so it is refused here, where the message can
-                // name the pass.
-                return Err(chassis::Error::Unsupported(format!(
-                    "pass '{}' ended while still inside a render pass",
-                    pass.name
-                )));
-            }
-            buffers.push(recording.finish());
+        };
+
+        // One job per pass, batch size one: passes are independent, so batching
+        // would only serialise them.
+        jobs.parallel_for(pass_count as u32, parallel, 1);
+
+        // `parallel_for` returns when its counter reaches zero, but a worker can
+        // still hold the closure -- and with it a clone of `resources` -- for a
+        // few instructions. The next frame's `resources_mut` needs the last
+        // reference back, and `Arc::get_mut` cannot wait, so wait here. The two
+        // remaining counts are this clone and the executor's own.
+        while Arc::strong_count(&resources) > 2 {
+            std::thread::yield_now();
+        }
+
+        // Which thread finished first is not an order. The submit preserves
+        // compiled order, which is the graph's whole guarantee.
+        let mut returned: Vec<(usize, wgpu::CommandBuffer)> = finished.try_iter().collect();
+        returned.sort_by_key(|(index, _)| *index);
+        let buffers: Vec<wgpu::CommandBuffer> =
+            returned.into_iter().map(|(_, buffer)| buffer).collect();
+
+        let failure = failures
+            .lock()
+            .expect("failure slots")
+            .iter()
+            .flatten()
+            .next()
+            .cloned();
+        if let Some(error) = failure {
+            // The finished buffers are dropped rather than submitted: a frame
+            // with a bad pass would otherwise present a half-recorded image.
+            return Err(error);
         }
 
         let submitted = buffers.len() as u32;
         // Moved in, not copied: a `CommandBuffer` is not `Copy`, and the
         // executor has no use for them afterwards.
-        self.queue.inner().submit(buffers);
+        let submission = self.queue.inner().submit(buffers);
 
-        self.stats.passes = graph.passes.len() as u32;
+        self.stats.passes = pass_count as u32;
         self.stats.buffers = submitted;
         self.stats.frames += 1;
-        Ok(())
+        Ok(submission)
     }
 
     /// Block until the queue has drained.
