@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use std::time::Duration;
 
-use grind::{JobCounter, Jobs, TaskGraph};
+use std::sync::atomic::AtomicBool;
+
+use grind::{CancelToken, JobCounter, Jobs, Priority, TaskGraph};
 
 #[test]
 fn execute_and_wait_runs_the_job() {
@@ -257,4 +259,46 @@ fn wait_for_all_does_not_return_early_when_the_caller_helps() {
         32,
         "wait_for_all returned early"
     );
+}
+
+#[test]
+fn a_cancelled_job_does_not_run_but_its_counter_settles() {
+    let jobs = Jobs::new();
+    let ran = Arc::new(AtomicBool::new(false));
+    let token = CancelToken::new();
+    token.cancel();
+
+    let counter = Arc::new(JobCounter::new());
+    let flag = Arc::clone(&ran);
+    jobs.execute_cancellable(
+        Box::new(move || flag.store(true, Ordering::Release)),
+        Some(Arc::clone(&counter)),
+        Priority::Low,
+        token,
+    );
+
+    // A waiter must not block on work that was abandoned.
+    jobs.wait(&counter);
+    assert!(!ran.load(Ordering::Acquire), "a cancelled job ran");
+}
+
+#[test]
+fn high_priority_jobs_run_and_settle_their_counter() {
+    let jobs = Jobs::new();
+    let ran = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::new(JobCounter::new());
+
+    for _ in 0..16 {
+        let flag = Arc::clone(&ran);
+        jobs.execute_priority(
+            Box::new(move || {
+                flag.fetch_add(1, Ordering::AcqRel);
+            }),
+            Some(Arc::clone(&counter)),
+            Priority::High,
+        );
+    }
+
+    jobs.wait(&counter);
+    assert_eq!(ran.load(Ordering::Acquire), 16);
 }
