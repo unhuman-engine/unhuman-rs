@@ -264,6 +264,7 @@ impl Physics3D {
                         collider: Some(collider),
                         source,
                         written: pose,
+                        previous: pose,
                         sleeping: false,
                         seen: generation,
                     },
@@ -290,6 +291,7 @@ impl Physics3D {
                 collider: None,
                 source,
                 written: pose,
+                previous: pose,
                 sleeping: false,
                 seen,
             },
@@ -330,6 +332,14 @@ impl PhysicsBackend for Physics3D {
 
     fn step(&mut self, scene: &mut Scene, dt: f32) {
         self.sync_in(scene);
+        for entry in self.entries.values_mut() {
+            let Some(handle) = entry.body else {
+                continue;
+            };
+            if let Some(pose) = body::pose_of(&self.bodies, handle) {
+                entry.previous = pose;
+            }
+        }
 
         // The engine's accumulator decides the rate; this only takes what it is
         // given, clamped at zero so a bad delta cannot run time backwards (Rapier
@@ -366,8 +376,49 @@ impl PhysicsBackend for Physics3D {
         );
     }
 
+    fn interpolate(&mut self, scene: &mut Scene, alpha: f32) {
+        let alpha = alpha.clamp(0.0, 1.0);
+        for entity in scene.entities() {
+            let Some(entry) = self.entries.get_mut(&entity) else {
+                continue;
+            };
+            let Some(handle) = entry.body else {
+                continue;
+            };
+            let Some(current) = body::pose_of(&self.bodies, handle) else {
+                continue;
+            };
+            if entry.previous == current {
+                continue;
+            }
+            let pose = blend(entry.previous, current, alpha);
+            entry.written = pose;
+            write_pose(scene, entity, pose);
+        }
+    }
+
     fn body_count(&self) -> usize {
         self.bodies.len()
+    }
+}
+
+/// Linear translation and shortest-arc rotation, in the scene's Euler units.
+fn blend(from: ScenePose, to: ScenePose, alpha: f32) -> ScenePose {
+    let translation = from.translation.lerp(to.translation, alpha);
+    let from_quat = meats::Transform {
+        rotation: from.rotation,
+        ..Default::default()
+    }
+    .rotation_quat();
+    let to_quat = meats::Transform {
+        rotation: to.rotation,
+        ..Default::default()
+    }
+    .rotation_quat();
+    let rotation = meats::euler_degrees(from_quat.slerp(to_quat, alpha));
+    ScenePose {
+        translation,
+        rotation,
     }
 }
 

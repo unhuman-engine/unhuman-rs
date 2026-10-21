@@ -123,6 +123,13 @@ impl App {
             }
         }
 
+        // Physics wrote the last step's pose; blend the last two steps so a
+        // frame between steps does not show the same pose twice.
+        let alpha = self.engine.time.alpha();
+        if let Some(physics) = self.engine.physics.as_mut() {
+            physics.interpolate(&mut self.engine.scene, alpha);
+        }
+
         ctx.step = self.engine.time.fixed_dt();
         for plugin in &mut self.plugins {
             plugin.on_frame(&mut self.engine, &mut ctx);

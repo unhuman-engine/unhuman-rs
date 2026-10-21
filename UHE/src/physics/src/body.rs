@@ -56,6 +56,8 @@ pub(crate) struct Entry {
     pub source: Source,
     /// The pose this backend last wrote into the scene.
     pub written: ScenePose,
+    /// The pose before the last step, which `interpolate` blends from.
+    pub previous: ScenePose,
     /// Whether the body was asleep at the last write, so the sleep transition
     /// writes once and the steps after it are skipped.
     pub sleeping: bool,

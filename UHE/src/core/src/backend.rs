@@ -50,6 +50,12 @@ pub trait PhysicsBackend: Send {
     /// Advance `dt` seconds and write the moved transforms back into `scene`.
     fn step(&mut self, scene: &mut Scene, dt: f32);
 
+    /// Write the poses a render at `alpha` into the next fixed step sees.
+    ///
+    /// Called after a frame's fixed steps. `alpha` is `Time::alpha`; a backend
+    /// that does not interpolate leaves the scene at the last step.
+    fn interpolate(&mut self, _scene: &mut Scene, _alpha: f32) {}
+
     /// Bodies currently in the simulation. Reported, not guessed, so a bench
     /// or a status bar can say zero and mean it.
     fn body_count(&self) -> usize;

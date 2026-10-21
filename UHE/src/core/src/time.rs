@@ -76,6 +76,14 @@ impl Time {
         self.fixed_dt
     }
 
+    /// How far the accumulator is into the next fixed step, in `[0, 1)`.
+    ///
+    /// A renderer samples the last two steps with this: the state at the last
+    /// step, not the state now, so the blend never extrapolates.
+    pub fn alpha(&self) -> f32 {
+        (self.accumulator.as_secs_f64() / self.fixed_dt.as_secs_f64()).clamp(0.0, 1.0) as f32
+    }
+
     pub fn elapsed(&self) -> Duration {
         self.elapsed
     }
