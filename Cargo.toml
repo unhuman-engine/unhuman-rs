@@ -75,7 +75,7 @@ glam = "0.33"
 hecs = "0.11"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-serde_yaml = "0.9"
+yaml_serde = "0.10"
 winit = "0.30"
 raw-window-handle = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
@@ -106,14 +106,23 @@ wgpu = { version = "30", features = ["spirv"] }
 # `3`: enough to inline the small math and iteration helpers where the time is
 # actually spent, while keeping line-level stepping and backtraces meaningful.
 #
-# Debug info stays on for dependencies too. It is what makes a `wgpu` validation
-# panic readable -- the frames above the workspace's own are in `wgpu` and
-# `naga`, and a backtrace that names them without a line is a backtrace that
-# sends you to the wrong file. The cost is real: every test binary links both
-# drivers and `gpui`, so it is paid once per binary. `cargo clean` is the answer
-# to the size, not a smaller backtrace.
+# Storage is part of the dev profile's cost. Full debug info for every
+# dependency and the incremental cache together reached 80 GB: every test binary
+# links both drivers and `gpui`, and `deps/` keeps one copy per binary.
+#
+# The workspace keeps line tables (`debug = 1`): backtraces name our own
+# file and line, which is what a `debug_assert` or a panic needs. Dependencies
+# carry no debug info (`debug = false`); a backtrace through `wgpu`/`naga` names
+# the function and not the line, the price of not storing ~40 GB of it.
+#
+# Incremental compilation is off by default. It is most of the remaining cache
+# (19 GB) and the largest single file win after debug info. A local iteration
+# loop that wants it back sets `CARGO_INCREMENTAL=1`, which overrides this.
 [profile.dev]
 opt-level = 1
+debug = 1
+incremental = false
 
 [profile.dev.package."*"]
 opt-level = 3
+debug = false
