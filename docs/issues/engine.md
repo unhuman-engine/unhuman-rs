@@ -37,15 +37,14 @@ the render width is arbitrary and the copy's rows are padded to 256 bytes.
 **Fixed when:** the render extent's width is a multiple of 64 texels
 (`chassis::copy_row_pitch`), the pitch equals the packed row, and the copy is gone.
 
-### P1 - the entry point rename is a workaround
+### Fixed - the entry point is the module's own
 
-`forge::wgsl::to_spirv_entry` renames the emitted entry point to `main` so naga's
-output matches what Slang emits, because the Vulkan backend names the entry point
-when it builds a pipeline and the RHI's `create_shader` does not carry a name.
-
-**Fixed when:** `create_shader` takes the entry point, or the module's own entry
-point is read back, and neither compiler's naming is a convention the other has
-to imitate.
+`chassis::spirv::entry_points` reads every `OpEntryPoint` and its `ExecutionModel`,
+so the module's own name is authoritative. `create_shader` stores the parsed
+entries, and both backends name a pipeline stage from the entry for that stage
+instead of a fixed `main`. `forge::wgsl::to_spirv` keeps the names the source
+declared and `to_spirv_entry` is gone; the Slang path still emits `main`, which
+is now just the name in that module and not a convention the WGSL path copies.
 
 ### P2 - a steady-state frame creates GPU objects
 
@@ -91,12 +90,73 @@ encoder.
 
 **Fixed when:** profiled (RenderDoc or Tracy) and in the same order as wgpu's.
 
-### P1 - Vulkan's GPU work is 3x wgpu's
+### Fixed - Vulkan's GPU work is 3x wgpu's
 
-Measured at 1998x1135: **33 ms** against **11 ms**. Same scene, same passes.
+The 33 ms was wall time, not GPU time. `VkQueryPool` timestamps around every
+bifrost pass (`stormbreaker/tests/bench_gpu.rs`, release, 1998x1135, 100 frames)
+give Vulkan **7.1 ms** of GPU work:
 
-**Fixed when:** profiled and explained -- barriers, pipeline state, or the passes
-themselves.
+| pass | GPU ms |
+|---|---:|
+| shadow | 0.005 |
+| opaque | 0.043 |
+| ssao | 6.132 |
+| editor | 0.186 |
+| composite | 0.197 |
+| readback | 0.364 |
+| **frame** | **7.069** |
+
+The same frame on wgpu is **7.2 ms** whole-frame wall; wgpu has no per-pass
+timing hook in this tree, so its column cannot be split without editing
+`stormglass`. Since the Vulkan total is already below the wgpu total, no Vulkan
+pass is 3x its wgpu counterpart.
+
+The other 36 ms of the old wall was the CPU readback: a `MAP_READ` buffer was
+allocated `HOST_VISIBLE | HOST_COHERENT` without `HOST_CACHED`, which RADV maps
+uncached on this RENOIR. Reading the 9.1 MB frame ran at **250 MB/s**, 36 ms per
+frame. `VulkanBuffer` now prefers `HOST_CACHED` for `MAP_READ` (falling back when
+a device has none), which is **4.6 GB/s**, 2.0 ms. Frame wall went from
+**43.0 ms to 7.2 ms**, and the GPU frame time is unchanged: the gap was never
+GPU.
+
+`ssao` was 6.1 ms, 87% of the GPU frame: 64 depth samples per pixel over 2.3 MP.
+It is the same shader and the same RADV driver on both backends, so it was the
+pass's budget, not Vulkan state. The profile rules out the listed backend causes:
+no MSAA or resolve, `Depth32Float` in both, dynamic rendering throughout, and
+shadow, opaque, editor, composite and readback together are under 0.8 ms, so
+barriers and layout transitions are not the cost. `opaque` was 0.185 ms before
+the readback change and 0.042 ms after; that is clock noise, not a state change.
+
+### Fixed - SSAO runs at half resolution
+
+Occlusion now renders at half the frame extent with 32 rotated kernel samples,
+then a separate full-rate pass upsamples it depth-aware:
+
+| extent | before ssao | after ssao | after upsample | after pair | before frame | after frame |
+|---|---:|---:|---:|---:|---:|---:|
+| 1920x1080 | 5.468 | 0.838 | 0.492 | 1.330 | 6.362 | 2.414 |
+| 1998x1135 | 6.132 | 1.035 | 0.552 | 1.587 | 7.091 | 2.808 |
+
+The technique:
+
+- The AO target is `render_extent / 2` in each axis. The 32-sample kernel is
+  rotated per pixel by interleaved gradient noise, so the reduced count reads as
+  noise rather than as one fixed band pattern.
+- `origin_clip` is projected once per pixel; each sample adds a `w = 0` offset
+  instead of re-projecting `origin + offset` 32 times.
+- The upsample reads the four half-rate texels under a full-rate pixel and keeps
+  the one whose reconstructed view-space depth matches the pixel, breaking a tie
+  by proximity. That avoids both silhouette halos and the loss of contact
+  darkening a bilinear average causes.
+- There was no full-rate blur to move; none was added.
+
+`Depth32Float`, radius 0.5, bias 0.025 and power 2.0 are unchanged. The
+`shadow_ssao` scene still darkens the contact region: the far wall stays equal
+with and without the caster, and the largest drop is 98 -> 87 on Vulkan and
+79 -> 73 on wgpu. The old fixed kernel's uniform 1.2% self-occlusion on a flat
+wall (251 rather than 255 sRGB) is gone; that was a kernel artifact, and the
+contact effect is still visible. `render_parity` is mean 0.138, max 81, against
+the target 0.2 / 85.
 
 ### P1 - the wgpu swapchain
 
@@ -124,9 +184,18 @@ scope, and the two known panics are gone.
 
 ### P2 - compute pipelines, both backends
 
-`PassType::Transfer` exists and there is no compute pass anywhere, so the
-particle system and the light culling in `docs/WORK.md` Phases 6 and 8 have
-nothing to land on.
+Compute pipelines and dispatch now work on both backends: one
+`chassis::ComputePipelineDesc`, `begin_compute`/`dispatch`/`end_compute` through
+`CommandList`, and a real GPU test per backend that reads the written word back.
+`DescriptorKind::StorageBufferReadWrite` is separate from the read-only kind
+because wgpu validates a layout against the shader's access. Push constants are
+an explicit `Error::Unsupported` on both: the RHI has no range declaration, so
+Vulkan's call would be invalid, and wgpu has none.
+
+**Still open:** one dispatch list per pass and no indirect dispatch or timestamp
+queries; nothing in the renderer declares a compute pass yet, and
+`PassType::Transfer` still has no producer. The particle system and the light
+culling in `docs/WORK.md` Phases 6 and 8 therefore have a target but no user.
 
 ### P2 - wgpu parallel recording
 

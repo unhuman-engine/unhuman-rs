@@ -30,7 +30,7 @@ readback, and the UI's own paint.
 | engine frame, render vs readback | a timer inside `bifrost::render`, which is where the 11.2 ms of 11.8 ms lives |
 | UI paint | the loop's period minus the engine's frame |
 | draw calls, passes, instances | `bifrost`'s existing counters, which nothing displays |
-| GPU time per pass | timestamp queries on both backends -- `docs/WORK.md` Phase 10 |
+| GPU time per pass | `chassis::Gpu::gpu_timings`, filled by Vulkan's timestamp queries; wgpu has none, so the panel reads unavailable |
 | CPU load | `/proc/self/stat` on Linux; the platform crate is where that belongs |
 | memory | `/proc/self/statm` for resident, plus the renderer's own allocations if it grows an allocator hook |
 | GPU load | AMD's `fdinfo` or `sysfs` where it exists; not portable, so it is a best-effort line |
@@ -38,6 +38,16 @@ readback, and the UI's own paint.
 
 **Fixed when:** every row above has a source, the panel updates every frame, and
 nothing is written to disk.
+
+### Fixed - GPU time per pass
+
+`chassis::Gpu` grew `enable_gpu_timing`, `collect_gpu_timings`, `gpu_timings`
+and `gpu_frame_ms`. Vulkan answers them from its existing `VkQueryPool` and
+carries the graph's own pass names through, owned, so the panel reads a name
+that outlives the frame. wgpu answers `false` and `None`, and the panel says the
+row is not collected rather than showing a zero. The editor enables timing only
+when the profiler panel is first shown, so a hidden panel pays nothing, and
+`bifrost` collects the split for the frame it just submitted.
 
 ## P2 - a ring of history, in memory
 

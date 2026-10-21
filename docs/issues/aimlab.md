@@ -9,10 +9,34 @@ issues, one entry each.
 
 ## What is there
 
-- `rules.rs`: the scoring and hit rules of the aim trainer.
+- `rules.rs`: the scoring, hit and magazine rules of the aim trainer, all pure
+  functions of their arguments.
 - `scene.rs`: the scene the demo spawns.
-- `lib.rs`: the plugin, which is the composition root's second example after the
-  editor.
+- `lib.rs`: the plugin, the input edges, and the display seam.
+- `tests/aimlab.rs`: the rules against a real `meats` scene, no GPU.
+
+## The display seam
+
+`AimLabPlugin::report` returns a `Report`: hits, misses, shots, points,
+accuracy, rounds, `max_ammo`, the reloading flag and its progress, plus
+`Report::CONTROLS`. This is the HUD contract. The demo never draws; a HUD is
+the sandbox's or the engine's to build from this. Nothing here reaches into
+another crate's renderer.
+
+## The gun seam
+
+The C++ loads a 12 MB animated pistol and plays `Idle`/`Fire`/`Reload_Complete`
+on a skeletal `Animator`. This tree does not copy the asset and cannot play it:
+`bifrost`'s clip-to-`Animator` glue is not in place, so nothing skins. The demo
+therefore builds a `Gun` entity as a camera child with the C++'s offset
+(`GUN_OFFSET`), facing fix (`GUN_ROTATION_DEGREES`) and scale (`GUN_SCALE`, 0.05)
+and attaches `assets/models/pistol_animations_blender.glb` only when it resolves.
+With the asset absent the entity is still there, invisible, and ammo and reload
+are unaffected. A HUD or a gun needs, from other crates:
+
+- the skinning path: `JOINTS_0`/`WEIGHTS_0` on the vertex layout
+  (`bifrost::mesh`) and the clip-to-`Animator` glue, before the pistol animates;
+- a HUD renderer, or an ImGui-equivalent panel, to read `Report`.
 
 ## P2 - what a demo layer is for
 
@@ -25,6 +49,25 @@ Two things, and they are the reason it is worth keeping working:
 
 **Fixed when:** the demo runs on both backends, its rules have tests that do not
 depend on a device, and the difference from the C++ demo is written down.
+
+## Difference from the C++ demo
+
+The camera framing, target wall, hit rule, spawn cadence, seven-round magazine,
+`R` reload, auto-reload at zero, 3.5 s reload timer and accuracy maths match.
+
+- **HUD.** The C++ draws an ImGui window, crosshair and gun tweak sliders. Rust
+  exposes `Report` and draws nothing.
+- **Gun.** See the gun seam above: no mesh is copied, no animation plays.
+- **Animation.** `Fire`'s 0.5 s and `Reload_Complete`'s duration, and the recoil
+  kick, come from the pistol's clips in the C++; neither is present here, so the
+  reload uses the C++'s documented 3.5 s default and there is no recoil.
+- **Picking.** The C++ reads an entity-ID framebuffer pixel from the previous
+  frame. Rust casts a ray at the same instant.
+- **Controls.** The C++ lists `ESC` cursor release/lock, `ALT`+mouse orbit and
+  scroll zoom from its `EditorCamera`; this demo has its own yaw/pitch and does
+  not port those, so they are not in `Report::CONTROLS`.
+- **Reload sound.** The C++ plays `reload.wav`; this tree has only `gunshot.wav`,
+  so the reload is silent.
 
 ## To add
 

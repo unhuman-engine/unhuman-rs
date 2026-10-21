@@ -10,41 +10,56 @@ filtering and the timestep.
 
 ## P1 - the three fixes the port carried and nobody applied
 
-From the C++ tree's own defects, all three still open:
+From the C++ tree's own defects. All three are done; each has a test that fails
+without the fix.
 
-- **Sleeping bodies never sync back.** A body that falls asleep stops being
-  written back to its transform, so a scene that was saved after a body settled
-  holds the transform from the frame before it slept. The C++ guards on
-  `!IsActive`; the Rust side has to either keep syncing a sleeping body once, or
-  write the transform when it sleeps.
-- **`AllowedDOFs` is serialized and never applied.** A file can say a body is
-  constrained to a plane and the simulation ignores it.
-- **`BoxCollider`'s `RuntimeShape` is never written**, so a box collider's shape
-  in the file and the shape in the simulation can disagree.
+- **Sleeping bodies never sync back.** Done. `sync_out` skips a body only once it
+  is already asleep, and writes on the step it falls asleep (`body::writes_pose`,
+  unit-tested). The write-once is what a stale saved scene needed; the skip after
+  is the frame-budget win. The C++ guard skips the transition too, which is the
+  bug.
+- **`AllowedDOFs` is serialized and never applied.** Done, as a femoral
+  component (`components::AllowedDOFs`): translation and rotation per axis, from
+  the file's `[tx, ty, tz, rx, ry, rz]` order, applied through Rapier's
+  `enabled_translations`/`enabled_rotations`. The test locks one translation axis
+  and asserts the body stays on its plane; the control falls.
+- **`BoxCollider`'s `RuntimeShape` is never written.** Done. The shape is part of
+  `Source`, so a changed half-extent or transform scale rebuilds the collider; the
+  test moves the file's half-extent and the scale and asserts the resting height
+  follows.
 
 **Fixed when:** each has a test that fails without the fix.
 
 ## P1 - a rewrite has to decide, not inherit
 
-The questions the current shape does not answer, and a rewrite has to:
+Decided; the ones with code are implemented in `src/`.
 
-- **Units and scale.** A scene is metres; a physics engine has defaults; a model
-  has its own. One of them is canonical and the other two convert.
-- **Where the fixed step lives.** `adam`'s `Time` has a fixed step and an
-  accumulator, femur has one too, and the scene has a scale for the whole
-  simulation. Two accumulators is one too many.
-- **Determinism.** rapier is deterministic per build; the job system is not
-  ordered. Whether a stepped frame is reproducible is a property to state, not to
-  discover.
-- **nalgebra at the boundary.** Keeping glam canonical is right; every conversion
-  is a place a matrix layout can be transposed by accident, so the boundary should
-  be one file with tests either side.
-- **Collision events into `pings`.** Contacts, enter and exit, as deferred
-  messages rather than a second event system.
-- **Sleeping, islands and the frame budget.** A large scene that is mostly asleep
-  is the case that decides whether stepping can be parallel.
-- **Serialization.** Which of the physics components are scene data and which are
-  runtime state, decided once, because it decides what a save contains.
+- **Units and scale.** The metre is canonical. A scene is metres and Rapier is SI
+  metres, so there is no scene-to-engine conversion and no global physics scale:
+  the second scale would be a second thing to keep consistent. A model's own
+  scale converts once, through `Transform::scale`, in `shape::scaled_shape`.
+- **Where the fixed step lives.** In `adam::Time`. It owns the accumulator and
+  the fixed rate; `Physics3D::step` consumes the `dt` it is handed and integrates
+  once. Femur has no accumulator. There is one clock.
+- **Determinism.** A stepped frame is reproducible for a fixed build: Rapier is
+  bit-deterministic, the backend holds no generator, and the step is
+  single-threaded. It breaks on a different build or SIMD width, on a different
+  `dt`, and on stepping from more than one thread. `two_identical_runs_agree_bit_for_bit`
+  is the claim; async stepping (P2) is what would break it.
+- **The math boundary.** `convert` is the only file that names a Rapier math
+  type, and it has tests in both directions, including a single-axis rotation
+  that an Euler-order mix-up would transpose.
+- **Collision events into `pings`.** `contacts` diffs touching pairs and queues
+  `Enter`, `Contact` and `Exit` messages; the engine drains them and forwards to
+  `pings`. The backend owns no bus, so a dropped queue cannot change a stepped
+  frame.
+- **Sleeping, islands and the frame budget.** A sleeping body is not written, and
+  the sleep-transition is. Whether stepping itself can be parallel is still P2:
+  the barrier is determinism, not the sleeping case.
+- **Serialization.** Scene data: `Transform`, `RigidBody`, `Collider`. Authored
+  physics data: `Ccd`, `CollisionFilter`, `AllowedDOFs`, `Joint`. Runtime state,
+  never saved: `BodyHandle`, the touching set, the collision queue, the Rapier
+  sets.
 
 ## P2 - no async stepping
 
@@ -54,8 +69,11 @@ overlap the renderer's frame -- and what the one-frame latency does to a contact
 
 ## P2 - the debug view
 
-Contacts, shapes and broad-phase cells drawn through `bifrost`'s line pass, which
-exists and already draws the grid and the gizmo.
+`debug::PhysicsDebug` is the data: collider wireframes, contact crosses and
+broad-phase boxes as world-space `DebugLine` segments, built by
+`Physics3D::debug_view`. `bifrost`'s line pass draws per-end vertices in its own
+format; femur does not depend on `bifrost`, so turning a `DebugLine` into that
+format is the drawing owner's job, not done here.
 
 ## To add
 

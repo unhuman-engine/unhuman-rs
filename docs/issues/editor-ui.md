@@ -20,7 +20,8 @@ the engine it is showing.
 
 **Fixed when:** the viewport shows the engine's texture without a round trip
 through the CPU, or the readback is at least asynchronous and off the frame's
-critical path.
+critical path. The interface the editor asks `bifrost` for is in
+`editor-viewport-seam.md`.
 
 ## P1 - no layout persistence
 
