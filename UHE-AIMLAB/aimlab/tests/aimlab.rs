@@ -7,12 +7,13 @@ use std::time::Duration;
 
 use adam::{Engine, FrameCtx, Plugin};
 use aimlab::{
-    ray_sphere, AimLabPlugin, Score, CAMERA_DISTANCE, HIT_POINTS, MAX_AMMO, RECOIL_DURATION,
-    RECOIL_MAX_DEGREES, RECOIL_PITCH_DEGREES, RELOAD_DURATION, SPAWN_X, SPAWN_Y, SPAWN_Z,
-    STAGE_ENTITIES, TARGET_COUNT, TARGET_RADIUS,
+    ray_sphere, AimLabPlugin, Score, CAMERA_DISTANCE, GUN_FIRE_CLIP, GUN_IDLE_CLIP,
+    GUN_RELOAD_CLIP, HIT_POINTS, MAX_AMMO, RECOIL_DURATION, RECOIL_MAX_DEGREES,
+    RECOIL_PITCH_DEGREES, RELOAD_DURATION, SPAWN_X, SPAWN_Y, SPAWN_Z, STAGE_ENTITIES, TARGET_COUNT,
+    TARGET_RADIUS,
 };
 use glam::Vec3;
-use meats::{Entity, Transform};
+use meats::{Animator, Entity, Transform};
 use pings::{Event, KeyCode, MouseButton};
 
 const STEP: f32 = 1.0 / 60.0;
@@ -64,6 +65,17 @@ fn place(engine: &mut Engine, entity: Entity, position: Vec3) {
         .get_mut::<Transform>()
         .expect("every entity has a transform")
         .translation = position;
+}
+
+fn gun_animator(engine: &Engine, plugin: &AimLabPlugin) -> Animator {
+    let gun = plugin.gun().expect("the gun seam");
+    let animator = engine
+        .scene
+        .get(gun)
+        .expect("the gun entity")
+        .get::<Animator>()
+        .expect("the gun animator");
+    (*animator).clone()
 }
 
 fn click(engine: &mut Engine) {
@@ -404,6 +416,7 @@ fn the_magazine_empties_then_auto_reloads() {
     assert_eq!(plugin.score().shots, MAX_AMMO);
     assert_eq!(plugin.ammo().rounds, 0);
     assert!(plugin.ammo().reloading, "auto-reload at zero");
+    assert_eq!(gun_animator(&engine, &plugin).clip_path, GUN_RELOAD_CLIP);
 
     // A click while reloading is consumed and spends no shot.
     let shots = plugin.score().shots;
@@ -416,6 +429,47 @@ fn the_magazine_empties_then_auto_reloads() {
     }
     assert!(!plugin.ammo().reloading);
     assert_eq!(plugin.ammo().rounds, MAX_AMMO);
+    assert_eq!(gun_animator(&engine, &plugin).clip_path, GUN_IDLE_CLIP);
+}
+
+#[test]
+fn a_shot_plays_fire_once_then_returns_to_idle() {
+    let (mut engine, mut plugin) = built();
+    let mut ctx = context();
+
+    fire(&mut engine, &mut plugin, &mut ctx);
+    let fire = gun_animator(&engine, &plugin);
+    assert_eq!(fire.clip_path, GUN_FIRE_CLIP);
+    assert!(!fire.looping, "fire is a one-shot");
+
+    let steps = (RECOIL_DURATION * STEPS_PER_SECOND as f32).ceil() as usize + 2;
+    for _ in 0..steps {
+        plugin.on_update(&mut engine, &mut ctx);
+    }
+    let idle = gun_animator(&engine, &plugin);
+    assert_eq!(idle.clip_path, GUN_IDLE_CLIP);
+    assert!(idle.looping);
+}
+
+#[test]
+fn r_plays_the_reload_clip_until_the_timer_finishes() {
+    let (mut engine, mut plugin) = built();
+    let mut ctx = context();
+
+    fire(&mut engine, &mut plugin, &mut ctx);
+    press_key(&mut engine, KeyCode::R);
+    plugin.on_update(&mut engine, &mut ctx);
+    assert_eq!(gun_animator(&engine, &plugin).clip_path, GUN_RELOAD_CLIP);
+
+    release_key(&mut engine, KeyCode::R);
+    plugin.on_update(&mut engine, &mut ctx);
+    assert_eq!(gun_animator(&engine, &plugin).clip_path, GUN_RELOAD_CLIP);
+
+    let steps = (RELOAD_DURATION * STEPS_PER_SECOND as f32).ceil() as usize + 2;
+    for _ in 0..steps {
+        plugin.on_update(&mut engine, &mut ctx);
+    }
+    assert_eq!(gun_animator(&engine, &plugin).clip_path, GUN_IDLE_CLIP);
 }
 
 #[test]

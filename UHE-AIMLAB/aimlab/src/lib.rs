@@ -24,7 +24,7 @@ mod scene;
 
 use adam::{Engine, FrameCtx, Plugin, Result};
 use glam::Vec3;
-use meats::{Entity, Scene};
+use meats::{Entity, MeshRenderer, Scene};
 use pings::{KeyCode, MouseButton};
 
 pub use rules::{
@@ -41,6 +41,12 @@ const GROUND_MESH: &str = "assets/models/Box.gltf";
 
 /// The animated pistol, attached to the gun seam when the checkout has it.
 const GUN_MESH: &str = "assets/models/pistol_animations_blender.glb";
+
+/// The pistol rig's clips. It has no plain `Reload`, so the full reload is
+/// `Reload_Complete`; `Reload_Fast` is the shorter variant.
+pub const GUN_IDLE_CLIP: &str = "Idle";
+pub const GUN_FIRE_CLIP: &str = "Fire";
+pub const GUN_RELOAD_CLIP: &str = "Reload_Complete";
 
 /// The sound played on every shot.
 const SHOT_SOUND: &str = "assets/audio/gunshot.wav";
@@ -75,6 +81,10 @@ pub struct AimLabPlugin {
     mouse_was_down: bool,
     r_was_down: bool,
     gun: Option<Entity>,
+    /// Seconds left on the one-shot fire clip.
+    fire_timer: f32,
+    /// The fire clip's own duration; `RECOIL_DURATION` until the asset supplies it.
+    fire_duration: f32,
     built: bool,
 }
 
@@ -93,6 +103,8 @@ impl AimLabPlugin {
             mouse_was_down: false,
             r_was_down: false,
             gun: None,
+            fire_timer: 0.0,
+            fire_duration: RECOIL_DURATION,
             built: false,
         }
     }
@@ -210,6 +222,7 @@ impl AimLabPlugin {
         self.ammo.fire();
         self.score.shot();
         self.recoil.kick(RECOIL_PITCH_DEGREES, RECOIL_YAW_DEGREES);
+        self.fire_timer = self.fire_duration;
         self.play_shot(eng);
         if let Some(entity) = self.pick(&eng.scene) {
             self.score.hit();
@@ -250,6 +263,44 @@ impl AimLabPlugin {
             audio.play(&eng.assets, clip, gain);
         }
     }
+
+    /// Drives the gun's clip from the ammo state: reload wins over the one-shot
+    /// fire, and idle is the resting state.
+    fn animate_gun(&mut self, eng: &mut Engine, dt: f32) {
+        let Some(gun) = self.gun else {
+            return;
+        };
+        if self.fire_timer > 0.0 {
+            self.fire_timer = (self.fire_timer - dt).max(0.0);
+        }
+        let (clip, looping) = if self.ammo.reloading {
+            (GUN_RELOAD_CLIP, true)
+        } else if self.fire_timer > 0.0 {
+            (GUN_FIRE_CLIP, false)
+        } else {
+            (GUN_IDLE_CLIP, true)
+        };
+        scene::play_clip(&mut eng.scene, gun, clip, looping);
+    }
+}
+
+/// The Fire clip's duration from the loaded pistol, so the state does not
+/// duplicate it. `RECOIL_DURATION` is the same 0.5 s when the asset is absent.
+fn fire_clip_duration(scene: &Scene, assets: &vault::Assets, gun: Entity) -> f32 {
+    scene
+        .get(gun)
+        .and_then(|entry| entry.get::<MeshRenderer>())
+        .and_then(|renderer| renderer.mesh)
+        .and_then(|mesh| assets.meshes(mesh))
+        .and_then(|meshes| {
+            meshes
+                .iter()
+                .flat_map(|mesh| mesh.animations.iter())
+                .find(|clip| clip.name == GUN_FIRE_CLIP)
+        })
+        .map(|clip| clip.duration)
+        .filter(|duration| *duration > 0.0)
+        .unwrap_or(RECOIL_DURATION)
 }
 
 impl Default for AimLabPlugin {
@@ -278,14 +329,14 @@ impl Plugin for AimLabPlugin {
 
         // The gun is a camera child, so its world transform follows the look
         // without a per-frame update of its own. The mesh is attached only when
-        // the pistol is present; the entity stays either way, so ammo and reload
-        // do not depend on the asset.
+        // the pistol is present; the animator stays either way, so ammo, reload
+        // and a test can read the clip state without the asset.
         let gun = scene::spawn(&mut eng.scene, "Gun", GUN_OFFSET, Vec3::splat(GUN_SCALE));
         scene::set_rotation(&mut eng.scene, gun, GUN_ROTATION_DEGREES);
         eng.scene.set_parent(gun, Some(camera));
+        scene::add_animator(&mut eng.scene, gun);
         if eng.assets.vfs().resolve(GUN_MESH).is_ok() {
             scene::add_mesh(&mut eng.scene, gun, GUN_MESH);
-            scene::add_animator(&mut eng.scene, gun);
         } else {
             log::info!("aimlab: {GUN_MESH} absent; the gun is a transform-only seam");
         }
@@ -314,6 +365,7 @@ impl Plugin for AimLabPlugin {
         for error in scene.resolve_assets(assets) {
             log::warn!("aimlab: {error}");
         }
+        self.fire_duration = fire_clip_duration(scene, assets, gun);
 
         log::info!(
             "aimlab: {} entities, {} targets",
@@ -347,5 +399,6 @@ impl Plugin for AimLabPlugin {
         // After the shot, so the pick uses the aim the crosshair was on and the
         // new kick lands on top of it.
         self.aim(eng);
+        self.animate_gun(eng, dt);
     }
 }

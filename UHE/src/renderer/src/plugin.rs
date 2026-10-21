@@ -314,21 +314,23 @@ impl Plugin for BifrostPlugin {
                 log::warn!("bifrost: mesh {:?} failed to upload: {error}", sample.mesh);
                 continue;
             }
-            let Some(state) = sample.animator else {
+            let Some(_state) = sample.animator else {
+                continue;
+            };
+            let Some(entry) = eng.scene.get(sample.entity) else {
+                continue;
+            };
+            let Some(animator) = entry.get::<meats::Animator>() else {
                 continue;
             };
             if !renderer.is_skinned(sample.entity) {
-                let hint = eng
-                    .scene
-                    .get(sample.entity)
-                    .and_then(|entry| entry.get::<meats::Animator>().map(|a| a.clip_path.clone()))
-                    .unwrap_or_default();
+                let hint = (!animator.clip_path.is_empty()).then_some(animator.clip_path.as_str());
                 match renderer.attach_skinned(
                     gpu.as_mut(),
                     &eng.assets,
                     sample.entity,
                     sample.mesh,
-                    (!hint.is_empty()).then_some(hint.as_str()),
+                    hint,
                 ) {
                     Ok(true) => {}
                     Ok(false) => log::debug!(
@@ -340,7 +342,7 @@ impl Plugin for BifrostPlugin {
                     }
                 }
             }
-            renderer.set_skinned_playback(sample.entity, state.playing, state.speed, state.looping);
+            renderer.apply_animator(sample.entity, &animator);
         }
         renderer.advance_skinned(&eng.scene, ctx.step_seconds());
     }

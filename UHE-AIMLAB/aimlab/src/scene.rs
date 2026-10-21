@@ -98,6 +98,21 @@ pub(crate) fn add_animator(scene: &mut Scene, entity: Entity) {
     let _ = scene.insert(entity, animator);
 }
 
+/// Selects a clip by name and its loop mode; a missing animator is a no-op.
+pub(crate) fn play_clip(scene: &mut Scene, entity: Entity, clip: &str, looping: bool) {
+    if let Some(mut entry) = scene.get_mut(entity) {
+        if let Some(animator) = entry.get_mut::<Animator>() {
+            if animator.clip_path != clip {
+                animator.clip_path.clear();
+                animator.clip_path.push_str(clip);
+                animator.time = 0.0;
+            }
+            animator.looping = looping;
+            animator.playing = true;
+        }
+    }
+}
+
 /// A sound on an entity by virtual path. The handle beside it is
 /// `Scene::resolve_assets`' to fill.
 pub(crate) fn add_audio_source(scene: &mut Scene, entity: Entity, path: &str) {

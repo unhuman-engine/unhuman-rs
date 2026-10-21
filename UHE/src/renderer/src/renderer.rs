@@ -203,6 +203,8 @@ impl FrameTextures {
 struct SkinnedDraw {
     animator: Animator,
     matrices: Vec<[[f32; 4]; 4]>,
+    /// The clip the runtime is playing, so a scene path change is one switch.
+    clip: String,
 }
 
 /// The renderer frontend. Owned by `BifrostPlugin`, never by `Engine`.
@@ -507,8 +509,15 @@ impl Bifrost {
         animator.play_animation(index as i32);
         animator.seek(0.0);
         let matrices = palette_of(&animator);
-        self.skinned
-            .insert(entity, SkinnedDraw { animator, matrices });
+        let clip = animator.clips()[index].name.clone();
+        self.skinned.insert(
+            entity,
+            SkinnedDraw {
+                animator,
+                matrices,
+                clip,
+            },
+        );
         Ok(true)
     }
 
@@ -522,6 +531,53 @@ impl Bifrost {
         self.skinned
             .get(&entity)
             .map(|draw| draw.matrices.as_slice())
+    }
+
+    /// The runtime clip index `entity` is playing, or `None` before attach.
+    pub fn skinned_animation_index(&self, entity: meats::Entity) -> Option<i32> {
+        self.skinned
+            .get(&entity)
+            .map(|draw| draw.animator.current_animation_index())
+    }
+
+    /// The runtime play head in seconds, or `None` before attach.
+    pub fn skinned_animation_time(&self, entity: meats::Entity) -> Option<f32> {
+        self.skinned
+            .get(&entity)
+            .map(|draw| draw.animator.current_time())
+    }
+
+    /// The playing clip's duration in seconds, or `None` before attach.
+    pub fn skinned_clip_duration(&self, entity: meats::Entity) -> Option<f32> {
+        self.skinned
+            .get(&entity)
+            .map(|draw| draw.animator.duration())
+    }
+
+    /// Switches `entity` to the named clip when it differs from the playing one.
+    ///
+    /// An unknown name leaves the last valid clip playing. Returns whether the
+    /// runtime is on the requested clip, or was already.
+    pub fn set_skinned_clip(&mut self, entity: meats::Entity, name: &str) -> bool {
+        let Some(draw) = self.skinned.get_mut(&entity) else {
+            return false;
+        };
+        if name.is_empty() || draw.clip == name {
+            return true;
+        }
+        if !draw.animator.play_animation_by_name(name) {
+            return false;
+        }
+        draw.clip.clear();
+        draw.clip.push_str(name);
+        draw.matrices = palette_of(&draw.animator);
+        true
+    }
+
+    /// Applies a scene animator's clip and playback state to `entity`.
+    pub fn apply_animator(&mut self, entity: meats::Entity, animator: &meats::Animator) {
+        self.set_skinned_clip(entity, &animator.clip_path);
+        self.set_skinned_playback(entity, animator.playing, animator.speed, animator.looping);
     }
 
     /// Copies playback state from the scene component into the runtime animator.
